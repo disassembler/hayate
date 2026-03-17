@@ -22,6 +22,6 @@ pub mod test_validators;
 
 pub use storage::*;
 pub use cli::handle_wallet_command;
-pub use wallet::{Wallet, ed25519_secret_to_privatekey};
+pub use wallet::{Wallet, ed25519_secret_to_privatekey, ed25519_secret_to_extended_privatekey};
 #[allow(unused_imports)]
 pub use derivation::{Network, DerivationError, DerivationResult};
