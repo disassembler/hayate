@@ -8,6 +8,8 @@ mod chain_sync;
 mod keys;
 mod rewards;
 mod snapshot_manager;
+mod genesis;  // Genesis file parsing
+mod ledger;   // Ledger state management
 mod indexer;
 mod api;
 mod config;

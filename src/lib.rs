@@ -7,8 +7,10 @@ pub mod gpg;
 pub mod chain_sync;
 pub mod keys;
 pub mod rewards;  // Must come before indexer
-pub mod rewards_calculation;  // Rewards calculation logic
+// pub mod rewards_calculation;  // Rewards calculation logic (deprecated - now in ledger/rewards.rs)
 pub mod snapshot_manager;  // LSM snapshot management
+pub mod genesis;  // Genesis file parsing (Byron, Shelley, Alonzo, Conway)
+pub mod ledger;  // Full ledger state management (epoch transitions, governance, validation)
 pub mod indexer;
 pub mod api;
 pub mod config;

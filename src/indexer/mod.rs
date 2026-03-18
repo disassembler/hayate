@@ -135,6 +135,21 @@ pub struct NetworkStorage {
 
     // Track which epoch we started indexing from
     pub indexing_start_epoch: u64,
+
+    // SPDD (Stake Pool Distribution Data) snapshot trees
+    // These store epoch boundary snapshots for rewards and stake distribution
+
+    // Stake distribution: "stake:{epoch}:{cred_hash_hex}" -> u64 (lovelace)
+    pub stake_distribution_tree: LsmTree,
+
+    // Pool parameters: "pool:{epoch}:{pool_id_hex}" -> JSON (PoolRegistration)
+    pub pool_params_tree: LsmTree,
+
+    // Pool stake totals: "pool_stake:{epoch}:{pool_id_hex}" -> u64 (lovelace)
+    pub pool_stake_tree: LsmTree,
+
+    // Delegations: "delegation:{epoch}:{cred_hash_hex}" -> pool_id (28 bytes)
+    pub delegations_tree: LsmTree,
 }
 
 /// Open an LSM tree, restoring from latest valid snapshot if available
@@ -288,6 +303,12 @@ impl NetworkStorage {
         let start_epoch = 0;
         let rewards_tracker = RewardsTracker::open(network_path.join("rewards"), start_epoch)?;
 
+        // SPDD snapshot trees
+        let stake_distribution_tree = open_lsm_tree_with_snapshot(network_path.join("stake_distribution"))?;
+        let pool_params_tree = open_lsm_tree_with_snapshot(network_path.join("pool_params"))?;
+        let pool_stake_tree = open_lsm_tree_with_snapshot(network_path.join("pool_stake"))?;
+        let delegations_tree = open_lsm_tree_with_snapshot(network_path.join("delegations"))?;
+
         Ok(Self {
             network,
             network_path: network_path.clone(),
@@ -306,6 +327,10 @@ impl NetworkStorage {
             block_events_tree,
             block_hash_index,
             indexing_start_epoch: start_epoch,
+            stake_distribution_tree,
+            pool_params_tree,
+            pool_stake_tree,
+            delegations_tree,
         })
     }
     
