@@ -29,20 +29,17 @@ impl LedgerState {
         // Step 1: Calculate rewards FIRST using existing snapshots
         // CRITICAL: Haskell's RUPD runs BEFORE SNAP, so we calculate rewards using:
         // - Stake distribution from ssStakeGo (existing go snapshot)
-        // - Fees from the CURRENT epoch (the epoch that just ended)
+        // - Fees from current_epoch_fees (fees from the PREVIOUS epoch, set by SNAP)
         // This matches the Haskell order: RUPD then SNAP
+        //
+        // Timing of fees:
+        // - At epoch 0→1: current_epoch_fees=0 (initial), fees from epoch 0 NOT used yet
+        // - SNAP updates current_epoch_fees = fees from epoch 0
+        // - At epoch 1→2: current_epoch_fees=fees from epoch 0, used by RUPD
+        // - So fees from epoch N are used at epoch N+1→N+2
+        let fees_for_rewards = self.snapshots.current_epoch_fees;
         let rupd = if let Some(ref go_snapshot) = self.snapshots.go {
-            // Use go snapshot for stake distribution, but CURRENT epoch fees!
-            // Create a temporary snapshot with current fees
-            let snapshot_with_current_fees = super::state::StakeSnapshot {
-                epoch: go_snapshot.epoch,
-                delegations: Arc::clone(&go_snapshot.delegations),
-                pool_stake: go_snapshot.pool_stake.clone(),
-                pool_params: Arc::clone(&go_snapshot.pool_params),
-                stake_distribution: Arc::clone(&go_snapshot.stake_distribution),
-                epoch_fees: self.epoch_fees, // CRITICAL: Use CURRENT epoch fees!
-            };
-            self.calculate_rewards(&snapshot_with_current_fees)
+            self.calculate_rewards(go_snapshot, fees_for_rewards)
         } else {
             // Early epochs before go snapshot exists: create empty snapshot
             // This allows reward calculation to run, with all rewards undistributed
@@ -52,9 +49,8 @@ impl LedgerState {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::clone(&self.pool_params),
                 stake_distribution: Arc::new(HashMap::new()),
-                epoch_fees: Lovelace(0), // No fees for empty/early epochs
             };
-            self.calculate_rewards(&empty_snapshot)
+            self.calculate_rewards(&empty_snapshot, fees_for_rewards)
         };
 
         // Apply the RUPD immediately (not deferred)
@@ -154,15 +150,13 @@ impl LedgerState {
         );
 
         use super::state::StakeSnapshot;
-        // CRITICAL: Create new snapshot and store in BOTH `mark` AND `set`
-        // This ensures fees from epoch N are used at epoch N+1 (after one rotation to `go`)
+        // CRITICAL: Create new mark snapshot for the epoch that just ended
         let new_snapshot = StakeSnapshot {
             epoch: self.epoch, // CRITICAL: Snapshot records the epoch that ENDED, not new_epoch
             delegations: Arc::clone(&self.delegations),
             pool_stake,
             pool_params: Arc::clone(&self.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
-            epoch_fees: self.epoch_fees, // Store fees from the epoch that just ended
         };
 
         // Store in mark for the 3-snapshot rotation pattern
@@ -173,6 +167,10 @@ impl LedgerState {
         if self.snapshots.set.is_none() {
             self.snapshots.set = Some(new_snapshot);
         }
+
+        // Update current_epoch_fees (Haskell's ssFee) to fees from the epoch that just ended
+        // This will be used by RUPD at the NEXT epoch boundary
+        self.snapshots.current_epoch_fees = self.epoch_fees;
 
         // Step 6: Process pending pool retirements for this epoch
         if let Some(retiring_pools) = self.pending_retirements.remove(&new_epoch) {
@@ -379,7 +377,6 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
-                epoch_fees: Lovelace(0),
             }),
             set: Some(StakeSnapshot {
                 epoch: EpochNo(99),
@@ -387,7 +384,6 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
-                epoch_fees: Lovelace(0),
             }),
             go: Some(StakeSnapshot {
                 epoch: EpochNo(98),
@@ -395,8 +391,8 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
-                epoch_fees: Lovelace(0),
             }),
+            current_epoch_fees: Lovelace(0),
         };
 
         state.process_epoch_transition(EpochNo(101));

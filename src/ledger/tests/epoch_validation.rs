@@ -124,7 +124,6 @@ mod snapshot_tests {
             pool_params: state.pool_params.clone(),
             pool_stake: Default::default(),
             delegations: state.delegations.clone(),
-            epoch_fees: Lovelace(0),
         };
 
         // Verify snapshot captured state correctly
@@ -149,7 +148,6 @@ mod snapshot_tests {
             pool_params: state.pool_params.clone(),
             pool_stake: Default::default(),
             delegations: state.delegations.clone(),
-            epoch_fees: Lovelace(0),
         };
 
         // Modify state after snapshot

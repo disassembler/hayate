@@ -500,6 +500,12 @@ pub struct EpochSnapshots {
     pub set: Option<StakeSnapshot>,
     /// Snapshot from two epochs ago ("go") — used for reward distribution
     pub go: Option<StakeSnapshot>,
+    /// Fees from the current epoch (Haskell's ssFee)
+    /// This is updated by SNAP at each epoch boundary to the fees from the epoch that just ended.
+    /// RUPD uses this value at the next epoch transition.
+    /// This means fees from epoch N are used for rewards at epoch N+1→N+2.
+    #[serde(default)]
+    pub current_epoch_fees: Lovelace,
 }
 
 /// A snapshot of the stake distribution at an epoch boundary.
@@ -516,9 +522,6 @@ pub struct StakeSnapshot {
     /// Individual stake per credential (for reward distribution and pledge verification)
     #[serde(default)]
     pub stake_distribution: Arc<HashMap<Hash32, Lovelace>>,
-    /// Fees collected during this epoch (for reward calculation 2 epochs later)
-    #[serde(default)]
-    pub epoch_fees: Lovelace,
 }
 
 /// Pool registration information

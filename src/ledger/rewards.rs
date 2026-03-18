@@ -56,15 +56,15 @@ impl LedgerState {
     ///
     /// Returns a `PendingRewardUpdate` that should be stored and applied at the
     /// NEXT epoch boundary, matching Haskell's RUPD timing.
-    pub fn calculate_rewards(&self, go_snapshot: &StakeSnapshot) -> PendingRewardUpdate {
+    pub fn calculate_rewards(&self, go_snapshot: &StakeSnapshot, fees: Lovelace) -> PendingRewardUpdate {
         let rho_num = self.protocol_params.rho.numerator as i128;
         let rho_den = self.protocol_params.rho.denominator.max(1) as i128;
         let tau_num = self.protocol_params.tau.numerator as i128;
         let tau_den = self.protocol_params.tau.denominator.max(1) as i128;
 
-        // CRITICAL: Use fees from the go snapshot (2 epochs ago), not current epoch fees!
-        // This matches the RUPD timing where rewards are calculated based on the "go" snapshot.
-        let fees_for_rewards = go_snapshot.epoch_fees.0;
+        // CRITICAL: Use fees from current_epoch_fees (set by SNAP at previous epoch boundary)
+        // This matches the RUPD timing where rewards use fees from the PREVIOUS epoch
+        let fees_for_rewards = fees.0;
 
         // Monetary expansion with eta performance adjustment:
         //   expected_blocks = floor(active_slot_coeff * epoch_length) (adjusted for d)
