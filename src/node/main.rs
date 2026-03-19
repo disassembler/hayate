@@ -47,6 +47,15 @@ struct Args {
     /// If not specified, will try to load from default paths based on network
     #[arg(short, long)]
     config: Option<PathBuf>,
+
+    /// Directory to dump epoch state JSON files (for comparison with Haskell cardano-node)
+    #[arg(long)]
+    dump_epoch_dir: Option<PathBuf>,
+
+    /// Wipe all ledger state and re-sync from genesis.
+    /// Use this when genesis parameters have changed or state is known to be corrupt.
+    #[arg(long, default_value_t = false)]
+    reset_genesis: bool,
 }
 
 #[tokio::main]
@@ -70,6 +79,19 @@ async fn main() -> Result<()> {
 
     info!("Network: {}", network.as_str());
     info!("Database: {}", args.db_path);
+
+    // Wipe state if --reset-genesis was requested
+    if args.reset_genesis {
+        let network_db = PathBuf::from(&args.db_path).join("node").join(network.as_str());
+        if network_db.exists() {
+            info!("⚠️  --reset-genesis: wiping ledger state at {}", network_db.display());
+            std::fs::remove_dir_all(&network_db)
+                .with_context(|| format!("Failed to remove {}", network_db.display()))?;
+            info!("✅ Ledger state wiped. Re-syncing from genesis.");
+        } else {
+            info!("--reset-genesis: no existing state at {}, nothing to wipe", network_db.display());
+        }
+    }
 
     // Open node storage
     let mut storage = NodeStorage::open(PathBuf::from(&args.db_path), network.clone())?;
@@ -129,6 +151,7 @@ async fn main() -> Result<()> {
         info!("🆕 Initializing fresh ledger state");
         load_genesis_and_init_ledger(args.config.as_ref(), &network)?
     };
+
 
     // Start processing blocks
     let mut blocks_processed = 0u64;
@@ -205,6 +228,13 @@ async fn main() -> Result<()> {
                             info!("⚙️  Processing epoch transition in ledger state...");
                             ledger_state.process_epoch_transition(EpochNo(epoch));
 
+                            // 2a. Dump epoch state to JSON for comparison with Haskell
+                            if let Some(ref dump_dir) = args.dump_epoch_dir {
+                                if let Err(e) = ledger_state.dump_epoch_state(dump_dir.as_path(), slot) {
+                                    error!("Failed to dump epoch state: {}", e);
+                                }
+                            }
+
                             // 3. Snapshot complete ledger state to disk
                             info!("💾 Snapshotting complete ledger state for epoch {} at slot {}...", epoch, slot);
                             match storage.snapshot_full_ledger_state(epoch, slot, &ledger_state) {
@@ -223,8 +253,8 @@ async fn main() -> Result<()> {
                                     info!("   • Total staked: {} ADA", total_stake / 1_000_000);
                                     info!("   • Active pools: {}", pool_count);
                                     info!("   • Reward accounts: {}", reward_accounts);
-                                    info!("   • Treasury: {} ADA", ledger_state.treasury.0 / 1_000_000);
-                                    info!("   • Reserves: {} ADA", ledger_state.reserves.0 / 1_000_000);
+                                    info!("   • Treasury: {} lovelace ({} ADA)", ledger_state.treasury.0, ledger_state.treasury.0 / 1_000_000);
+                                    info!("   • Reserves: {} lovelace ({} ADA)", ledger_state.reserves.0, ledger_state.reserves.0 / 1_000_000);
                                 }
                                 Err(e) => {
                                     error!("❌ Failed to snapshot ledger state: {}", e);
@@ -293,7 +323,14 @@ fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Op
 
     let slot = block.slot();
     let hash = block.hash().to_vec();
+
     let tx_count = block.txs().len();
+
+    // ALWAYS log any block with transactions
+    if tx_count > 0 {
+        tracing::info!("🔍 Found block with {} transactions at slot {} (block_size={} bytes)",
+            tx_count, slot, block_bytes.len());
+    }
 
     // Extract VRF output from block header
     let vrf_output: Option<Vec<u8>> = if let Some(babbage_block) = block.as_babbage() {
@@ -331,9 +368,19 @@ async fn process_block_simple(
 
     // Track block for leader schedule (pool that produced this block)
     if let Some(pool_id) = extract_pool_id_from_block(&block) {
-        let mut epoch_blocks = (*ledger_state.epoch_blocks_by_pool).clone();
-        *epoch_blocks.entry(pool_id).or_insert(0) += 1;
-        ledger_state.epoch_blocks_by_pool = Arc::new(epoch_blocks);
+        // Only count blocks from REGISTERED stake pools when d < 0.8 (decentralized)
+        // When d >= 0.8 (federated), don't count blocks at all - the epoch is federated
+        // and the reward formula uses eta = 1 regardless of block count
+        let d_value = ledger_state.protocol_params.decentralization.numerator as f64
+            / ledger_state.protocol_params.decentralization.denominator.max(1) as f64;
+        let is_decentralized = d_value < 0.8;
+        let is_registered = ledger_state.pool_params.contains_key(&pool_id);
+
+        if is_decentralized && is_registered {
+            let mut epoch_blocks = (*ledger_state.epoch_blocks_by_pool).clone();
+            *epoch_blocks.entry(pool_id).or_insert(0) += 1;
+            ledger_state.epoch_blocks_by_pool = Arc::new(epoch_blocks);
+        }
     }
 
     // Process each transaction
@@ -426,6 +473,11 @@ async fn process_block_simple(
             process_certificate(cert, ledger_state)?;
         }
 
+        // Extract pre-Conway protocol parameter update proposals (Shelley through Babbage)
+        if let Some(update) = tx.update() {
+            process_ppup_proposal(update, ledger_state);
+        }
+
         // Process withdrawals (reward account withdrawals)
         // Note: MultiEraWithdrawals needs special handling, simplified for now
         // TODO: Extract withdrawals from transaction and update reward accounts
@@ -434,10 +486,11 @@ async fn process_block_simple(
         let tx_fee = tx.fee().unwrap_or(0);
         ledger_state.epoch_fees.0 += tx_fee;
         if tx_fee > 0 {
-            tracing::debug!(
-                "Accumulated fee: tx_fee={}, total_epoch_fees={} lovelace",
+            tracing::info!(
+                "💰 Fee extracted: tx_fee={}, total_epoch_fees={} lovelace (slot {})",
                 tx_fee,
-                ledger_state.epoch_fees.0
+                ledger_state.epoch_fees.0,
+                slot
             );
         }
     }
@@ -471,23 +524,119 @@ fn extract_stake_credential(address: &[u8]) -> Result<Option<Vec<u8>>> {
 }
 
 fn extract_pool_id_from_block(block: &pallas_traverse::MultiEraBlock) -> Option<hayate::ledger::primitives::Hash28> {
-    // Try to get pool ID from block header
+    use blake2::{Blake2b, Digest};
+
+    // The pool ID is the blake2b-224 hash (28 bytes) of the cold vkey
+    // The block header contains the full vkey (32 bytes), so we need to hash it
     if let Some(babbage_block) = block.as_babbage() {
-        let pool_id_bytes: &[u8] = babbage_block.header.header_body.issuer_vkey.as_ref();
-        if pool_id_bytes.len() >= 28 {
+        let issuer_vkey: &[u8] = babbage_block.header.header_body.issuer_vkey.as_ref();
+        if issuer_vkey.len() == 32 {
+            let mut hasher = Blake2b::<blake2::digest::consts::U28>::new();
+            hasher.update(issuer_vkey);
+            let hash_result = hasher.finalize();
             let mut pool_id = [0u8; 28];
-            pool_id.copy_from_slice(&pool_id_bytes[..28]);
+            pool_id.copy_from_slice(&hash_result);
             return Some(pool_id);
         }
     } else if let Some(alonzo_block) = block.as_alonzo() {
-        let pool_id_bytes: &[u8] = alonzo_block.header.header_body.issuer_vkey.as_ref();
-        if pool_id_bytes.len() >= 28 {
+        let issuer_vkey: &[u8] = alonzo_block.header.header_body.issuer_vkey.as_ref();
+        if issuer_vkey.len() == 32 {
+            let mut hasher = Blake2b::<blake2::digest::consts::U28>::new();
+            hasher.update(issuer_vkey);
+            let hash_result = hasher.finalize();
             let mut pool_id = [0u8; 28];
-            pool_id.copy_from_slice(&pool_id_bytes[..28]);
+            pool_id.copy_from_slice(&hash_result);
             return Some(pool_id);
         }
     }
     None
+}
+
+/// Extract a pre-Conway protocol parameter update proposal from a transaction
+/// and record it in `pending_pp_updates` for application at the target epoch.
+///
+/// In Shelley through Babbage, transaction bodies may contain an `Update` field
+/// with proposed protocol parameter changes keyed by genesis delegate hash.
+/// When quorum (from Shelley genesis `updateQuorum`) delegates have proposed
+/// the same update for the same target epoch, those parameters are enacted
+/// at the epoch boundary.
+fn process_ppup_proposal(
+    update: pallas_traverse::MultiEraUpdate<'_>,
+    ledger_state: &mut LedgerState,
+) {
+    use hayate::ledger::primitives::{EpochNo, Rational, ProtocolParamUpdate};
+
+    let target_epoch = EpochNo(update.epoch());
+
+    // Extract proposals from Alonzo-compatible (Shelley/Allegra/Mary/Alonzo) or Babbage updates.
+    // For each genesis delegate hash and its proposed parameters, build our ProtocolParamUpdate.
+    let proposals: Vec<(hayate::ledger::primitives::Hash32, ProtocolParamUpdate)> = if let Some(alonzo_update) = update.as_alonzo() {
+        alonzo_update.proposed_protocol_parameter_updates.iter().map(|(genesis_hash, ppu)| {
+            let mut update = ProtocolParamUpdate::default();
+            update.min_fee_a = ppu.minfee_a.map(|v| v as u64);
+            update.min_fee_b = ppu.minfee_b.map(|v| v as u64);
+            update.max_block_body_size = ppu.max_block_body_size.map(|v| v as u64);
+            update.max_transaction_size = ppu.max_transaction_size.map(|v| v as u64);
+            update.max_block_header_size = ppu.max_block_header_size.map(|v| v as u64);
+            update.key_deposit = ppu.key_deposit;
+            update.pool_deposit = ppu.pool_deposit;
+            update.e_max = ppu.maximum_epoch;
+            update.n_opt = ppu.desired_number_of_stake_pools.map(|v| v as u64);
+            update.a0 = ppu.pool_pledge_influence.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.rho = ppu.expansion_rate.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.tau = ppu.treasury_growth_rate.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.decentralization = ppu.decentralization_constant.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.protocol_version = ppu.protocol_version.map(|(major, minor)| (major as u64, minor as u64));
+            update.min_pool_cost = ppu.min_pool_cost;
+            let src: &[u8] = genesis_hash.as_ref();
+            let mut hash = [0u8; 32];
+            let n = src.len().min(32);
+            hash[..n].copy_from_slice(&src[..n]);
+            (hash, update)
+        }).collect()
+    } else if let Some(babbage_update) = update.as_babbage() {
+        babbage_update.proposed_protocol_parameter_updates.iter().map(|(genesis_hash, ppu)| {
+            let mut update = ProtocolParamUpdate::default();
+            update.min_fee_a = ppu.minfee_a.map(|v| v as u64);
+            update.min_fee_b = ppu.minfee_b.map(|v| v as u64);
+            update.max_block_body_size = ppu.max_block_body_size.map(|v| v as u64);
+            update.max_transaction_size = ppu.max_transaction_size.map(|v| v as u64);
+            update.max_block_header_size = ppu.max_block_header_size.map(|v| v as u64);
+            update.key_deposit = ppu.key_deposit;
+            update.pool_deposit = ppu.pool_deposit;
+            update.e_max = ppu.maximum_epoch;
+            update.n_opt = ppu.desired_number_of_stake_pools.map(|v| v as u64);
+            update.a0 = ppu.pool_pledge_influence.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.rho = ppu.expansion_rate.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.tau = ppu.treasury_growth_rate.as_ref().map(|r| Rational { numerator: r.numerator, denominator: r.denominator });
+            update.protocol_version = ppu.protocol_version.map(|(major, minor)| (major as u64, minor as u64));
+            update.min_pool_cost = ppu.min_pool_cost;
+            let src: &[u8] = genesis_hash.as_ref();
+            let mut hash = [0u8; 32];
+            let n = src.len().min(32);
+            hash[..n].copy_from_slice(&src[..n]);
+            (hash, update)
+        }).collect()
+    } else {
+        return;
+    };
+
+    if proposals.is_empty() {
+        return;
+    }
+
+    tracing::info!(
+        target_epoch = target_epoch.0,
+        n_proposals = proposals.len(),
+        "Recording pre-Conway protocol parameter update proposals"
+    );
+
+    let entry = ledger_state.pending_pp_updates
+        .entry(target_epoch)
+        .or_insert_with(Vec::new);
+    for (hash, ppu) in proposals {
+        entry.push((hash, ppu));
+    }
 }
 
 fn process_certificate(
@@ -549,7 +698,7 @@ fn process_alonzo_certificate(
     ledger_state: &mut LedgerState,
 ) -> Result<()> {
     use hayate::ledger::primitives::{Hash32, Lovelace, EpochNo};
-    use hayate::ledger::state::PoolRegistration;
+    use hayate::ledger::state::{PoolRegistration, DepositType};
     use std::sync::Arc;
     use pallas_primitives::alonzo::Certificate;
 
@@ -560,8 +709,14 @@ fn process_alonzo_certificate(
                 hash[..28].copy_from_slice(&cred_hash);
 
                 let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                reward_accounts.entry(hash).or_insert(Lovelace(0));
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
                 ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                // Track deposit only on new registrations (not re-registrations)
+                if is_new {
+                    let key_deposit = Lovelace(ledger_state.protocol_params.key_deposit);
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, key_deposit);
+                }
 
                 tracing::debug!("Stake registered: {}", hex::encode(&hash[..8]));
             }
@@ -579,6 +734,8 @@ fn process_alonzo_certificate(
                 let mut reward_accounts = (*ledger_state.reward_accounts).clone();
                 reward_accounts.remove(&hash);
                 ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                ledger_state.deposit_tracker.refund_deposit(&hash, DepositType::Stake);
 
                 tracing::debug!("Stake deregistered: {}", hex::encode(&hash[..8]));
             }
@@ -653,8 +810,19 @@ fn process_alonzo_certificate(
                 };
 
                 let mut pool_params = (*ledger_state.pool_params).clone();
-                pool_params.insert(pool_id, pool_reg);
+                let is_new_pool = pool_params.insert(pool_id, pool_reg).is_none();
                 ledger_state.pool_params = Arc::new(pool_params);
+
+                // Track deposit only on new pool registrations (not updates/re-registrations)
+                if is_new_pool {
+                    let pool_dep_key = {
+                        let mut k = [0u8; 32];
+                        k[..28].copy_from_slice(&pool_id);
+                        k
+                    };
+                    let pool_deposit = Lovelace(ledger_state.protocol_params.pool_deposit);
+                    ledger_state.deposit_tracker.add_deposit(pool_dep_key, DepositType::Pool, pool_deposit);
+                }
 
                 tracing::info!("Pool registered: {} (pledge: {} ADA)",
                     hex::encode(&pool_id[..8]),
@@ -690,7 +858,7 @@ fn process_conway_certificate(
     ledger_state: &mut LedgerState,
 ) -> Result<()> {
     use hayate::ledger::primitives::{Hash32, Lovelace, EpochNo};
-    use hayate::ledger::state::PoolRegistration;
+    use hayate::ledger::state::{PoolRegistration, DepositType};
     use std::sync::Arc;
     use pallas_primitives::conway::Certificate;
 
@@ -702,8 +870,14 @@ fn process_conway_certificate(
                 hash[..28].copy_from_slice(&cred_hash);
 
                 let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                reward_accounts.entry(hash).or_insert(Lovelace(0));
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
                 ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                // Track deposit only on new registrations (not re-registrations)
+                if is_new {
+                    let key_deposit = Lovelace(ledger_state.protocol_params.key_deposit);
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, key_deposit);
+                }
 
                 tracing::debug!("Stake registered: {}", hex::encode(&hash[..8]));
             }
@@ -721,6 +895,8 @@ fn process_conway_certificate(
                 let mut reward_accounts = (*ledger_state.reward_accounts).clone();
                 reward_accounts.remove(&hash);
                 ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                ledger_state.deposit_tracker.refund_deposit(&hash, DepositType::Stake);
 
                 tracing::debug!("Stake deregistered: {}", hex::encode(&hash[..8]));
             }
@@ -795,8 +971,19 @@ fn process_conway_certificate(
                 };
 
                 let mut pool_params = (*ledger_state.pool_params).clone();
-                pool_params.insert(pool_id, pool_reg);
+                let is_new_pool = pool_params.insert(pool_id, pool_reg).is_none();
                 ledger_state.pool_params = Arc::new(pool_params);
+
+                // Track deposit only on new pool registrations (not updates/re-registrations)
+                if is_new_pool {
+                    let pool_dep_key = {
+                        let mut k = [0u8; 32];
+                        k[..28].copy_from_slice(&pool_id);
+                        k
+                    };
+                    let pool_deposit = Lovelace(ledger_state.protocol_params.pool_deposit);
+                    ledger_state.deposit_tracker.add_deposit(pool_dep_key, DepositType::Pool, pool_deposit);
+                }
 
                 tracing::info!("Pool registered: {} (pledge: {} ADA)",
                     hex::encode(&pool_id[..8]),
@@ -819,12 +1006,39 @@ fn process_conway_certificate(
         }
 
         // Conway-specific governance certificates
-        Certificate::Reg(stake_cred, _deposit) |
+        Certificate::Reg(stake_cred, deposit) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+
+                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
+                ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                if is_new {
+                    // Use the explicit deposit amount from the certificate
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, Lovelace(*deposit));
+                }
+                tracing::debug!("Conway stake registered: {}", hex::encode(&cred_hash[..8]));
+            }
+        }
         Certificate::UnReg(stake_cred, _deposit) => {
             if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                tracing::debug!("Conway stake registration/deregistration with deposit: {}", hex::encode(&cred_hash[..8]));
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+
+                let mut delegations = (*ledger_state.delegations).clone();
+                delegations.remove(&hash);
+                ledger_state.delegations = Arc::new(delegations);
+
+                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
+                reward_accounts.remove(&hash);
+                ledger_state.reward_accounts = Arc::new(reward_accounts);
+
+                ledger_state.deposit_tracker.refund_deposit(&hash, DepositType::Stake);
+
+                tracing::debug!("Conway stake deregistered: {}", hex::encode(&cred_hash[..8]));
             }
-            // TODO: Track deposits in DepositTracker
         }
 
         Certificate::VoteDeleg(_, _) |
@@ -920,6 +1134,7 @@ fn load_genesis_and_init_ledger(
                         pp.pool_deposit,
                         pp.key_deposit,
                         pp.min_pool_cost,
+                        Some(shelley_genesis.active_slots_coeff),
                     );
 
                     info!(
@@ -953,3 +1168,5 @@ fn load_genesis_and_init_ledger(
 
     Ok(ledger_state)
 }
+
+

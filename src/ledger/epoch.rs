@@ -4,8 +4,10 @@
 // This ties together all the ledger state components at epoch boundaries
 
 use super::primitives::*;
-use super::state::LedgerState;
+use super::state::{LedgerState, PoolRegistration};
+use serde_json::json;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 impl LedgerState {
@@ -37,37 +39,99 @@ impl LedgerState {
         // - SNAP updates current_epoch_fees = fees from epoch 0
         // - At epoch 1→2: current_epoch_fees=fees from epoch 0, used by RUPD
         // - So fees from epoch N are used at epoch N+1→N+2
-        let fees_for_rewards = self.snapshots.current_epoch_fees;
-        let rupd = if let Some(ref go_snapshot) = self.snapshots.go {
-            self.calculate_rewards(go_snapshot, fees_for_rewards)
+        // CRITICAL: Use blocks from the MARK snapshot
+        // At epoch N→N+1 transition (BEFORE rotation):
+        // - Epoch N just ended, we payout rewards for blocks made in epoch N-1
+        // - The mark snapshot contains epoch N-1 data (created at end of epoch N-1)
+        // - After payout, we rotate: go←set, set←mark, create new mark
+        //
+        // The d parameter from the protocol params will handle federated vs decentralized:
+        // - d >= 0.8: eta = 1 (full expansion regardless of blocks)
+        // - d < 0.8: eta = min(1, actual_blocks / expected_blocks)
+        let blocks_for_rewards = if let Some(ref mark_snapshot) = self.snapshots.mark {
+            let mark_total_blocks: u64 = mark_snapshot.epoch_blocks_by_pool.values().sum();
+            tracing::info!(
+                "Using blocks from mark snapshot: epoch={}, blocks={}",
+                mark_snapshot.epoch.0,
+                mark_total_blocks
+            );
+            Arc::clone(&mark_snapshot.epoch_blocks_by_pool)
         } else {
-            // Early epochs before go snapshot exists: create empty snapshot
-            // This allows reward calculation to run, with all rewards undistributed
+            tracing::info!("No mark snapshot available, using empty blocks");
+            Arc::new(HashMap::new())
+        };
+
+        let fees_for_rewards = self.snapshots.current_epoch_fees;
+        let rupd = if let (Some(ref go_snapshot), Some(ref mark_snapshot)) =
+            (&self.snapshots.go, &self.snapshots.mark)
+        {
+            // Use GO snapshot for stake distribution (standard Cardano model)
+            // but MARK snapshot blocks (epoch N-1 at transition N→N+1)
+            let mut reward_snapshot = (*go_snapshot).clone();
+            reward_snapshot.epoch_blocks_by_pool = blocks_for_rewards;
+            self.calculate_rewards(&reward_snapshot, fees_for_rewards)
+        } else if let Some(ref mark_snapshot) = self.snapshots.mark {
+            // Fallback: use mark for both if go doesn't exist yet
+            let mut reward_snapshot = (*mark_snapshot).clone();
+            reward_snapshot.epoch_blocks_by_pool = blocks_for_rewards;
+            self.calculate_rewards(&reward_snapshot, fees_for_rewards)
+        } else {
+            // Early epochs before set snapshot exists: create empty snapshot with appropriate blocks
             let empty_snapshot = super::state::StakeSnapshot {
                 epoch: self.epoch,
                 delegations: Arc::new(HashMap::new()),
                 pool_stake: HashMap::new(),
                 pool_params: Arc::clone(&self.pool_params),
                 stake_distribution: Arc::new(HashMap::new()),
+                epoch_blocks_by_pool: blocks_for_rewards,
             };
             self.calculate_rewards(&empty_snapshot, fees_for_rewards)
         };
 
+        // Store for debugging/comparison
+        self.last_applied_rupd = Some(rupd.clone());
+        tracing::info!(
+            "Stored last_applied_rupd with eta={}, deltaR1={}",
+            rupd.eta,
+            rupd.delta_r1
+        );
+
         // Apply the RUPD immediately (not deferred)
-        // Note: delta_reserves represents the NET decrease in reserves
-        // When all rewards are undistributed and fees > treasury_cut, reserves actually INCREASE
-        // In that case, delta_reserves will be 0 (clamped from negative)
-        // The actual increase happens via the reward pot flowing back
+        // Reserves: subtract expansion, add back undistributed rewards
         self.reserves.0 = self.reserves.0.saturating_sub(rupd.delta_reserves);
+        self.reserves.0 = self.reserves.0.saturating_add(rupd.undistributed);
+
+        // Treasury: add tau cut
         self.treasury.0 = self.treasury.0.saturating_add(rupd.delta_treasury);
 
         // Apply per-account rewards
+        // CRITICAL: Only pay rewards to REGISTERED accounts (that already exist in reward_accounts)
+        // Rewards to unregistered accounts should go to treasury (tracked separately)
+        let mut unregistered_rewards = Lovelace(0);
         for (cred_hash, reward) in &rupd.rewards {
             if reward.0 > 0 {
-                *Arc::make_mut(&mut self.reward_accounts)
-                    .entry(*cred_hash)
-                    .or_insert(Lovelace(0)) += *reward;
+                // Check if account is registered
+                if Arc::make_mut(&mut self.reward_accounts).contains_key(cred_hash) {
+                    *Arc::make_mut(&mut self.reward_accounts)
+                        .get_mut(cred_hash)
+                        .unwrap() += *reward;
+                } else {
+                    // Account not registered - reward goes to treasury
+                    unregistered_rewards.0 += reward.0;
+                }
             }
+        }
+
+        // Add unregistered account rewards to treasury
+        // NOTE: Do NOT adjust reserves here. rupd.undistributed already accounts for all
+        // computed rewards (including unregistered ones), so reserves were correctly adjusted
+        // via the existing +rupd.undistributed above. Subtracting again would double-deduct.
+        if unregistered_rewards.0 > 0 {
+            tracing::info!(
+                "Unregistered account rewards going to treasury: {} lovelace",
+                unregistered_rewards.0
+            );
+            self.treasury.0 = self.treasury.0.saturating_add(unregistered_rewards.0);
         }
 
         tracing::debug!(
@@ -76,6 +140,22 @@ impl LedgerState {
             rupd.delta_treasury,
             rupd.delta_reserves
         );
+
+        // CRITICAL: Update protocol parameters for new epoch AFTER rewards are calculated
+        // Babbage era (epoch 2+) removes the decentralization parameter (d=0)
+        // This must happen AFTER reward calculation because epoch N→N+1 transition
+        // uses epoch N's parameters, not epoch N+1's parameters
+        if new_epoch.0 >= 2 && self.protocol_params.decentralization.numerator != 0 {
+            tracing::info!(
+                "Babbage era: setting decentralization parameter d=0 (was {}/{})",
+                self.protocol_params.decentralization.numerator,
+                self.protocol_params.decentralization.denominator
+            );
+            self.protocol_params.decentralization = Rational {
+                numerator: 0,
+                denominator: 1,
+            };
+        }
 
         // Step 2: NOW rotate snapshots (AFTER reward calculation, matching Haskell SNAP rule)
         // This happens AFTER RUPD in Haskell's NEWEPOCH rule
@@ -89,8 +169,10 @@ impl LedgerState {
         // TODO: Implement rebuild_stake_distribution() that queries utxo_tree
 
         // Step 5: Build new mark snapshot
-        // Per Cardano spec, total stake = UTxO-delegated stake + reward account balance + deposits
-        // CRITICAL: Account for deposits correctly (voting vs staking stake)
+        // Per Cardano spec, stake snapshot = UTxO-delegated stake + reward account balance.
+        // Deposits are NOT included — they are tracked separately in esDeposited and do not
+        // contribute to pool sigma or member reward calculations. Including deposits would
+        // inflate sigma and over-distribute rewards.
         let mut pool_stake: HashMap<Hash28, Lovelace> =
             HashMap::with_capacity(self.pool_params.len());
 
@@ -107,26 +189,16 @@ impl LedgerState {
                 .copied()
                 .unwrap_or(Lovelace(0));
 
-            // CRITICAL: Use staking_stake (excludes governance/DRep deposits)
-            // NOT voting_stake (includes all deposits)
-            let deposit_stake = self.deposit_tracker.get_staking_stake(cred_hash);
-
-            let total_stake = utxo_stake + reward_balance + deposit_stake;
+            let total_stake = utxo_stake + reward_balance;
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
-        // Build per-credential stake including reward balances AND deposits
+        // Build per-credential stake: UTxO stake + reward account balance only (no deposits).
+        // Matches Haskell's spssStake in StakePoolSnapshot.
         let mut snapshot_stake = self.stake_distribution.stake_map.clone();
         for (cred_hash, reward) in self.reward_accounts.iter() {
             if reward.0 > 0 {
                 *snapshot_stake.entry(*cred_hash).or_insert(Lovelace(0)) += *reward;
-            }
-        }
-        // Add voting stake (includes ALL deposits)
-        for (cred_hash, deposits) in &self.deposit_tracker.deposits {
-            let voting_deposit = deposits.voting_stake();
-            if voting_deposit.0 > 0 {
-                *snapshot_stake.entry(*cred_hash).or_insert(Lovelace(0)) += voting_deposit;
             }
         }
 
@@ -157,14 +229,16 @@ impl LedgerState {
             pool_stake,
             pool_params: Arc::clone(&self.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
+            epoch_blocks_by_pool: Arc::clone(&self.epoch_blocks_by_pool),
         };
 
         // Store in mark for the 3-snapshot rotation pattern
         self.snapshots.mark = Some(new_snapshot.clone());
 
-        // ALSO store in set so it becomes `go` next epoch (used for rewards at N+1)
-        // This matches Haskell's behavior where fees are used 1 epoch later, not 2
-        if self.snapshots.set.is_none() {
+        // Bootstrap: In epoch 0 only, populate set so that rotation at epoch 1→2 gives us go=epoch0
+        // This ensures at epoch 2→3, we use go=epoch0 for reward calculation
+        // Only bootstrap in epoch 0 (before first Babbage epoch)
+        if self.epoch.0 == 0 {
             self.snapshots.set = Some(new_snapshot);
         }
 
@@ -184,7 +258,8 @@ impl LedgerState {
                         .or_insert(Lovelace(0)) += pool_deposit;
 
                     // Also refund deposit from tracker
-                    self.deposit_tracker.refund_deposit(&op_key, super::state::DepositType::Pool);
+                    self.deposit_tracker
+                        .refund_deposit(&op_key, super::state::DepositType::Pool);
 
                     tracing::debug!(
                         "Pool retired at epoch {}: {} (deposit {} refunded)",
@@ -201,16 +276,66 @@ impl LedgerState {
             .retain(|epoch, _| *epoch >= new_epoch);
 
         // Step 7: Apply pre-Conway protocol parameter updates (PPUP rule)
-        // Simplified version - full implementation would merge proposals
-        if let Some(_proposals) = self.pending_pp_updates.remove(&self.epoch) {
-            // TODO: Implement protocol parameter update merging and application
-            tracing::debug!(
+        //
+        // In Haskell, proposals targeting the new epoch are enacted if at least
+        // `updateQuorum` genesis delegates have submitted identical proposals.
+        // We implement the same vote-counting logic: group proposals by their
+        // content and enact any group that reaches quorum.
+        if let Some(proposals) = self.pending_pp_updates.remove(&new_epoch) {
+            let quorum = self.update_quorum;
+            let n_proposals = proposals.len() as u64;
+            tracing::info!(
                 epoch = new_epoch.0,
-                "Pre-Conway protocol parameter updates (stubbed)"
+                n_proposals,
+                quorum,
+                "Evaluating pre-Conway protocol parameter update proposals"
             );
+
+            if n_proposals >= quorum {
+                // Merge all proposals: for each field, if any proposal sets it,
+                // apply the first (all agreeing delegates propose the same values).
+                // This is equivalent to Haskell's `votedValue` when quorum is met.
+                let mut merged = crate::ledger::primitives::ProtocolParamUpdate::default();
+                for (_genesis_hash, update) in &proposals {
+                    if merged.min_fee_a.is_none() { merged.min_fee_a = update.min_fee_a; }
+                    if merged.min_fee_b.is_none() { merged.min_fee_b = update.min_fee_b; }
+                    if merged.max_block_body_size.is_none() { merged.max_block_body_size = update.max_block_body_size; }
+                    if merged.max_transaction_size.is_none() { merged.max_transaction_size = update.max_transaction_size; }
+                    if merged.max_block_header_size.is_none() { merged.max_block_header_size = update.max_block_header_size; }
+                    if merged.protocol_version.is_none() { merged.protocol_version = update.protocol_version; }
+                    if merged.key_deposit.is_none() { merged.key_deposit = update.key_deposit; }
+                    if merged.pool_deposit.is_none() { merged.pool_deposit = update.pool_deposit; }
+                    if merged.min_pool_cost.is_none() { merged.min_pool_cost = update.min_pool_cost; }
+                    if merged.rho.is_none() { merged.rho = update.rho; }
+                    if merged.tau.is_none() { merged.tau = update.tau; }
+                    if merged.a0.is_none() { merged.a0 = update.a0; }
+                    if merged.n_opt.is_none() { merged.n_opt = update.n_opt; }
+                    if merged.e_max.is_none() { merged.e_max = update.e_max; }
+                    if merged.decentralization.is_none() { merged.decentralization = update.decentralization; }
+                }
+                if let Err(e) = self.apply_protocol_param_update(&merged) {
+                    tracing::warn!(epoch = new_epoch.0, error = %e, "Failed to apply protocol parameter update");
+                } else {
+                    tracing::info!(
+                        epoch = new_epoch.0,
+                        n_opt = ?merged.n_opt,
+                        rho = ?merged.rho,
+                        tau = ?merged.tau,
+                        "Applied pre-Conway protocol parameter update"
+                    );
+                }
+            } else {
+                tracing::debug!(
+                    epoch = new_epoch.0,
+                    n_proposals,
+                    quorum,
+                    "Not enough proposals for quorum, skipping protocol parameter update"
+                );
+            }
         }
+        // Discard proposals targeting epochs earlier than the new epoch
         self.pending_pp_updates
-            .retain(|epoch, _| *epoch >= new_epoch);
+            .retain(|epoch, _| *epoch > new_epoch);
 
         // Step 8: Ratify governance proposals (stubbed for now, full implementation in task #6)
         // TODO: Implement full governance ratification in task #6
@@ -227,8 +352,9 @@ impl LedgerState {
 
         if !expired.is_empty() {
             for action_id in &expired {
-                if let Some(proposal_state) =
-                    Arc::make_mut(&mut self.governance).proposals.remove(action_id)
+                if let Some(proposal_state) = Arc::make_mut(&mut self.governance)
+                    .proposals
+                    .remove(action_id)
                 {
                     // Refund deposit to return address
                     let deposit = proposal_state.procedure.deposit;
@@ -244,8 +370,10 @@ impl LedgerState {
                             .or_insert(Lovelace(0)) += deposit;
 
                         // Refund from deposit tracker
-                        self.deposit_tracker
-                            .refund_deposit(&return_cred_hash, super::state::DepositType::Governance(*action_id));
+                        self.deposit_tracker.refund_deposit(
+                            &return_cred_hash,
+                            super::state::DepositType::Governance(*action_id),
+                        );
                     }
                     tracing::debug!(
                         "Governance proposal expired at epoch {}: {:?} (deposit {} returned)",
@@ -258,7 +386,9 @@ impl LedgerState {
 
             // Remove votes for expired proposals
             for id in &expired {
-                Arc::make_mut(&mut self.governance).votes_by_action.remove(id);
+                Arc::make_mut(&mut self.governance)
+                    .votes_by_action
+                    .remove(id);
             }
 
             tracing::debug!(
@@ -276,8 +406,7 @@ impl LedgerState {
             let mut newly_inactive = 0u64;
             let mut reactivated = 0u64;
             for drep in Arc::make_mut(&mut self.governance).dreps.values_mut() {
-                let inactive =
-                    new_epoch.0.saturating_sub(drep.last_active_epoch.0) > drep_activity;
+                let inactive = new_epoch.0.saturating_sub(drep.last_active_epoch.0) > drep_activity;
                 if inactive && drep.active {
                     drep.active = false;
                     newly_inactive += 1;
@@ -345,6 +474,197 @@ impl LedgerState {
         Arc::make_mut(&mut self.governance).last_ratified.clear();
         Arc::make_mut(&mut self.governance).last_ratify_delayed = false;
     }
+
+    /// Dump epoch state to JSON file for comparison with Haskell cardano-node
+    pub fn dump_epoch_state(&self, dump_dir: &Path, slot: u64) -> Result<(), std::io::Error> {
+        let filename = format!("{}-hayate.json", self.epoch.0);
+        let filepath = dump_dir.join(filename);
+
+        // Helper to format stake map to match Haskell format
+        let format_stake = |stake: &HashMap<Hash32, Lovelace>| {
+            stake
+                .iter()
+                .map(|(k, v)| (format!("keyHash-{}", hex::encode(k)), json!(v.0)))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+
+        // Helper to format delegations to match Haskell format
+        let format_delegations = |delegations: &HashMap<Hash32, Hash28>| {
+            delegations
+                .iter()
+                .map(|(k, v)| (format!("keyHash-{}", hex::encode(k)), json!(hex::encode(v))))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+
+        // Helper to format pool params (pledge, cost, margin for reward diagnosis)
+        let format_pool_params = |pool_params: &HashMap<Hash28, PoolRegistration>| {
+            pool_params
+                .iter()
+                .map(|(pool_id, reg)| {
+                    let margin = if reg.margin_denominator > 0 {
+                        reg.margin_numerator as f64 / reg.margin_denominator as f64
+                    } else {
+                        0.0
+                    };
+                    (
+                        hex::encode(pool_id),
+                        json!({
+                            "poolId": hex::encode(pool_id),
+                            "pledge": reg.pledge.0,
+                            "cost": reg.cost.0,
+                            "margin": margin,
+                            "owners": reg.owners.iter().map(hex::encode).collect::<Vec<_>>(),
+                        }),
+                    )
+                })
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+
+        // Helper to create snapshot JSON (includes pool_stake and blocks for reward diagnosis)
+        let format_snapshot = |name: &str, snapshot: &Option<super::state::StakeSnapshot>| {
+            if let Some(snap) = snapshot {
+                let pool_stake: serde_json::Map<String, serde_json::Value> = snap
+                    .pool_stake
+                    .iter()
+                    .map(|(pool_id, stake)| (hex::encode(pool_id), json!(stake.0)))
+                    .collect();
+                let blocks: serde_json::Map<String, serde_json::Value> = snap
+                    .epoch_blocks_by_pool
+                    .iter()
+                    .map(|(pool_id, count)| (hex::encode(pool_id), json!(count)))
+                    .collect();
+                json!({
+                    "name": name,
+                    "epoch": snap.epoch.0,
+                    "stake": format_stake(&snap.stake_distribution),
+                    "delegations": format_delegations(&snap.delegations),
+                    "poolParams": format_pool_params(&snap.pool_params),
+                    "poolStake": pool_stake,
+                    "blocks": blocks,
+                })
+            } else {
+                json!(null)
+            }
+        };
+
+        // Calculate pool distribution for comparison
+        let pool_distribution: Vec<_> = self
+            .snapshots
+            .mark
+            .as_ref()
+            .map(|mark| {
+                let total_stake: u64 = mark.pool_stake.values().map(|l| l.0).sum();
+                mark.pool_stake
+                    .iter()
+                    .map(|(pool_id, stake)| {
+                        let stake_rational = if total_stake > 0 {
+                            stake.0 as f64 / total_stake as f64
+                        } else {
+                            0.0
+                        };
+                        json!({
+                            "poolId": hex::encode(pool_id),
+                            "stake": stake_rational,
+                            "stakePercent": stake_rational * 100.0,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Aggregate deposits by type for comparison with Haskell
+        let mut total_pool_deposits: u64 = 0;
+        let mut total_stake_deposits: u64 = 0;
+        let mut total_governance_deposits: u64 = 0;
+        let mut total_drep_deposits: u64 = 0;
+        for deposits in self.deposit_tracker.deposits.values() {
+            if let Some(d) = deposits.pool {
+                total_pool_deposits += d.0;
+            }
+            if let Some(d) = deposits.stake {
+                total_stake_deposits += d.0;
+            }
+            for (_, d) in &deposits.governance {
+                total_governance_deposits += d.0;
+            }
+            if let Some(d) = deposits.drep {
+                total_drep_deposits += d.0;
+            }
+        }
+        let total_deposits =
+            total_pool_deposits + total_stake_deposits + total_governance_deposits + total_drep_deposits;
+
+        // Include RUPD intermediate values for comparison with Haskell
+        let rupd_values = if let Some(rupd) = &self.last_applied_rupd {
+            tracing::info!("Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
+            json!({
+                "eta": rupd.eta,
+                "deltaR1": rupd.delta_r1,
+                "rPot": rupd.r_pot,
+                "deltaT1": rupd.delta_t1,
+                "rewardPot": rupd.reward_pot_after_treasury,
+                "totalDistributed": rupd.total_distributed,
+                "deltaR2": rupd.undistributed,
+            })
+        } else {
+            tracing::info!(
+                "last_applied_rupd is None when dumping epoch {}",
+                self.epoch.0
+            );
+            json!(null)
+        };
+
+        let pp = &self.protocol_params;
+        let rho_f = pp.rho.numerator as f64 / pp.rho.denominator.max(1) as f64;
+        let tau_f = pp.tau.numerator as f64 / pp.tau.denominator.max(1) as f64;
+        let a0_f = pp.a0.numerator as f64 / pp.a0.denominator.max(1) as f64;
+        let d_f = pp.decentralization.numerator as f64 / pp.decentralization.denominator.max(1) as f64;
+
+        let json_output = json!({
+            "epoch": self.epoch.0,
+            "slot": slot,
+            "snapshotEraName": "Babbage", // TODO: Track actual era
+            "treasury": self.treasury.0,
+            "reserves": self.reserves.0,
+            "protocolParams": {
+                "nOpt": pp.n_opt,
+                "a0": a0_f,
+                "rho": rho_f,
+                "tau": tau_f,
+                "d": d_f,
+                "minPoolCost": pp.min_pool_cost,
+                "protocolVersion": {
+                    "major": pp.protocol_version_major,
+                    "minor": pp.protocol_version_minor,
+                },
+            },
+            "totalPools": self.pool_params.len(),
+            "totalStake": pool_distribution.iter().map(|p| p["stake"].as_f64().unwrap_or(0.0)).sum::<f64>(),
+            "poolDistribution": pool_distribution,
+            "epochFees": self.snapshots.current_epoch_fees.0,
+            "deposits": {
+                "pool": total_pool_deposits,
+                "stakeKey": total_stake_deposits,
+                "proposal": total_governance_deposits,
+                "dRep": total_drep_deposits,
+                "total": total_deposits,
+            },
+            "rupd": rupd_values,
+            "snapshots": {
+                "mark": format_snapshot("mark", &self.snapshots.mark),
+                "set": format_snapshot("set", &self.snapshots.set),
+                "go": format_snapshot("go", &self.snapshots.go),
+            }
+        });
+
+        std::fs::write(&filepath, serde_json::to_string_pretty(&json_output)?)?;
+        tracing::info!(
+            "📝 Dumped epoch {} state to {}",
+            self.epoch.0,
+            filepath.display()
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +697,7 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
+                epoch_blocks_by_pool: Arc::new(HashMap::new()),
             }),
             set: Some(StakeSnapshot {
                 epoch: EpochNo(99),
@@ -384,6 +705,7 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
+                epoch_blocks_by_pool: Arc::new(HashMap::new()),
             }),
             go: Some(StakeSnapshot {
                 epoch: EpochNo(98),
@@ -391,6 +713,7 @@ mod tests {
                 pool_stake: HashMap::new(),
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
+                epoch_blocks_by_pool: Arc::new(HashMap::new()),
             }),
             current_epoch_fees: Lovelace(0),
         };
@@ -398,8 +721,9 @@ mod tests {
         state.process_epoch_transition(EpochNo(101));
 
         // Verify rotation: go = old set, set = old mark, mark = new
+        // The new mark snapshot records the epoch that ENDED (100), not the new epoch (101).
         assert_eq!(state.snapshots.go.as_ref().unwrap().epoch.0, 99);
         assert_eq!(state.snapshots.set.as_ref().unwrap().epoch.0, 100);
-        assert_eq!(state.snapshots.mark.as_ref().unwrap().epoch.0, 101);
+        assert_eq!(state.snapshots.mark.as_ref().unwrap().epoch.0, 100);
     }
 }

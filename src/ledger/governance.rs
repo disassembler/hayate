@@ -796,25 +796,35 @@ impl LedgerState {
 
     /// Apply a protocol parameter update.
     ///
-    /// Validates and applies parameter changes from a governance action.
-    fn apply_protocol_param_update(&mut self, update: &ProtocolParamUpdate) -> Result<(), String> {
-        // Apply updates to protocol parameters
-        if let Some(v) = update.min_fee_a {
-            self.protocol_params.min_fee_a = v;
+    /// Validates and applies parameter changes from a governance action or
+    /// a pre-Conway PPUP proposal.
+    pub fn apply_protocol_param_update(&mut self, update: &ProtocolParamUpdate) -> Result<(), String> {
+        // Network group
+        if let Some(v) = update.min_fee_a { self.protocol_params.min_fee_a = v; }
+        if let Some(v) = update.min_fee_b { self.protocol_params.min_fee_b = v; }
+        if let Some(v) = update.max_block_body_size { self.protocol_params.max_block_body_size = v; }
+        if let Some(v) = update.max_transaction_size { self.protocol_params.max_transaction_size = v; }
+        if let Some(v) = update.max_block_header_size { self.protocol_params.max_block_header_size = v; }
+        if let Some((major, minor)) = update.protocol_version {
+            self.protocol_params.protocol_version_major = major;
+            self.protocol_params.protocol_version_minor = minor;
         }
-        if let Some(v) = update.min_fee_b {
-            self.protocol_params.min_fee_b = v;
+        // Economic group
+        if let Some(v) = update.key_deposit { self.protocol_params.key_deposit = v; }
+        if let Some(v) = update.pool_deposit { self.protocol_params.pool_deposit = v; }
+        if let Some(v) = update.min_pool_cost {
+            self.protocol_params.min_pool_cost = v;
+            self.protocol_params.min_pool_cost_lovelace = v;
         }
-        if let Some(v) = update.max_block_body_size {
-            self.protocol_params.max_block_body_size = v;
-        }
-        if let Some(v) = update.max_transaction_size {
-            self.protocol_params.max_transaction_size = v;
-        }
+        if let Some(v) = update.rho { self.protocol_params.rho = v; }
+        if let Some(v) = update.tau { self.protocol_params.tau = v; }
+        if let Some(v) = update.a0 { self.protocol_params.a0 = v; }
+        // Technical group
+        if let Some(v) = update.n_opt { self.protocol_params.n_opt = v; }
+        if let Some(v) = update.e_max { self.protocol_params.e_max = v; }
+        if let Some(v) = update.decentralization { self.protocol_params.decentralization = v; }
 
-        // TODO: Add more parameter fields as needed
-
-        tracing::debug!("Protocol parameters updated via governance");
+        tracing::debug!("Protocol parameters updated");
         Ok(())
     }
 }
@@ -844,7 +854,10 @@ pub(crate) type PPGroup = (DRepPPGroup, StakePoolPPGroup);
 /// Each parameter belongs to exactly one (DRepPPGroup, StakePoolPPGroup) pair.
 /// Classification matches Haskell cardano-ledger Conway ConwayPParams field tags.
 ///
-/// TODO: Expand this as more fields are added to ProtocolParamUpdate
+/// Determine which PP groups are modified by a ProtocolParamUpdate.
+///
+/// Each parameter belongs to exactly one (DRepPPGroup, StakePoolPPGroup) pair.
+/// Classification matches Haskell cardano-ledger Conway ConwayPParams field tags.
 pub(crate) fn modified_pp_groups(ppu: &ProtocolParamUpdate) -> Vec<PPGroup> {
     use DRepPPGroup::*;
     use StakePoolPPGroup::*;
@@ -852,20 +865,25 @@ pub(crate) fn modified_pp_groups(ppu: &ProtocolParamUpdate) -> Vec<PPGroup> {
     let mut groups = Vec::new();
 
     // Network + Security
-    if ppu.max_block_body_size.is_some() {
-        groups.push((Network, Security));
-    }
-    if ppu.max_transaction_size.is_some() {
-        groups.push((Network, Security));
-    }
+    if ppu.max_block_body_size.is_some() { groups.push((Network, Security)); }
+    if ppu.max_transaction_size.is_some() { groups.push((Network, Security)); }
+    if ppu.max_block_header_size.is_some() { groups.push((Network, Security)); }
+    if ppu.protocol_version.is_some() { groups.push((Network, Security)); }
 
     // Economic + Security
-    if ppu.min_fee_a.is_some() {
-        groups.push((Economic, Security));
-    }
-    if ppu.min_fee_b.is_some() {
-        groups.push((Economic, Security));
-    }
+    if ppu.min_fee_a.is_some() { groups.push((Economic, Security)); }
+    if ppu.min_fee_b.is_some() { groups.push((Economic, Security)); }
+    if ppu.key_deposit.is_some() { groups.push((Economic, NoVote)); }
+    if ppu.pool_deposit.is_some() { groups.push((Economic, NoVote)); }
+    if ppu.min_pool_cost.is_some() { groups.push((Economic, NoVote)); }
+    if ppu.rho.is_some() { groups.push((Economic, NoVote)); }
+    if ppu.tau.is_some() { groups.push((Economic, NoVote)); }
+    if ppu.a0.is_some() { groups.push((Economic, NoVote)); }
+
+    // Technical + Security
+    if ppu.n_opt.is_some() { groups.push((Technical, Security)); }
+    if ppu.e_max.is_some() { groups.push((Technical, NoVote)); }
+    if ppu.decentralization.is_some() { groups.push((Technical, Security)); }
 
     groups
 }

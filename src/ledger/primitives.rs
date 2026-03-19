@@ -190,7 +190,7 @@ pub enum Vote {
 }
 
 /// Rational number (for protocol parameters)
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rational {
     pub numerator: u64,
     pub denominator: u64,
@@ -380,14 +380,30 @@ pub enum GovernanceAction {
     InfoAction,
 }
 
-/// Protocol parameter update
+/// Protocol parameter update (pre-Conway and Conway governance)
+///
+/// Fields correspond to the CDDL protocol_param_update map (Shelley through Babbage).
+/// All fields are optional; only set fields are applied when an update is enacted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProtocolParamUpdate {
+    // Network group
     pub min_fee_a: Option<u64>,
     pub min_fee_b: Option<u64>,
     pub max_block_body_size: Option<u64>,
     pub max_transaction_size: Option<u64>,
-    // Add more fields as needed
+    pub max_block_header_size: Option<u64>,
+    pub protocol_version: Option<(u64, u64)>,
+    // Economic group
+    pub key_deposit: Option<u64>,
+    pub pool_deposit: Option<u64>,
+    pub min_pool_cost: Option<u64>,
+    pub rho: Option<Rational>,      // monetary expansion rate
+    pub tau: Option<Rational>,      // treasury growth rate
+    pub a0: Option<Rational>,       // pool pledge influence
+    // Technical group
+    pub n_opt: Option<u64>,         // optimal pool count (k)
+    pub e_max: Option<u64>,         // max pool retirement epoch
+    pub decentralization: Option<Rational>, // d parameter
 }
 
 /// Constitution
