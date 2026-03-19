@@ -1,7 +1,8 @@
 /// compare-epoch-dumps: Compare hayate epoch JSON dumps against Haskell cardano-node dumps.
 ///
-/// RUPD alignment: Haskell epoch N .rupd == Hayate epoch N+1 .rupd
-///   (Haskell stores the RUPD being computed for next epoch; hayate stores what was just applied)
+/// RUPD alignment: Haskell epoch N .rupdNext == Hayate epoch N+1 .rupd
+///   (Haskell's rupdNext is the RUPD computed during epoch N for application at N→N+1;
+///    Hayate's epoch N+1 .rupd is what was just applied to produce that state)
 ///
 /// State alignment: Haskell epoch N .{treasury,reserves,...} == Hayate epoch N .{...}
 ///   (Both reflect state after the epoch N→N+1 transition was applied)
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
         compare_u64(haskell, hayate, "treasury", &mut critical);
         compare_u64(haskell, hayate, "reserves", &mut critical);
         compare_u64(haskell, hayate, "epochFees", &mut warnings);
+        compare_u64(haskell, hayate, "activeStake", &mut warnings);
         compare_deposits(haskell, hayate, &mut warnings);
 
         // --- Critical: protocol parameters (if Haskell dump has them) ---
@@ -243,11 +245,16 @@ fn compare_protocol_params(haskell: &Value, hayate: &Value, out: &mut Vec<String
 }
 
 fn compare_rupd(haskell: &Value, hayate_next: &Value, epoch: u64, out: &mut Vec<String>) {
-    let hr = &haskell["rupd"];
+    // Haskell epoch N has "rupdNext": the RUPD computed during epoch N for application at N→N+1.
+    // Hayate epoch N+1 has "rupd": what was applied to produce that state.
+    // Try rupdNext first, fall back to rupd for older dump formats.
+    let hr = haskell.get("rupdNext")
+        .filter(|v| !v.is_null())
+        .unwrap_or(&haskell["rupd"]);
     let rr = &hayate_next["rupd"];
 
     if hr.is_null() || hr == &Value::Null {
-        out.push(format!("rupd: missing in haskell[{epoch}]"));
+        out.push(format!("rupdNext: missing in haskell[{epoch}]"));
         return;
     }
     if rr.is_null() || rr == &Value::Null {
@@ -255,7 +262,7 @@ fn compare_rupd(haskell: &Value, hayate_next: &Value, epoch: u64, out: &mut Vec<
         return;
     }
 
-    let prefix = format!("rupd (haskell[{epoch}] vs hayate[{}])", epoch + 1);
+    let prefix = format!("rupdNext (haskell[{epoch}] vs hayate[{}])", epoch + 1);
     for key in &["deltaR1", "deltaR2", "deltaT1", "rPot", "rewardPot", "totalDistributed"] {
         let hv = hr.get(key).and_then(|v| v.as_u64());
         let rv = rr.get(key).and_then(|v| v.as_u64());

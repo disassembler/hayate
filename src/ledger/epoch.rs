@@ -620,12 +620,19 @@ impl LedgerState {
         let a0_f = pp.a0.numerator as f64 / pp.a0.denominator.max(1) as f64;
         let d_f = pp.decentralization.numerator as f64 / pp.decentralization.denominator.max(1) as f64;
 
+        // activeStake = sum of all go snapshot stake (= delegated lovelace in go snapshot)
+        // Matches Haskell's sumAllStake (ssStake goSnap)
+        let active_stake: u64 = self.snapshots.go.as_ref()
+            .map(|go| go.stake_distribution.values().map(|l| l.0).sum())
+            .unwrap_or(0);
+
         let json_output = json!({
             "epoch": self.epoch.0,
             "slot": slot,
             "snapshotEraName": "Babbage", // TODO: Track actual era
             "treasury": self.treasury.0,
             "reserves": self.reserves.0,
+            "activeStake": active_stake,
             "protocolParams": {
                 "nOpt": pp.n_opt,
                 "a0": a0_f,
