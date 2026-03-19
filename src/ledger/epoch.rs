@@ -193,13 +193,28 @@ impl LedgerState {
             *pool_stake.entry(*pool_id).or_insert(Lovelace(0)) += total_stake;
         }
 
-        // Build per-credential stake: UTxO stake + reward account balance only (no deposits).
-        // Matches Haskell's spssStake in StakePoolSnapshot.
-        let mut snapshot_stake = self.stake_distribution.stake_map.clone();
-        for (cred_hash, reward) in self.reward_accounts.iter() {
-            if reward.0 > 0 {
-                *snapshot_stake.entry(*cred_hash).or_insert(Lovelace(0)) += *reward;
+        // Build per-credential stake for delegated credentials only.
+        // Matches Haskell's spssStake: `domRestrictedMap (delegations ▷ dom poolParams) (utxo ∪+ rewards)`.
+        // Only credentials that are delegated to a registered pool are included.
+        // Undelegated (registered but not delegated) credentials are excluded.
+        let mut snapshot_stake: HashMap<Hash32, Lovelace> =
+            HashMap::with_capacity(self.delegations.len());
+        for (cred_hash, pool_id) in self.delegations.iter() {
+            if !self.pool_params.contains_key(pool_id) {
+                continue; // pool retired or not yet registered
             }
+            let utxo_stake = self
+                .stake_distribution
+                .stake_map
+                .get(cred_hash)
+                .copied()
+                .unwrap_or(Lovelace(0));
+            let reward_balance = self
+                .reward_accounts
+                .get(cred_hash)
+                .copied()
+                .unwrap_or(Lovelace(0));
+            snapshot_stake.insert(*cred_hash, utxo_stake + reward_balance);
         }
 
         let total_utxo_stake: u64 = self
@@ -240,6 +255,20 @@ impl LedgerState {
         // Only bootstrap in epoch 0 (before first Babbage epoch)
         if self.epoch.0 == 0 {
             self.snapshots.set = Some(new_snapshot);
+        }
+
+        // Apply queued pool re-registrations AFTER taking the mark snapshot.
+        // Matches Haskell's EPOCH STS ordering: SNAP runs before POOL.
+        // The re-registered params will appear in the mark snapshot at the NEXT epoch boundary.
+        let future_params = std::mem::replace(
+            Arc::make_mut(&mut self.future_pool_params),
+            HashMap::new(),
+        );
+        if !future_params.is_empty() {
+            let pool_map = Arc::make_mut(&mut self.pool_params);
+            for (pool_id, reg) in future_params {
+                pool_map.insert(pool_id, reg);
+            }
         }
 
         // Update current_epoch_fees (Haskell's ssFee) to fees from the epoch that just ended

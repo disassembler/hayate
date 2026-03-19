@@ -69,6 +69,14 @@ pub struct LedgerState {
     /// Pool registrations: pool_id -> pool registration (Arc for copy-on-write)
     pub pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
 
+    /// Future pool params from re-registrations during the current epoch.
+    /// In Haskell's POOL STS rule, re-registrations go into psFutureStakePoolParams
+    /// and are only merged into psStakePoolParams AFTER the mark snapshot is taken
+    /// at the epoch boundary (SNAP runs before POOL in the EPOCH STS rule).
+    /// New registrations go directly to pool_params; only re-registrations are queued here.
+    #[serde(default)]
+    pub future_pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
+
     /// Pool retirements pending at a given epoch
     pub pending_retirements: BTreeMap<EpochNo, Vec<Hash28>>,
 
@@ -149,6 +157,10 @@ pub struct LedgerState {
     #[serde(default)]
     pub pending_reward_update: Option<PendingRewardUpdate>,
 
+    /// Last applied RUPD (for debugging/comparison with Haskell)
+    #[serde(default)]
+    pub last_applied_rupd: Option<PendingRewardUpdate>,
+
     // ===== Script credentials =====
 
     /// Script-type stake credentials (for N2C queries)
@@ -173,6 +185,7 @@ impl LedgerState {
             reserves: Lovelace(MAX_LOVELACE_SUPPLY),
             delegations: Arc::new(HashMap::new()),
             pool_params: Arc::new(HashMap::new()),
+            future_pool_params: Arc::new(HashMap::new()),
             pending_retirements: BTreeMap::new(),
             snapshots: EpochSnapshots::default(),
             reward_accounts: Arc::new(HashMap::new()),
@@ -192,6 +205,7 @@ impl LedgerState {
             governance: Arc::new(GovernanceState::default()),
             deposit_tracker: DepositTracker::default(),
             pending_reward_update: None,
+            last_applied_rupd: None,
             script_stake_credentials: HashSet::new(),
         }
     }
@@ -254,6 +268,7 @@ impl LedgerState {
         pool_deposit: Option<u64>,
         key_deposit: Option<u64>,
         min_pool_cost: Option<u64>,
+        active_slot_coeff: Option<f64>,
     ) {
         // Helper to convert f64 to exact rational by parsing decimal string
         // This avoids floating point precision loss
@@ -370,6 +385,10 @@ impl LedgerState {
             self.protocol_params.min_pool_cost = c;
             self.protocol_params.min_pool_cost_lovelace = c;
         }
+
+        if let Some(f) = active_slot_coeff {
+            self.protocol_params.active_slot_coefficient = f64_to_rational(f);
+        }
     }
 }
 
@@ -383,10 +402,32 @@ impl LedgerState {
 pub struct PendingRewardUpdate {
     /// Rewards to add to each registered stake credential's reward account
     pub rewards: HashMap<Hash32, Lovelace>,
-    /// Total treasury increase (tau cut + undistributed rewards)
+    /// Total treasury increase (tau cut)
     pub delta_treasury: u64,
     /// Total reserves decrease (monetary expansion)
     pub delta_reserves: u64,
+    /// Undistributed rewards (returned to reserves)
+    pub undistributed: u64,
+
+    // === Intermediate values for debugging (match Haskell PulsingReward.hs) ===
+    /// Effectiveness parameter: eta = blocks_produced / expected_blocks (capped at 1)
+    #[serde(default)]
+    pub eta: f64,
+    /// Monetary expansion: deltaR1 = floor(min(eta, 1) * rho * reserves)
+    #[serde(default)]
+    pub delta_r1: u64,
+    /// Reward pot before treasury cut: rPot = deltaR1 + fees
+    #[serde(default)]
+    pub r_pot: u64,
+    /// Treasury cut: deltaT1 = floor(tau * rPot)
+    #[serde(default)]
+    pub delta_t1: u64,
+    /// Reward pot after treasury cut: _R = rPot - deltaT1
+    #[serde(default)]
+    pub reward_pot_after_treasury: u64,
+    /// Total distributed rewards
+    #[serde(default)]
+    pub total_distributed: u64,
 }
 
 /// Conway-era governance state (CIP-1694)
@@ -522,6 +563,10 @@ pub struct StakeSnapshot {
     /// Individual stake per credential (for reward distribution and pledge verification)
     #[serde(default)]
     pub stake_distribution: Arc<HashMap<Hash32, Lovelace>>,
+    /// Blocks produced by each pool during this epoch (for reward calculation)
+    /// CRITICAL: Must be stored in snapshot so rewards use blocks from the correct epoch
+    #[serde(default)]
+    pub epoch_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
 }
 
 /// Pool registration information

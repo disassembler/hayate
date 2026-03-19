@@ -128,21 +128,28 @@ impl LedgerState {
                     metadata_url: params.pool_metadata.as_ref().map(|m| m.url.clone()),
                     metadata_hash: params.pool_metadata.as_ref().map(|m| m.hash),
                 };
-                // If pool is re-registering, cancel any pending retirement
                 if self.pool_params.contains_key(&params.operator) {
+                    // Re-registration: queue into future_pool_params (Haskell psFutureStakePoolParams).
+                    // In the EPOCH STS, SNAP runs before POOL, so the mark snapshot is taken using
+                    // the current params; the future params are merged in AFTER the snapshot.
+                    // This means re-registration params appear in the snapshot one epoch later.
                     for pools in self.pending_retirements.values_mut() {
                         pools.retain(|id| id != &params.operator);
                     }
                     self.pending_retirements
                         .retain(|_, pools| !pools.is_empty());
+                    Arc::make_mut(&mut self.future_pool_params).insert(params.operator, pool_reg);
                     tracing::debug!(
-                        "Pool re-registered (pending retirement cancelled): {}",
+                        "Pool re-registered (queued for next epoch): {}",
                         hex::encode(params.operator)
                     );
                 } else {
+                    // New registration: apply immediately (Haskell also puts these in psFuture,
+                    // but for new pools there are no existing params to preserve, so the snapshot
+                    // difference is irrelevant — the pool has no delegators yet).
+                    Arc::make_mut(&mut self.pool_params).insert(params.operator, pool_reg);
                     tracing::debug!("Pool registered: {}", hex::encode(params.operator));
                 }
-                Arc::make_mut(&mut self.pool_params).insert(params.operator, pool_reg);
             }
             Certificate::PoolRetirement { pool_hash, epoch } => {
                 // Validate: retirement epoch must be <= current_epoch + e_max
