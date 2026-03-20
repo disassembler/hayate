@@ -269,6 +269,7 @@ impl LedgerState {
         key_deposit: Option<u64>,
         min_pool_cost: Option<u64>,
         active_slot_coeff: Option<f64>,
+        protocol_version: Option<(u64, u64)>,
     ) {
         // Helper to convert f64 to exact rational by parsing decimal string
         // This avoids floating point precision loss
@@ -388,6 +389,11 @@ impl LedgerState {
 
         if let Some(f) = active_slot_coeff {
             self.protocol_params.active_slot_coefficient = f64_to_rational(f);
+        }
+
+        if let Some((major, minor)) = protocol_version {
+            self.protocol_params.protocol_version_major = major;
+            self.protocol_params.protocol_version_minor = minor;
         }
     }
 }

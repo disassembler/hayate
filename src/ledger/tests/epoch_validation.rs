@@ -7,6 +7,8 @@
 // 4. Snapshot consistency: mark/set/go rotation preserves data
 
 use crate::ledger::*;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 #[cfg(test)]
 mod invariant_tests {
@@ -124,6 +126,7 @@ mod snapshot_tests {
             pool_params: state.pool_params.clone(),
             pool_stake: Default::default(),
             delegations: state.delegations.clone(),
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
         };
 
         // Verify snapshot captured state correctly
@@ -147,6 +150,7 @@ mod snapshot_tests {
             stake_distribution: state.stake_distribution.stake_map.clone().into(),
             pool_params: state.pool_params.clone(),
             pool_stake: Default::default(),
+            epoch_blocks_by_pool: Arc::new(HashMap::new()),
             delegations: state.delegations.clone(),
         };
 

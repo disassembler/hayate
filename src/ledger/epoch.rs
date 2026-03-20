@@ -306,11 +306,15 @@ impl LedgerState {
 
         // Step 7: Apply pre-Conway protocol parameter updates (PPUP rule)
         //
-        // In Haskell, proposals targeting the new epoch are enacted if at least
-        // `updateQuorum` genesis delegates have submitted identical proposals.
-        // We implement the same vote-counting logic: group proposals by their
-        // content and enact any group that reaches quorum.
-        if let Some(proposals) = self.pending_pp_updates.remove(&new_epoch) {
+        // Proposals submitted in epoch N carry CBOR epoch=N in their Update field.
+        // Haskell applies them two transitions later: the proposals from epoch N are
+        // enacted at (N+1)→(N+2), producing epoch N+2 state.
+        //
+        // Concretely: at transition old→new (self.epoch=old, new_epoch=new),
+        // we apply proposals with key = old - 1.  Example: at 2→3, apply epoch-1
+        // proposals → epoch 3 gets nOpt=500.
+        let ppup_key = EpochNo(self.epoch.0.saturating_sub(1));
+        if let Some(proposals) = self.pending_pp_updates.remove(&ppup_key) {
             let quorum = self.update_quorum;
             let n_proposals = proposals.len() as u64;
             tracing::info!(
@@ -362,9 +366,11 @@ impl LedgerState {
                 );
             }
         }
-        // Discard proposals targeting epochs earlier than the new epoch
+        // Discard proposals from epochs before the current (old) epoch.
+        // Proposals with key = self.epoch are still needed for the next transition
+        // (they will be applied at (self.epoch+1) → (self.epoch+2)).
         self.pending_pp_updates
-            .retain(|epoch, _| *epoch > new_epoch);
+            .retain(|epoch, _| epoch.0 >= self.epoch.0);
 
         // Step 8: Ratify governance proposals (stubbed for now, full implementation in task #6)
         // TODO: Implement full governance ratification in task #6

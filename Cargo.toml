@@ -17,6 +17,10 @@ path = "src/main.rs"
 name = "hayate-node"
 path = "src/node/main.rs"
 
+[[bin]]
+name = "compare-epoch-dumps"
+path = "src/bin/compare_epoch_dumps.rs"
+
 [dependencies]
 # LSM storage engine
 cardano-lsm = "1.0.0"
