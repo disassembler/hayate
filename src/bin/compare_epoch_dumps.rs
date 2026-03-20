@@ -81,6 +81,12 @@ fn main() -> Result<()> {
             compare_rupd(haskell, hn, epoch, &mut critical);
         }
 
+        // --- Era name ---
+        compare_era_name(haskell, hayate, &mut warnings);
+
+        // --- Conway governance (only present for Conway epochs) ---
+        compare_conway_gov(haskell, hayate, &mut critical, &mut warnings);
+
         // --- Informational: snapshot contents ---
         compare_snapshots(haskell, hayate, &mut warnings);
 
@@ -100,7 +106,6 @@ fn main() -> Result<()> {
                 println!("  WARN: {w}");
             }
             all_ok = false;
-            break;
         }
     }
 
@@ -323,6 +328,123 @@ fn normalize_cred(s: &str) -> String {
     // to the 28-byte (56 char) prefix
     let hex_part = s.strip_prefix("keyHash-").unwrap_or(s);
     format!("keyHash-{}", &hex_part[..56.min(hex_part.len())])
+}
+
+fn compare_era_name(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {
+    let h = haskell.get("snapshotEraName").and_then(|v| v.as_str());
+    let r = hayate.get("snapshotEraName").and_then(|v| v.as_str());
+    match (h, r) {
+        (Some(h), Some(r)) if h != r => out.push(format!("snapshotEraName: haskell={h} hayate={r}")),
+        _ => {}
+    }
+}
+
+fn compare_conway_gov(haskell: &Value, hayate: &Value, critical: &mut Vec<String>, warnings: &mut Vec<String>) {
+    let hg = haskell.get("conwayGov");
+    let rg = hayate.get("conwayGov");
+
+    match (hg, rg) {
+        // Both null = pre-Conway, nothing to compare
+        (None | Some(Value::Null), None | Some(Value::Null)) => return,
+        // Haskell has it, hayate doesn't
+        (Some(hv), None | Some(Value::Null)) if !hv.is_null() => {
+            critical.push("conwayGov: present in haskell but null in hayate".to_string());
+            return;
+        }
+        // Hayate has it, haskell doesn't
+        (None | Some(Value::Null), Some(rv)) if !rv.is_null() => {
+            warnings.push("conwayGov: present in hayate but null in haskell".to_string());
+            return;
+        }
+        _ => {}
+    }
+
+    let hg = match hg.and_then(|v| if v.is_null() { None } else { Some(v) }) {
+        Some(v) => v,
+        None => return,
+    };
+    let rg = match rg.and_then(|v| if v.is_null() { None } else { Some(v) }) {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Committee members count
+    let h_members = hg.pointer("/committee/members").and_then(|v| v.as_object()).map(|m| m.len());
+    let r_members = rg.pointer("/committee/members").and_then(|v| v.as_object()).map(|m| m.len());
+    match (h_members, r_members) {
+        (Some(h), Some(r)) if h != r => warnings.push(format!(
+            "conwayGov.committee.members count: haskell={h} hayate={r}"
+        )),
+        _ => {}
+    }
+
+    // Committee threshold
+    let h_thresh_n = hg.pointer("/committee/threshold/numerator").and_then(|v| v.as_u64());
+    let r_thresh_n = rg.pointer("/committee/threshold/numerator").and_then(|v| v.as_u64());
+    let h_thresh_d = hg.pointer("/committee/threshold/denominator").and_then(|v| v.as_u64());
+    let r_thresh_d = rg.pointer("/committee/threshold/denominator").and_then(|v| v.as_u64());
+    if h_thresh_n != r_thresh_n || h_thresh_d != r_thresh_d {
+        warnings.push(format!(
+            "conwayGov.committee.threshold: haskell={h_thresh_n:?}/{h_thresh_d:?} hayate={r_thresh_n:?}/{r_thresh_d:?}"
+        ));
+    }
+
+    // Constitution anchor URL
+    let h_url = hg.pointer("/constitution/anchor/url").and_then(|v| v.as_str());
+    let r_url = rg.pointer("/constitution/anchor/url").and_then(|v| v.as_str());
+    match (h_url, r_url) {
+        (Some(h), Some(r)) if h != r => critical.push(format!(
+            "conwayGov.constitution.url: haskell={h} hayate={r}"
+        )),
+        (Some(_), None) => warnings.push("conwayGov.constitution.url: missing in hayate".to_string()),
+        (None, Some(_)) => warnings.push("conwayGov.constitution.url: missing in haskell".to_string()),
+        _ => {}
+    }
+
+    // DRep distribution entry count
+    let h_drep_count = hg.get("drepDistr").and_then(|v| v.as_object()).map(|m| m.len());
+    let r_drep_count = rg.get("drepDistr").and_then(|v| v.as_object()).map(|m| m.len());
+    match (h_drep_count, r_drep_count) {
+        (Some(h), Some(r)) if h != r => warnings.push(format!(
+            "conwayGov.drepDistr entry count: haskell={h} hayate={r}"
+        )),
+        _ => {}
+    }
+
+    // DRep distribution total stake
+    let drep_total = |gov: &Value| -> u64 {
+        gov.get("drepDistr")
+            .and_then(|v| v.as_object())
+            .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
+            .unwrap_or(0)
+    };
+    let h_drep_total = drep_total(hg);
+    let r_drep_total = drep_total(rg);
+    if h_drep_total != r_drep_total {
+        let diff = r_drep_total as i128 - h_drep_total as i128;
+        warnings.push(format!(
+            "conwayGov.drepDistr total stake: haskell={h_drep_total} hayate={r_drep_total} diff={diff}"
+        ));
+    }
+
+    // prevGovActionIds
+    let nes = hg.get("nextEnactState");
+    let rnes = rg.get("nextEnactState");
+    if let (Some(hnes), Some(rnes)) = (nes, rnes) {
+        for action_type in &["Committee", "Constitution", "HardFork", "PParamUpdate"] {
+            let h_id = hnes.pointer(&format!("/prevGovActionIds/{action_type}/txId")).and_then(|v| v.as_str());
+            let r_id = rnes.pointer(&format!("/prevGovActionIds/{action_type}/txId")).and_then(|v| v.as_str());
+            match (h_id, r_id) {
+                (Some(h), Some(r)) if h != r => warnings.push(format!(
+                    "conwayGov.nextEnactState.prevGovActionIds.{action_type}: haskell={h} hayate={r}"
+                )),
+                (Some(_), None) => warnings.push(format!(
+                    "conwayGov.nextEnactState.prevGovActionIds.{action_type}: present in haskell, null in hayate"
+                )),
+                _ => {}
+            }
+        }
+    }
 }
 
 fn compare_snapshots(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {

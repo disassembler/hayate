@@ -372,9 +372,10 @@ impl LedgerState {
         self.pending_pp_updates
             .retain(|epoch, _| epoch.0 >= self.epoch.0);
 
-        // Step 8: Ratify governance proposals (stubbed for now, full implementation in task #6)
-        // TODO: Implement full governance ratification in task #6
-        self.ratify_proposals_stub();
+        // Step 8: Ratify governance proposals per CIP-1694.
+        // Only active in Conway era (protocol_version_major >= 9).
+        // In pre-Conway eras the governance state is empty so this is a no-op.
+        let _ratified = self.ratify_proposals();
 
         // Step 9: Expire governance proposals that have passed their lifetime
         let expired: Vec<GovActionId> = self
@@ -495,19 +496,6 @@ impl LedgerState {
         self.epoch_block_count = 0;
 
         self.epoch = new_epoch;
-    }
-
-    /// Stub for governance ratification (full implementation in task #6)
-    fn ratify_proposals_stub(&mut self) {
-        // TODO: Implement full CIP-1694 ratification logic in task #6
-        // This includes:
-        // - Checking voting thresholds per action type
-        // - DRep + SPO + Committee voting
-        // - Enacting ratified actions
-        // - Updating enacted_* roots
-        // For now, this is a placeholder
-        Arc::make_mut(&mut self.governance).last_ratified.clear();
-        Arc::make_mut(&mut self.governance).last_ratify_delayed = false;
     }
 
     /// Dump epoch state to JSON file for comparison with Haskell cardano-node
@@ -655,16 +643,211 @@ impl LedgerState {
         let a0_f = pp.a0.numerator as f64 / pp.a0.denominator.max(1) as f64;
         let d_f = pp.decentralization.numerator as f64 / pp.decentralization.denominator.max(1) as f64;
 
+        // Conway era = protocol_version_major >= 9
+        let is_conway = pp.protocol_version_major >= 9;
+        let era_name = if is_conway { "Conway" } else { "Babbage" };
+
         // activeStake = sum of all go snapshot stake (= delegated lovelace in go snapshot)
         // Matches Haskell's sumAllStake (ssStake goSnap)
         let active_stake: u64 = self.snapshots.go.as_ref()
             .map(|go| go.stake_distribution.values().map(|l| l.0).sum())
             .unwrap_or(0);
 
+        // Helper: serialize a Rational as {numerator, denominator}
+        let rat_json = |r: Rational| json!({"numerator": r.numerator, "denominator": r.denominator});
+
+        // Helper: serialize full protocol parameters (both Babbage and Conway fields)
+        let serialize_pp = |p: &ProtocolParameters| -> serde_json::Value {
+            json!({
+                "protocolVersion": {"major": p.protocol_version_major, "minor": p.protocol_version_minor},
+                "txFeePerByte": p.min_fee_a,
+                "txFeeFixed": p.min_fee_b,
+                "maxBlockBodySize": p.max_block_body_size,
+                "maxTxSize": p.max_transaction_size,
+                "maxBlockHeaderSize": p.max_block_header_size,
+                "stakeAddressDeposit": p.key_deposit,
+                "stakePoolDeposit": p.pool_deposit,
+                "poolRetireMaxEpoch": p.e_max,
+                "stakePoolTargetNum": p.n_opt,
+                "poolPledgeInfluence": rat_json(p.a0),
+                "monetaryExpansion": rat_json(p.rho),
+                "treasuryCut": rat_json(p.tau),
+                "minPoolCost": p.min_pool_cost,
+                "maxValueSize": p.max_value_size,
+                "collateralPercentage": p.collateral_percentage,
+                "maxCollateralInputs": p.max_collateral_inputs,
+                "executionUnitPrices": {
+                    "priceMemory": rat_json(p.price_mem),
+                    "priceSteps": rat_json(p.price_step),
+                },
+                "maxTxExecutionUnits": {
+                    "memory": p.max_tx_execution_units_mem,
+                    "steps": p.max_tx_execution_units_steps,
+                },
+                "maxBlockExecutionUnits": {
+                    "memory": p.max_block_execution_units_mem,
+                    "steps": p.max_block_execution_units_steps,
+                },
+                // Conway-specific
+                "dRepDeposit": p.drep_deposit,
+                "dRepActivity": p.drep_activity_period,
+                "govActionLifetime": p.gov_action_lifetime,
+                "govActionDeposit": p.gov_action_deposit,
+                "committeeMinSize": p.committee_min_size,
+                "dRepVotingThresholds": {
+                    "motionNoConfidence": rat_json(p.dvt_motion_no_confidence),
+                    "committeeNormal": rat_json(p.dvt_committee_normal),
+                    "committeeNoConfidence": rat_json(p.dvt_committee_no_confidence),
+                    "hardForkInitiation": rat_json(p.dvt_hard_fork),
+                    "ppNetworkGroup": rat_json(p.dvt_pp_network_group),
+                    "ppEconomicGroup": rat_json(p.dvt_pp_economic_group),
+                    "ppTechnicalGroup": rat_json(p.dvt_pp_technical_group),
+                    "ppGovGroup": rat_json(p.dvt_pp_gov_group),
+                    "treasuryWithdrawal": rat_json(p.dvt_treasury_withdrawal),
+                    "updateToConstitution": rat_json(p.dvt_constitution),
+                    "noConfidence": rat_json(p.dvt_no_confidence),
+                },
+                "poolVotingThresholds": {
+                    "motionNoConfidence": rat_json(p.pvt_motion_no_confidence),
+                    "committeeNormal": rat_json(p.pvt_committee_normal),
+                    "committeeNoConfidence": rat_json(p.pvt_committee_no_confidence),
+                    "hardForkInitiation": rat_json(p.pvt_hard_fork),
+                    "ppSecurityGroup": rat_json(p.pvt_pp_security_group),
+                },
+            })
+        };
+
+        // Compute conwayGov JSON (only populated in Conway era)
+        let conway_gov = if is_conway {
+            let gov = &*self.governance;
+
+            // Committee members: cold_cred_hex -> expiration_epoch
+            let committee_members: serde_json::Map<String, serde_json::Value> = gov
+                .committee_expiration
+                .iter()
+                .map(|(cold_hash, exp)| {
+                    let key = if gov.script_committee_credentials.contains(cold_hash) {
+                        format!("scriptHash-{}", hex::encode(cold_hash))
+                    } else {
+                        format!("keyHash-{}", hex::encode(cold_hash))
+                    };
+                    (key, json!(exp.0))
+                })
+                .collect();
+
+            // Committee threshold
+            let committee_threshold = gov.committee_threshold.as_ref().map(|r| {
+                json!({"numerator": r.numerator, "denominator": r.denominator})
+            }).unwrap_or(json!(null));
+
+            // Committee state: cold_cred -> hot credential status
+            let cs_creds: serde_json::Map<String, serde_json::Value> = {
+                let mut map = serde_json::Map::new();
+                // Hot key authorizations
+                for (cold_hash, hot_hash) in &gov.committee_hot_keys {
+                    let cold_key = if gov.script_committee_credentials.contains(cold_hash) {
+                        format!("scriptHash-{}", hex::encode(cold_hash))
+                    } else {
+                        format!("keyHash-{}", hex::encode(cold_hash))
+                    };
+                    let hot_tag = if gov.script_committee_hot_credentials.contains(hot_hash) {
+                        json!({"tag": "CommitteeHotCredential", "contents": {"scriptHash": hex::encode(hot_hash)}})
+                    } else {
+                        json!({"tag": "CommitteeHotCredential", "contents": {"keyHash": hex::encode(hot_hash)}})
+                    };
+                    map.insert(cold_key, hot_tag);
+                }
+                // Resignations
+                for (cold_hash, _anchor) in &gov.committee_resigned {
+                    let cold_key = if gov.script_committee_credentials.contains(cold_hash) {
+                        format!("scriptHash-{}", hex::encode(cold_hash))
+                    } else {
+                        format!("keyHash-{}", hex::encode(cold_hash))
+                    };
+                    map.entry(cold_key).or_insert(json!({"tag": "MemberResigned", "contents": null}));
+                }
+                map
+            };
+
+            // Constitution
+            let constitution_json = if let Some(c) = &gov.constitution {
+                let anchor_json = if let Some(a) = &c.anchor {
+                    json!({"url": a.url, "dataHash": hex::encode(a.hash)})
+                } else {
+                    json!(null)
+                };
+                let script_json = c.script_hash.map(|h| json!(hex::encode(h))).unwrap_or(json!(null));
+                json!({"anchor": anchor_json, "script": script_json})
+            } else {
+                json!(null)
+            };
+
+            // DRep stake distribution: compute from mark snapshot vote_delegations
+            let drep_distr: serde_json::Map<String, serde_json::Value> = {
+                let mut distr: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+                if let Some(mark) = &self.snapshots.mark {
+                    for (stake_cred, drep) in &gov.vote_delegations {
+                        let stake = mark.stake_distribution.get(stake_cred).map(|l| l.0).unwrap_or(0);
+                        if stake == 0 { continue; }
+                        let key = match drep {
+                            DRep::KeyHash(h) => format!("keyHash-{}", hex::encode(h)),
+                            DRep::ScriptHash(h) => format!("scriptHash-{}", hex::encode(h)),
+                            DRep::AlwaysAbstain => "alwaysAbstain".to_string(),
+                            DRep::AlwaysNoConfidence => "alwaysNoConfidence".to_string(),
+                        };
+                        *distr.entry(key).or_insert(0) += stake;
+                    }
+                }
+                distr.into_iter().map(|(k, v)| (k, json!(v))).collect()
+            };
+
+            // prevGovActionIds: last enacted action ID per type
+            let format_action_id = |opt: Option<&GovActionId>| -> serde_json::Value {
+                match opt {
+                    Some(id) => json!({"txId": hex::encode(id.tx_hash), "govActionIx": id.index}),
+                    None => json!(null),
+                }
+            };
+            let prev_gov_action_ids = json!({
+                "Committee": format_action_id(gov.enacted_committee.as_ref()),
+                "Constitution": format_action_id(gov.enacted_constitution.as_ref()),
+                "HardFork": format_action_id(gov.enacted_hard_fork.as_ref()),
+                "PParamUpdate": format_action_id(gov.enacted_pparam_update.as_ref()),
+            });
+
+            let prev_pp_json = self.prev_protocol_params.as_ref()
+                .map(|p| serialize_pp(p))
+                .unwrap_or_else(|| serialize_pp(pp));
+
+            json!({
+                "committee": {
+                    "members": committee_members,
+                    "threshold": committee_threshold,
+                },
+                "committeeState": {
+                    "csCommitteeCreds": cs_creds,
+                },
+                "constitution": constitution_json,
+                "drepDistr": drep_distr,
+                "nextEnactState": {
+                    "committee": {
+                        "members": committee_members,
+                        "threshold": committee_threshold,
+                    },
+                    "constitution": constitution_json,
+                    "curPParams": serialize_pp(pp),
+                    "prevPParams": prev_pp_json,
+                    "prevGovActionIds": prev_gov_action_ids,
+                },
+            })
+        } else {
+            json!(null)
+        };
+
         let json_output = json!({
             "epoch": self.epoch.0,
             "slot": slot,
-            "snapshotEraName": "Babbage", // TODO: Track actual era
+            "snapshotEraName": era_name,
             "treasury": self.treasury.0,
             "reserves": self.reserves.0,
             "activeStake": active_stake,
@@ -680,6 +863,7 @@ impl LedgerState {
                     "minor": pp.protocol_version_minor,
                 },
             },
+            "conwayGov": conway_gov,
             "totalPools": self.pool_params.len(),
             "totalStake": pool_distribution.iter().map(|p| p["stake"].as_f64().unwrap_or(0.0)).sum::<f64>(),
             "poolDistribution": pool_distribution,

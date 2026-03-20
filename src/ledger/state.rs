@@ -166,6 +166,11 @@ pub struct LedgerState {
     /// Script-type stake credentials (for N2C queries)
     #[serde(default)]
     pub script_stake_credentials: HashSet<Hash32>,
+
+    /// Protocol parameters from before the last ParameterChange governance action was enacted.
+    /// Used for nextEnactState.prevPParams in Conway epoch dumps.
+    #[serde(default)]
+    pub prev_protocol_params: Option<ProtocolParameters>,
 }
 
 fn default_update_quorum() -> u64 {
@@ -207,6 +212,7 @@ impl LedgerState {
             pending_reward_update: None,
             last_applied_rupd: None,
             script_stake_credentials: HashSet::new(),
+            prev_protocol_params: None,
         }
     }
 
@@ -457,6 +463,10 @@ pub struct GovernanceState {
     /// Script-type cold committee credentials (for N2C queries)
     #[serde(default)]
     pub script_committee_credentials: HashSet<Hash32>,
+
+    /// Script-type hot committee credentials (needed to emit correct type tag in dumps)
+    #[serde(default)]
+    pub script_committee_hot_credentials: HashSet<Hash32>,
 
     /// Active governance proposals indexed by GovActionId
     pub proposals: BTreeMap<GovActionId, ProposalState>,

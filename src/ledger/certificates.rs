@@ -265,6 +265,9 @@ impl LedgerState {
                 if matches!(cold_credential, Credential::Script(_)) {
                     gov.script_committee_credentials.insert(cold_key);
                 }
+                if matches!(hot_credential, Credential::Script(_)) {
+                    gov.script_committee_hot_credentials.insert(hot_key);
+                }
                 tracing::debug!(
                     "Committee hot key authorized: {} -> {}",
                     hex::encode(cold_key),

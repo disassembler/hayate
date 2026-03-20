@@ -670,11 +670,14 @@ impl LedgerState {
     pub(crate) fn enact_gov_action(&mut self, action: &GovernanceAction) {
         match action {
             GovernanceAction::ParameterChange { update, .. } => {
+                // Save current pparams as prevPParams before applying update (for dump output)
+                self.prev_protocol_params = Some(self.protocol_params.clone());
                 if let Err(e) = self.apply_protocol_param_update(update) {
                     tracing::warn!(
                         error = %e,
                         "Governance protocol parameter update rejected"
                     );
+                    self.prev_protocol_params = None; // rollback if rejected
                 } else {
                     tracing::debug!("Governance protocol parameters updated");
                 }
