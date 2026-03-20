@@ -89,8 +89,26 @@ impl LedgerState {
         let d_den = self.protocol_params.decentralization.denominator.max(1) as i128;
         let d_value = d_num as f64 / d_den as f64;
 
+        // CRITICAL: Use blocks from go snapshot, not current epoch's blocks
+        // This ensures we're using blocks from the same epoch as the stake distribution
+        let total_stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
+
+        tracing::info!(
+            "Reward calculation for epoch {}: d = {}/{} = {:.2}, stake_pool_blocks = {} (from snapshot epoch {})",
+            self.epoch.0,
+            d_num,
+            d_den,
+            d_value,
+            total_stake_pool_blocks,
+            go_snapshot.epoch.0
+        );
+
+        // Expected blocks formula from Shelley spec: floor((1 - d) * activeSlotCoeff * epochLength)
+        // When d >= 0.8 (federated), very few blocks expected from stake pools
+        // When d < 0.8 (decentralized), more blocks expected from stake pools
+        let d_value_f64 = d_num as f64 / d_den as f64;
         let raw_expected_blocks =
-            (self.protocol_params.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
+            ((1.0 - d_value_f64) * self.protocol_params.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
         if raw_expected_blocks == 0 {
             tracing::warn!(
                 "expected_blocks rounded to 0 (active_slot_coeff={}, epoch_length={}), clamping to 1",
@@ -102,6 +120,28 @@ impl LedgerState {
 
         // Calculate eta based on decentralization parameter
         let rho = Rat::from_i128(rho_num, rho_den);
+        let eta: f64 = if d_value >= 0.8 {
+            // Federated phase: eta = 1.0
+            1.0
+        } else {
+            // Decentralized phase: check if there's active stake first
+            let total_active_stake_check: u64 = go_snapshot
+                .pool_stake
+                .values()
+                .fold(0u64, |acc, s| acc.saturating_add(s.0));
+
+            if total_active_stake_check == 0 {
+                // No active stake: no expansion regardless of blocks → eta = 0
+                0.0
+            } else {
+                // Decentralized phase with active stake: eta = min(1, actual/expected)
+                let stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
+                let actual_blocks = stake_pool_blocks;
+                let effective_blocks = actual_blocks.min(expected_blocks);
+                (effective_blocks as f64) / (expected_blocks as f64)
+            }
+        };
+
         let expansion_rat = if d_value >= 0.8 {
             // Federated phase: eta = 1.0
             tracing::debug!(
@@ -110,20 +150,35 @@ impl LedgerState {
             );
             rho.mul(&Rat::from_i128(self.reserves.0 as i128, 1))
         } else {
-            // Decentralized phase: eta = min(1, actual/expected)
-            let actual_blocks = self.epoch_block_count;
-            let effective_blocks = actual_blocks.min(expected_blocks);
-            tracing::debug!(
-                "Decentralized phase (d={:.2}): using eta={}/{} for reward expansion",
-                d_value,
-                effective_blocks,
-                expected_blocks
-            );
-            rho.mul(&Rat::from_i128(self.reserves.0 as i128, 1))
-                .mul(&Rat::from_i128(
-                    effective_blocks as i128,
-                    expected_blocks as i128,
-                ))
+            // Decentralized phase
+            let total_active_stake_check: u64 = go_snapshot
+                .pool_stake
+                .values()
+                .fold(0u64, |acc, s| acc.saturating_add(s.0));
+
+            if total_active_stake_check == 0 {
+                // No active stake: no expansion regardless of blocks
+                tracing::debug!("Decentralized phase with no active stake: setting expansion=0");
+                Rat::from_i128(0, 1)
+            } else {
+                // Decentralized phase with active stake: eta = min(1, actual/expected)
+                let stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
+                let actual_blocks = stake_pool_blocks;
+                let effective_blocks = actual_blocks.min(expected_blocks);
+                tracing::debug!(
+                    "Decentralized phase (d={:.2}): using eta={}/{} for reward expansion (stake_pool_blocks={} from snapshot epoch {})",
+                    d_value,
+                    effective_blocks,
+                    expected_blocks,
+                    stake_pool_blocks,
+                    go_snapshot.epoch.0
+                );
+                rho.mul(&Rat::from_i128(self.reserves.0 as i128, 1))
+                    .mul(&Rat::from_i128(
+                        effective_blocks as i128,
+                        expected_blocks as i128,
+                    ))
+            }
         };
         let expansion = expansion_rat.floor_u64();
         let total_rewards_available = expansion + fees_for_rewards;
@@ -137,7 +192,18 @@ impl LedgerState {
 
         if total_rewards_available == 0 {
             tracing::warn!("No rewards to distribute (expansion={}, fees={}), returning default", expansion, fees_for_rewards);
-            return PendingRewardUpdate::default();
+            return PendingRewardUpdate {
+                rewards: HashMap::new(),
+                delta_treasury: 0,
+                delta_reserves: 0,
+                undistributed: 0,
+                eta,
+                delta_r1: expansion,
+                r_pot: total_rewards_available,
+                delta_t1: 0,
+                reward_pot_after_treasury: 0,
+                total_distributed: 0,
+            };
         }
 
         // Treasury cut: floor(tau * total_rewards)
@@ -171,9 +237,16 @@ impl LedgerState {
                 delta_reserves
             );
             return PendingRewardUpdate {
-                delta_reserves,
+                delta_reserves: expansion,
                 delta_treasury: treasury_cut,
                 rewards: HashMap::new(),
+                undistributed: reward_pot,
+                eta,
+                delta_r1: expansion,
+                r_pot: total_rewards_available,
+                delta_t1: treasury_cut,
+                reward_pot_after_treasury: reward_pot,
+                total_distributed: 0,
             };
         }
 
@@ -211,14 +284,24 @@ impl LedgerState {
                 fees_for_rewards > treasury_cut
             );
             return PendingRewardUpdate {
-                delta_reserves,
+                delta_reserves: expansion,
                 delta_treasury: treasury_cut,
                 rewards: HashMap::new(),
+                undistributed: reward_pot,
+                eta,
+                delta_r1: expansion,
+                r_pot: total_rewards_available,
+                delta_t1: treasury_cut,
+                reward_pot_after_treasury: reward_pot,
+                total_distributed: 0,
             };
         }
 
-        // Total blocks produced this epoch
-        let total_blocks_in_epoch = self.epoch_block_count.max(1);
+        // For apparent performance calculation, use ACTUAL total blocks produced by all pools.
+        // This matches Haskell's mkApparentPerformance where blocksTotal is the sum over
+        // the blocks-made map (nesBprev), not the expected blocks. Using expected blocks
+        // would cause over/under-distribution whenever actual != expected.
+        let total_blocks_for_performance = total_stake_pool_blocks.max(1);
 
         // Saturation point: z0 = 1/nOpt
         let n_opt = self.protocol_params.n_opt.max(1);
@@ -299,15 +382,29 @@ impl LedgerState {
             // Apparent performance: beta / sigma_a (using total_active_stake)
             //   perf = (blocks_made / total_blocks) / (pool_stake / total_active_stake)
             //        = (blocks_made * total_active_stake) / (total_blocks * pool_stake)
-            let blocks_made = self.epoch_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
+            // CRITICAL: Use blocks from go snapshot to match stake distribution
+            let blocks_made = go_snapshot.epoch_blocks_by_pool.get(pool_id).copied().unwrap_or(0);
             let pool_reward = if blocks_made == 0 || pool_active_stake.0 == 0 {
                 0u64
             } else {
-                let perf = Rat::from_i128(blocks_made as i128, total_blocks_in_epoch as i128).mul(
+                // Apparent performance: β/σ where β = blocks_made / expected_blocks
+                // Use expected_blocks (N from spec), not actual blocks produced
+                let perf = Rat::from_i128(blocks_made as i128, total_blocks_for_performance as i128).mul(
                     &Rat::from_i128(total_active_stake as i128, pool_active_stake.0 as i128),
                 );
                 perf.mul(&Rat::from_i128(max_pool as i128, 1)).floor_u64()
             };
+
+            tracing::info!(
+                "Pool {} reward calc: blocks={}, total_blocks={}, pool_stake={}, total_active={}, max_pool={}, pool_reward={}",
+                hex::encode(pool_id),
+                blocks_made,
+                total_blocks_for_performance,
+                pool_active_stake.0,
+                total_active_stake,
+                max_pool,
+                pool_reward
+            );
 
             if pool_reward == 0 {
                 continue;
@@ -402,6 +499,18 @@ impl LedgerState {
             undistributed
         );
 
+        // Detailed breakdown for debugging
+        tracing::info!(
+            "RUPD details: deltaR1(expansion)={}, fees={}, rPot(expansion+fees)={}, deltaT1(treasury_cut)={}, _R(reward_pot)={}, distributed={}, deltaR2(undistributed)={}",
+            expansion,
+            fees_for_rewards,
+            expansion + fees_for_rewards,
+            treasury_cut,
+            reward_pot,
+            total_distributed,
+            undistributed
+        );
+
         tracing::debug!(
             "Rewards calculated: {} lovelace to {} accounts, treasury +{}, reserves -{} (expansion: {}, undistributed: {}, fees: {})",
             total_distributed,
@@ -416,7 +525,14 @@ impl LedgerState {
         PendingRewardUpdate {
             rewards: reward_map,
             delta_treasury: treasury_cut,
-            delta_reserves: expansion.saturating_sub(undistributed),
+            delta_reserves: expansion,
+            undistributed,
+            eta,
+            delta_r1: expansion,
+            r_pot: total_rewards_available,
+            delta_t1: treasury_cut,
+            reward_pot_after_treasury: reward_pot,
+            total_distributed,
         }
     }
 
@@ -438,6 +554,149 @@ impl LedgerState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::state::{StakeSnapshot, PoolRegistration};
+    use crate::ledger::primitives::Hash28Ext;
+
+    fn hex28(s: &str) -> Hash28 {
+        let b = hex::decode(s).unwrap();
+        let mut h = [0u8; 28];
+        h.copy_from_slice(&b[..28]);
+        h
+    }
+
+    /// Build the go_snapshot as used for the epoch 12→13 RUPD:
+    /// - stake: go snapshot (epoch 9) — 1T each pool
+    /// - blocks: mark snapshot (epoch 11) — {8fc7:1432, bf94:1422, d9ea:1511}
+    /// Each pool gets a unique reward account (AA/BB/CC) so we can track per-pool rewards.
+    fn make_epoch12_reward_snapshot() -> StakeSnapshot {
+        let pool_8fc7 = hex28("8fc7a730bba533f2f6f0c4ce0df1783bd002ee9d923ae941728b2830");
+        let pool_bf94 = hex28("bf94a435bab1bc756f2f61443cc26d857b2e227903d9f2f5f2e7b686");
+        let pool_d9ea = hex28("d9eaf1f9770c8bb35dd18df8d8a0b2b324cdbdeeb38e5e7ceb7ea734");
+
+        // Owner keys (28-byte) → padded to 32-byte credential keys
+        let own_b2f1 = hex28("b2f1e813fb3108fe6926717ec6409bc369ae81b485aa2120dc1fa1d7");
+        let own_2f5f = hex28("2f5fde105530993a262d744e534847794d477d2cc5a457312b2014b1");
+        let own_f535 = hex28("f535d2bfc700116bb07ad9f9a1159d45577e85fc3c472d692780d996");
+
+        let cred_b2f1 = own_b2f1.to_hash32_padded();
+        let cred_2f5f = own_2f5f.to_hash32_padded();
+        let cred_f535 = own_f535.to_hash32_padded();
+
+        // Use unique reward accounts per pool so we can see per-pool rewards
+        let make_reward_acct = |tag: u8| {
+            let mut acct = vec![0xE0u8]; // testnet key reward address header
+            acct.extend_from_slice(&[tag; 28]);
+            acct
+        };
+
+        let pool_reg = |pool_id: Hash28, owner: Hash28, reward_account: Vec<u8>| PoolRegistration {
+            pool_id,
+            vrf_keyhash: [0u8; 32],
+            pledge: Lovelace(1_000_000_000_000),
+            cost: Lovelace(500_000_000),
+            margin_numerator: 1,
+            margin_denominator: 1,
+            reward_account,
+            owners: vec![owner],
+            relays: vec![],
+            metadata_url: None,
+            metadata_hash: None,
+        };
+
+        let mut delegations = HashMap::new();
+        delegations.insert(cred_b2f1, pool_8fc7);
+        delegations.insert(cred_2f5f, pool_bf94);
+        delegations.insert(cred_f535, pool_d9ea);
+
+        let mut pool_stake = HashMap::new();
+        pool_stake.insert(pool_8fc7, Lovelace(1_000_000_000_000));
+        pool_stake.insert(pool_bf94, Lovelace(1_000_000_000_000));
+        pool_stake.insert(pool_d9ea, Lovelace(1_000_000_000_000));
+
+        let mut pool_params = HashMap::new();
+        pool_params.insert(pool_8fc7, pool_reg(pool_8fc7, own_b2f1, make_reward_acct(0xAA)));
+        pool_params.insert(pool_bf94, pool_reg(pool_bf94, own_2f5f, make_reward_acct(0xBB)));
+        pool_params.insert(pool_d9ea, pool_reg(pool_d9ea, own_f535, make_reward_acct(0xCC)));
+
+        let mut stake_distribution = HashMap::new();
+        stake_distribution.insert(cred_b2f1, Lovelace(1_000_000_000_000));
+        stake_distribution.insert(cred_2f5f, Lovelace(1_000_000_000_000));
+        stake_distribution.insert(cred_f535, Lovelace(1_000_000_000_000));
+
+        // Mark snapshot blocks (epoch 11 data — used for reward calc at 12→13).
+        // These are Haskell's go.blocks at epoch 12 = {8fc7:1433, bf94:1422, d9ea:1510}.
+        // The previously wrong values {1432, 1422, 1511} were caused by the epoch-boundary
+        // block-counting bug: the first block of epoch 12 (produced by d9ea) was incorrectly
+        // counted in epoch 11's mark snapshot instead of epoch 12's. Fixed in main.rs by
+        // running the epoch transition before processing the new epoch's first block.
+        let mut blocks = HashMap::new();
+        blocks.insert(pool_8fc7, 1433u64);
+        blocks.insert(pool_bf94, 1422u64);
+        blocks.insert(pool_d9ea, 1510u64);
+
+        StakeSnapshot {
+            epoch: EpochNo(9),
+            delegations: Arc::new(delegations),
+            pool_stake,
+            pool_params: Arc::new(pool_params),
+            stake_distribution: Arc::new(stake_distribution),
+            epoch_blocks_by_pool: Arc::new(blocks),
+        }
+    }
+
+    /// Reproduce hayate's epoch 12→13 RUPD calculation and verify it matches
+    /// the expected output. Prints per-pool details for diagnostic purposes.
+    #[test]
+    fn test_epoch12_rupd_total_distributed() {
+        use crate::ledger::primitives::{ProtocolParameters, Rational};
+        use crate::ledger::state::LedgerState;
+
+        let mut params = ProtocolParameters::default();
+        params.rho = Rational { numerator: 3, denominator: 1000 };
+        params.tau = Rational { numerator: 1, denominator: 5 };
+        params.a0 = Rational { numerator: 3, denominator: 10 };
+        params.n_opt = 500;
+        params.decentralization = Rational { numerator: 0, denominator: 1 };
+        params.active_slot_coefficient = Rational { numerator: 1, denominator: 20 };
+
+        let mut state = LedgerState::new(params);
+        state.epoch = EpochNo(12);
+        state.epoch_length = 86400;
+        // Epoch 12 reserves (from hayate 12-hayate.json)
+        state.reserves = Lovelace(14_901_365_998_049_648);
+
+        let go_snapshot = make_epoch12_reward_snapshot();
+        let rupd = state.calculate_rewards(&go_snapshot, Lovelace(0));
+
+        // Per-pool reward account keys (from make_reward_acct tags)
+        let key_8fc7: Hash32 = { let mut k = [0xAAu8; 32]; k[28..].fill(0); k };
+        let key_bf94: Hash32 = { let mut k = [0xBBu8; 32]; k[28..].fill(0); k };
+        let key_d9ea: Hash32 = { let mut k = [0xCCu8; 32]; k[28..].fill(0); k };
+
+        let r_8fc7 = rupd.rewards.get(&key_8fc7).map(|l| l.0).unwrap_or(0);
+        let r_bf94 = rupd.rewards.get(&key_bf94).map(|l| l.0).unwrap_or(0);
+        let r_d9ea = rupd.rewards.get(&key_d9ea).map(|l| l.0).unwrap_or(0);
+
+        println!("=== Epoch 12→13 RUPD ===");
+        println!("deltaR1 (expansion):    {}", rupd.delta_r1);
+        println!("deltaT1 (treasury):     {}", rupd.delta_t1);
+        println!("rewardPot:              {}", rupd.reward_pot_after_treasury);
+        println!("totalDistributed:       {}", rupd.total_distributed);
+        println!("undistributed (deltaR2):{}", rupd.undistributed);
+        println!("eta:                    {}", rupd.eta);
+        println!("--- Per-pool rewards (blocks 1433/1422/1510) ---");
+        println!("8fc7 (1433 blocks):     {}", r_8fc7);
+        println!("bf94 (1422 blocks):     {}", r_bf94);
+        println!("d9ea (1510 blocks):     {}", r_d9ea);
+        println!("sum:                    {}", r_8fc7 + r_bf94 + r_d9ea);
+
+        // Expected from Haskell epoch 12 rupdNext:
+        assert_eq!(rupd.delta_r1, 44_704_097_994_148, "deltaR1 mismatch");
+        assert_eq!(rupd.delta_t1, 8_940_819_598_829, "deltaT1 mismatch");
+        assert_eq!(rupd.reward_pot_after_treasury, 35_763_278_395_319, "rewardPot mismatch");
+        // Haskell totalDistributed = 2_742_233_249; hayate should match:
+        assert_eq!(rupd.total_distributed, 2_742_233_249, "totalDistributed mismatch");
+    }
 
     #[test]
     fn test_reward_account_to_hash() {

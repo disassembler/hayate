@@ -198,15 +198,10 @@ async fn main() -> Result<()> {
                             }
                         }
 
-                        // Process block
-                        if let Err(e) = process_block_simple(&mut storage, &mut ledger_state, slot, &block_hash, &block_bytes).await {
-                            error!("Error processing block at slot {}: {}", slot, e);
-                            continue;
-                        }
-
-                        blocks_processed += 1;
-
-                        // Check for epoch transition
+                        // Check for epoch transition BEFORE processing the block.
+                        // This ensures the mark snapshot captures only the previous epoch's
+                        // blocks. If the block were counted first, the snapshot would include
+                        // the first block of the new epoch — causing a 1-block misattribution.
                         let epoch = slot_to_epoch(slot, &network);
 
                         // When we transition to a new epoch, snapshot the previous epoch
@@ -285,6 +280,15 @@ async fn main() -> Result<()> {
 
                             current_epoch = epoch;
                         }
+
+                        // Process block AFTER epoch transition so the first block of a new
+                        // epoch is counted towards the new epoch, not the previous one.
+                        if let Err(e) = process_block_simple(&mut storage, &mut ledger_state, slot, &block_hash, &block_bytes).await {
+                            error!("Error processing block at slot {}: {}", slot, e);
+                            continue;
+                        }
+
+                        blocks_processed += 1;
 
                         // Update chain tip
                         storage.store_chain_tip(slot, &block_hash)?;
@@ -809,9 +813,14 @@ fn process_alonzo_certificate(
                     metadata_hash: None,
                 };
 
-                let mut pool_params = (*ledger_state.pool_params).clone();
-                let is_new_pool = pool_params.insert(pool_id, pool_reg).is_none();
-                ledger_state.pool_params = Arc::new(pool_params);
+                // Re-registrations must be queued to future_pool_params (applied after mark snapshot)
+                let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
+                    Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
+                    false
+                } else {
+                    Arc::make_mut(&mut ledger_state.pool_params).insert(pool_id, pool_reg);
+                    true
+                };
 
                 // Track deposit only on new pool registrations (not updates/re-registrations)
                 if is_new_pool {
@@ -970,9 +979,14 @@ fn process_conway_certificate(
                     metadata_hash: None,
                 };
 
-                let mut pool_params = (*ledger_state.pool_params).clone();
-                let is_new_pool = pool_params.insert(pool_id, pool_reg).is_none();
-                ledger_state.pool_params = Arc::new(pool_params);
+                // Re-registrations must be queued to future_pool_params (applied after mark snapshot)
+                let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
+                    Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
+                    false
+                } else {
+                    Arc::make_mut(&mut ledger_state.pool_params).insert(pool_id, pool_reg);
+                    true
+                };
 
                 // Track deposit only on new pool registrations (not updates/re-registrations)
                 if is_new_pool {
@@ -1135,6 +1149,7 @@ fn load_genesis_and_init_ledger(
                         pp.key_deposit,
                         pp.min_pool_cost,
                         Some(shelley_genesis.active_slots_coeff),
+                        pp.protocol_version.as_ref().map(|v| (v.major, v.minor)),
                     );
 
                     info!(
