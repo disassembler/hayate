@@ -230,7 +230,10 @@ impl LedgerState {
                 .get(cred_hash)
                 .copied()
                 .unwrap_or(Lovelace(0));
-            snapshot_stake.insert(*cred_hash, utxo_stake + reward_balance);
+            let total = utxo_stake + reward_balance;
+            if total.0 > 0 {
+                snapshot_stake.insert(*cred_hash, total);
+            }
         }
 
         let total_utxo_stake: u64 = self

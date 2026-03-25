@@ -82,11 +82,11 @@ impl LedgerState {
         action_id: &GovActionId,
         procedure: &VotingProcedure,
     ) {
-        // Check proposal exists
+        // Check proposal exists (already ratified/expired proposals are removed from the map)
         if !self.governance.proposals.contains_key(action_id) {
-            tracing::warn!(
+            tracing::debug!(
                 action_id = %hex::encode(&action_id.tx_hash),
-                "Vote on non-existent proposal ignored"
+                "Vote on already-ratified or unknown proposal, ignoring"
             );
             return;
         }

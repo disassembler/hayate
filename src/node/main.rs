@@ -538,6 +538,62 @@ fn compare_epoch_dumps(
     let (hd, rd) = (drep_total(&haskell), drep_total(&hayate));
     cmp_u64("conwayGov.drepDistr total stake", Some(hd), Some(rd));
 
+    // Snapshots: compare mark/set/go per-credential stake and totalStake
+    {
+        fn normalize_cred(s: &str) -> String {
+            let hex_part = s.strip_prefix("keyHash-").unwrap_or(s);
+            format!("keyHash-{}", &hex_part[..56.min(hex_part.len())])
+        }
+        fn snapshot_stake_total(snap: &Value) -> u64 {
+            snap.get("stake")
+                .and_then(|s| s.as_object())
+                .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
+                .unwrap_or(0)
+        }
+        for sname in &["mark", "set", "go"] {
+            let hs = haskell.get("snapshots").and_then(|s| s.get(sname));
+            let rs = hayate.get("snapshots").and_then(|s| s.get(sname));
+            match (hs, rs) {
+                (Some(h), Some(r)) if !h.is_null() && !r.is_null() => {
+                    let ht = snapshot_stake_total(h);
+                    let rt = snapshot_stake_total(r);
+                    if ht != rt {
+                        let diff = rt as i128 - ht as i128;
+                        criticals.push(format!(
+                            "snapshots.{sname}.totalStake: haskell={ht} hayate={rt} diff={diff} ({:.3} ADA)",
+                            diff as f64 / 1_000_000.0
+                        ));
+                    }
+                    let hstake: std::collections::HashMap<String, u64> = h.get("stake")
+                        .and_then(|s| s.as_object())
+                        .map(|m| m.iter().map(|(k, v)| (normalize_cred(k), v.as_u64().unwrap_or(0))).collect())
+                        .unwrap_or_default();
+                    let rstake: std::collections::HashMap<String, u64> = r.get("stake")
+                        .and_then(|s| s.as_object())
+                        .map(|m| m.iter().map(|(k, v)| (normalize_cred(k), v.as_u64().unwrap_or(0))).collect())
+                        .unwrap_or_default();
+                    for (cred, hv) in &hstake {
+                        let rv = rstake.get(cred).copied().unwrap_or(0);
+                        if *hv != rv {
+                            criticals.push(format!(
+                                "snapshots.{sname}.stake[{cred}]: haskell={hv} hayate={rv}"
+                            ));
+                        }
+                    }
+                    for (cred, rv) in &rstake {
+                        if !hstake.contains_key(cred) {
+                            criticals.push(format!(
+                                "snapshots.{sname}.stake[{cred}]: missing in haskell, hayate={rv}"
+                            ));
+                        }
+                    }
+                }
+                (Some(_), None) => criticals.push(format!("snapshots.{sname}: missing in hayate")),
+                _ => {}
+            }
+        }
+    }
+
     // RUPD: compare haskell[N-1].rupdNext vs hayate[N].rupd
     if epoch_num > 0 {
         if let Some(prev_haskell_path) = find_haskell_dump(haskell_dir, epoch_num - 1) {
