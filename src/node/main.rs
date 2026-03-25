@@ -18,6 +18,7 @@ use pallas_network::miniprotocols::Point;
 use pallas_network::miniprotocols::chainsync::NextResponse;
 use pallas_crypto::nonce::generate_rolling_nonce;
 use pallas_crypto::hash::Hash;
+use pallas_hardano::storage::immutable as imm_db;
 
 #[derive(Parser, Debug)]
 #[command(name = "hayate-node")]
@@ -75,6 +76,16 @@ struct Args {
     /// (e.g. epoch 492 on sanchonet) are never pruned so they are always available.
     #[arg(long)]
     restore_from_epoch: Option<u64>,
+
+    /// Path to a Cardano node immutable database directory (offline sync).
+    ///
+    /// When set, Hayate reads blocks directly from the immutable DB files on disk
+    /// instead of (or before) connecting to a live node socket.  A --config file
+    /// is still required for genesis initialisation when starting from scratch.
+    /// After exhausting the immutable DB, Hayate connects to --socket if one is
+    /// given, or exits otherwise.
+    #[arg(long)]
+    immutable_db: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -114,28 +125,6 @@ async fn main() -> Result<()> {
 
     // Open node storage
     let mut storage = NodeStorage::open(PathBuf::from(&args.db_path), network.clone())?;
-
-    // Determine socket path
-    let socket_path = if let Some(socket) = args.socket {
-        socket
-    } else {
-        // Default socket paths
-        match network {
-            Network::Preview => {
-                std::env::var("CARDANO_NODE_SOCKET_PATH")
-                    .unwrap_or_else(|_| "./cardano-node/node.socket".to_string())
-            },
-            Network::Mainnet => {
-                std::env::var("CARDANO_NODE_SOCKET_PATH")
-                    .unwrap_or_else(|_| "./cardano-node/node.socket".to_string())
-            },
-            _ => {
-                return Err(anyhow::anyhow!("Please specify --socket for network {}", network.as_str()));
-            }
-        }
-    };
-
-    info!("Connecting to node socket: {}", socket_path);
 
     // Determine magic
     let magic = args.magic.unwrap_or_else(|| network.magic());
@@ -184,11 +173,7 @@ async fn main() -> Result<()> {
             }
         };
 
-    info!("Connecting to chain sync...");
-    let mut sync = HayateSync::connect(&socket_path, magic, start_point).await?;
-    info!("✅ Connected to Cardano node via chain sync");
-
-    // Start processing blocks
+    // Shared processing state — used by both immutable-DB and network sync loops.
     let mut blocks_processed = 0u64;
     let mut current_epoch = ledger_state.epoch.0;
     let mut epoch_tx_count: u64 = 0;
@@ -199,11 +184,98 @@ async fn main() -> Result<()> {
     let (mut last_slot, mut last_hash): (u64, [u8; 32]) =
         resume_slot_hash.unwrap_or((0, [0u8; 32]));
 
-    // Initialize rolling nonce with Shelley genesis nonce for Preview network
-    // This is the starting point for nonce evolution
+    // Rolling nonce for epoch nonce calculation
     let mut rolling_nonce: Option<Hash<32>> = None;
 
     info!("🔄 Starting block processing from epoch {}...", current_epoch);
+
+    // ── Immutable DB sync ────────────────────────────────────────────────────
+    if let Some(ref imm_dir) = args.immutable_db {
+        info!("📂 Syncing from immutable DB at {}", imm_dir.display());
+
+        match imm_db::get_tip(imm_dir) {
+            Ok(Some(Point::Specific(tip_slot, _))) =>
+                info!("📂 Immutable DB tip: slot {}", tip_slot),
+            Ok(_) => info!("📂 Immutable DB appears empty"),
+            Err(e) => return Err(anyhow::anyhow!("Cannot read immutable DB tip: {e}")),
+        }
+
+        let mut iter = imm_db::read_blocks_from_point(imm_dir, start_point.clone())
+            .context("Failed to open immutable DB iterator")?;
+
+        // read_blocks_from_point is inclusive: the first block returned IS the
+        // start_point block, which the restored ledger state has already processed.
+        // Skip it to match socket chainsync semantics (find_intersect positions
+        // the cursor AFTER the intersection block).
+        if matches!(start_point, Point::Specific(_, _)) {
+            iter.next(); // discard the already-processed start block
+        }
+
+        for block_result in iter {
+            let block_bytes = block_result.context("Error reading block from immutable DB")?;
+            process_block_bytes(
+                &block_bytes,
+                &mut storage,
+                &mut ledger_state,
+                &conway_genesis,
+                &network,
+                args.dump_epoch_dir.as_deref(),
+                args.haskell_epoch_dir.as_deref(),
+                &mut rolling_nonce,
+                &mut current_epoch,
+                &mut epoch_tx_count,
+                &mut last_slot,
+                &mut last_hash,
+                &mut blocks_processed,
+            ).await;
+        }
+
+        info!(
+            "✅ Immutable DB sync complete — epoch {}, {} blocks processed",
+            current_epoch, blocks_processed
+        );
+    }
+
+    // ── Network sync (optional after immutable DB, or standalone) ───────────
+    // Resolve socket path; if not available and no network sync is needed, exit.
+    let socket_path_opt: Option<String> = if let Some(socket) = args.socket {
+        Some(socket)
+    } else {
+        match network {
+            Network::Preview | Network::Mainnet => Some(
+                std::env::var("CARDANO_NODE_SOCKET_PATH")
+                    .unwrap_or_else(|_| "./cardano-node/node.socket".to_string())
+            ),
+            _ => None,
+        }
+    };
+
+    let socket_path = match socket_path_opt {
+        Some(s) => s,
+        None => {
+            if args.immutable_db.is_some() {
+                // Finished immutable DB sync with no socket to continue from — done.
+                return Ok(());
+            }
+            return Err(anyhow::anyhow!(
+                "Please specify --socket for network {}", network.as_str()
+            ));
+        }
+    };
+
+    // The network sync resumes from wherever we currently are (either the
+    // original start_point if no immutable DB was synced, or the tip of the
+    // immutable DB if we just processed it).
+    let network_start_point = if last_slot > 0 {
+        Point::Specific(last_slot, last_hash.to_vec())
+    } else {
+        start_point
+    };
+
+    info!("Connecting to node socket: {}", socket_path);
+    info!("Connecting to chain sync...");
+    let mut sync = HayateSync::connect(&socket_path, magic, network_start_point).await?;
+    info!("✅ Connected to Cardano node via chain sync");
 
     let mut awaiting = false;
     loop {
@@ -215,137 +287,21 @@ async fn main() -> Result<()> {
         match sync.request_next().await? {
             NextResponse::RollForward(block_bytes, _tip) => {
                 awaiting = false;
-                // Parse block using pallas
-                match parse_block_with_nonce(&block_bytes) {
-                    Ok((slot, block_hash, tx_count, vrf_output_opt, is_conway_block)) => {
-                        // Update rolling nonce if VRF is present
-                        if let Some(vrf_output) = vrf_output_opt {
-                            // VRF output should be at least 32 bytes
-                            if vrf_output.len() >= 32 {
-                                match rolling_nonce {
-                                    Some(prev_nonce) => {
-                                        // generate_rolling_nonce(prev: Hash<32>, vrf: &[u8]) -> Hash<32>
-                                        rolling_nonce = Some(generate_rolling_nonce(prev_nonce, &vrf_output[..32]));
-                                    }
-                                    None => {
-                                        // Initialize with Preview network genesis nonce
-                                        // For now, using zero hash - TODO: use actual genesis nonce
-                                        let init_nonce = Hash::<32>::from([0u8; 32]);
-                                        rolling_nonce = Some(generate_rolling_nonce(init_nonce, &vrf_output[..32]));
-                                        info!("🔐 Initializing rolling nonce from first VRF at slot {}", slot);
-                                    }
-                                }
-                            } else {
-                                warn!("VRF output too short: {} bytes", vrf_output.len());
-                            }
-                        }
-
-                        // Check for epoch transition BEFORE processing the block.
-                        // This ensures the mark snapshot captures only the previous epoch's
-                        // blocks. If the block were counted first, the snapshot would include
-                        // the first block of the new epoch — causing a 1-block misattribution.
-                        let epoch = slot_to_epoch(slot, &network);
-
-                        // Detect first Conway block and apply Conway genesis BEFORE the epoch
-                        // transition. This ensures the epoch dump shows Conway state.
-                        if is_conway_block {
-                            if ledger_state.conway_genesis_epoch.is_none() {
-                                if let Some(ref cg) = conway_genesis {
-                                    ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
-                                    info!("🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
-                                } else {
-                                    warn!("⚠️  First Conway block detected but no Conway genesis loaded!");
-                                }
-                            }
-                        }
-
-                        // When we transition to a new epoch, snapshot the previous epoch
-                        if epoch > current_epoch {
-                            let era = era_name(ledger_state.protocol_params.protocol_version_major);
-                            let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
-
-                            // Capture enactments before process_epoch_transition consumes them
-                            let pending_enactments: Vec<_> = ledger_state.pending_enactments
-                                .iter()
-                                .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
-                                .collect();
-
-                            // 1. Rebuild stake distribution from UTxO set
-                            if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
-                                error!("Failed to rebuild stake distribution: {}", e);
-                            }
-
-                            // 2. Process epoch transition in ledger state
-                            ledger_state.process_epoch_transition(EpochNo(epoch));
-
-                            // 2a. Dump epoch state to JSON for comparison with Haskell
-                            if let Some(ref dump_dir) = args.dump_epoch_dir {
-                                if let Err(e) = ledger_state.dump_epoch_state(dump_dir.as_path(), slot) {
-                                    error!("Failed to dump epoch state: {}", e);
-                                }
-
-                                // Mismatch detection: compare against Haskell reference if provided
-                                if let Some(ref haskell_dir) = args.haskell_epoch_dir {
-                                    let epoch_num = ledger_state.epoch.0;
-                                    let hayate_dump = dump_dir.join(format!("{}-hayate.json", epoch_num));
-                                    if let Some(haskell_dump) = find_haskell_dump(haskell_dir, epoch_num) {
-                                        match compare_epoch_dumps(&hayate_dump, &haskell_dump, haskell_dir, epoch_num) {
-                                            Ok(true) => debug!("Epoch {} matches Haskell reference", epoch_num),
-                                            Ok(false) => {
-                                                error!("EPOCH {} DIVERGED", epoch_num);
-                                                std::process::exit(1);
-                                            }
-                                            Err(e) => warn!("Could not compare epoch {} dumps: {}", epoch_num, e),
-                                        }
-                                    }
-                                }
-                            }
-
-                            // 3. Save epoch snapshot (UTxO hard-links + bincode file).
-                            // last_slot/last_hash = final block of the ending epoch
-                            // (the current block hasn't been processed yet at this point).
-                            if let Err(e) = storage.save_epoch_snapshot(epoch, last_slot, last_hash, &ledger_state) {
-                                error!("Failed to save epoch {} snapshot: {}", epoch, e);
-                            }
-
-                            info!(
-                                "Epoch {} ({}) slot={}  txs: {}  fees: {} ADA",
-                                current_epoch, era, slot, epoch_tx_count, epoch_fees_ada
-                            );
-                            for desc in &pending_enactments {
-                                info!("  enacted: {desc}");
-                            }
-
-                            epoch_tx_count = 0;
-                            current_epoch = epoch;
-                        }
-
-                        // Process block AFTER epoch transition so the first block of a new
-                        // epoch is counted towards the new epoch, not the previous one.
-                        if let Err(e) = process_block_simple(&mut storage, &mut ledger_state, slot, &block_hash, &block_bytes).await {
-                            error!("Error processing block at slot {}: {}", slot, e);
-                            continue;
-                        }
-
-                        blocks_processed += 1;
-                        epoch_tx_count += tx_count as u64;
-
-                        // Track last processed block for epoch snapshot resume point.
-                        last_slot = slot;
-                        let n = block_hash.len().min(32);
-                        last_hash[..n].copy_from_slice(&block_hash[..n]);
-
-                        // Log progress
-                        if blocks_processed % 1000 == 0 {
-                            debug!("Processed {} blocks, slot: {}, epoch: {}",
-                                blocks_processed, slot, epoch);
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to parse block: {}", e);
-                        continue;
-                    }
-                }
+                process_block_bytes(
+                    &block_bytes,
+                    &mut storage,
+                    &mut ledger_state,
+                    &conway_genesis,
+                    &network,
+                    args.dump_epoch_dir.as_deref(),
+                    args.haskell_epoch_dir.as_deref(),
+                    &mut rolling_nonce,
+                    &mut current_epoch,
+                    &mut epoch_tx_count,
+                    &mut last_slot,
+                    &mut last_hash,
+                    &mut blocks_processed,
+                ).await;
             }
             NextResponse::RollBackward(point, _tip) => {
                 awaiting = false;
@@ -356,6 +312,151 @@ async fn main() -> Result<()> {
                 info!("Caught up, waiting for new blocks...");
                 awaiting = true;
             }
+        }
+    }
+}
+
+/// Process a single raw block through the full ledger pipeline.
+///
+/// Handles nonce evolution, epoch transitions, epoch snapshots/dumps, and
+/// block application.  Shared by both the immutable-DB and network-sync paths.
+#[allow(clippy::too_many_arguments)]
+async fn process_block_bytes(
+    block_bytes: &[u8],
+    storage: &mut NodeStorage,
+    ledger_state: &mut LedgerState,
+    conway_genesis: &Option<ConwayGenesis>,
+    network: &Network,
+    dump_epoch_dir: Option<&std::path::Path>,
+    haskell_epoch_dir: Option<&std::path::Path>,
+    rolling_nonce: &mut Option<Hash<32>>,
+    current_epoch: &mut u64,
+    epoch_tx_count: &mut u64,
+    last_slot: &mut u64,
+    last_hash: &mut [u8; 32],
+    blocks_processed: &mut u64,
+) {
+    match parse_block_with_nonce(block_bytes) {
+        Ok((slot, block_hash, tx_count, vrf_output_opt, is_conway_block)) => {
+            // Update rolling nonce if VRF is present
+            if let Some(vrf_output) = vrf_output_opt {
+                if vrf_output.len() >= 32 {
+                    match rolling_nonce {
+                        Some(prev_nonce) => {
+                            *rolling_nonce = Some(generate_rolling_nonce(*prev_nonce, &vrf_output[..32]));
+                        }
+                        None => {
+                            let init_nonce = Hash::<32>::from([0u8; 32]);
+                            *rolling_nonce = Some(generate_rolling_nonce(init_nonce, &vrf_output[..32]));
+                            info!("🔐 Initializing rolling nonce from first VRF at slot {}", slot);
+                        }
+                    }
+                } else {
+                    warn!("VRF output too short: {} bytes", vrf_output.len());
+                }
+            }
+
+            // Check for epoch transition BEFORE processing the block.
+            // This ensures the mark snapshot captures only the previous epoch's
+            // blocks. If the block were counted first, the snapshot would include
+            // the first block of the new epoch — causing a 1-block misattribution.
+            let epoch = slot_to_epoch(slot, network);
+
+            // Detect first Conway block and apply Conway genesis BEFORE the epoch
+            // transition. This ensures the epoch dump shows Conway state.
+            if is_conway_block && ledger_state.conway_genesis_epoch.is_none() {
+                if let Some(ref cg) = conway_genesis {
+                    ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
+                    info!("🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
+                } else {
+                    warn!("⚠️  First Conway block detected but no Conway genesis loaded!");
+                }
+            }
+
+            // When we transition to a new epoch, snapshot the previous epoch
+            if epoch > *current_epoch {
+                let era = era_name(ledger_state.protocol_params.protocol_version_major);
+                let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
+
+                // Capture enactments before process_epoch_transition consumes them
+                let pending_enactments: Vec<_> = ledger_state.pending_enactments
+                    .iter()
+                    .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
+                    .collect();
+
+                // 1. Rebuild stake distribution from UTxO set
+                if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
+                    error!("Failed to rebuild stake distribution: {}", e);
+                }
+
+                // 2. Process epoch transition in ledger state
+                ledger_state.process_epoch_transition(EpochNo(epoch));
+
+                // 2a. Dump epoch state to JSON for comparison with Haskell
+                if let Some(dump_dir) = dump_epoch_dir {
+                    if let Err(e) = ledger_state.dump_epoch_state(dump_dir, slot) {
+                        error!("Failed to dump epoch state: {}", e);
+                    }
+
+                    // Mismatch detection: compare against Haskell reference if provided
+                    if let Some(haskell_dir) = haskell_epoch_dir {
+                        let epoch_num = ledger_state.epoch.0;
+                        let hayate_dump = dump_dir.join(format!("{}-hayate.json", epoch_num));
+                        if let Some(haskell_dump) = find_haskell_dump(haskell_dir, epoch_num) {
+                            match compare_epoch_dumps(&hayate_dump, &haskell_dump, haskell_dir, epoch_num) {
+                                Ok(true) => debug!("Epoch {} matches Haskell reference", epoch_num),
+                                Ok(false) => {
+                                    error!("EPOCH {} DIVERGED", epoch_num);
+                                    std::process::exit(1);
+                                }
+                                Err(e) => warn!("Could not compare epoch {} dumps: {}", epoch_num, e),
+                            }
+                        }
+                    }
+                }
+
+                // 3. Save epoch snapshot (UTxO hard-links + bincode file).
+                // last_slot/last_hash = final block of the ending epoch
+                // (the current block hasn't been processed yet at this point).
+                if let Err(e) = storage.save_epoch_snapshot(epoch, *last_slot, *last_hash, ledger_state) {
+                    error!("Failed to save epoch {} snapshot: {}", epoch, e);
+                }
+
+                info!(
+                    "Epoch {} ({}) slot={}  txs: {}  fees: {} ADA",
+                    current_epoch, era, slot, epoch_tx_count, epoch_fees_ada
+                );
+                for desc in &pending_enactments {
+                    info!("  enacted: {desc}");
+                }
+
+                *epoch_tx_count = 0;
+                *current_epoch = epoch;
+            }
+
+            // Process block AFTER epoch transition so the first block of a new
+            // epoch is counted towards the new epoch, not the previous one.
+            if let Err(e) = process_block_simple(storage, ledger_state, slot, &block_hash, block_bytes).await {
+                error!("Error processing block at slot {}: {}", slot, e);
+                return;
+            }
+
+            *blocks_processed += 1;
+            *epoch_tx_count += tx_count as u64;
+
+            // Track last processed block for epoch snapshot resume point.
+            *last_slot = slot;
+            let n = block_hash.len().min(32);
+            last_hash[..n].copy_from_slice(&block_hash[..n]);
+
+            // Log progress
+            if *blocks_processed % 1000 == 0 {
+                debug!("Processed {} blocks, slot: {}, epoch: {}",
+                    blocks_processed, slot, epoch);
+            }
+        }
+        Err(e) => {
+            error!("Failed to parse block: {}", e);
         }
     }
 }

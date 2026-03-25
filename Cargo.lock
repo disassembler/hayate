@@ -235,6 +235,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
+name = "binary-layout"
+version = "3.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5845e3504cf59b9588fff324710f27ee519515b8a8a9f1207042da9a9e64f819"
+dependencies = [
+ "doc-comment",
+ "paste",
+]
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -760,6 +770,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "doc-comment"
+version = "0.3.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780955b8b195a21ab8e4ac6b60dd1dbdcec1dc6c51c0617964b08c81785e12c9"
+
+[[package]]
 name = "dyn-clone"
 version = "1.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1089,6 +1105,7 @@ dependencies = [
  "pallas-codec 1.0.0-alpha.5",
  "pallas-configs",
  "pallas-crypto 1.0.0-alpha.5",
+ "pallas-hardano",
  "pallas-network",
  "pallas-primitives 1.0.0-alpha.5",
  "pallas-traverse 1.0.0-alpha.5",
@@ -1775,6 +1792,27 @@ dependencies = [
  "rand_core 0.9.5",
  "serde",
  "thiserror",
+]
+
+[[package]]
+name = "pallas-hardano"
+version = "1.0.0-alpha.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "615bb51008928f087de8c51820ff28eb91091290d08375646c946f0cf11b48a4"
+dependencies = [
+ "binary-layout",
+ "hex",
+ "pallas-addresses 1.0.0-alpha.5",
+ "pallas-codec 1.0.0-alpha.5",
+ "pallas-crypto 1.0.0-alpha.5",
+ "pallas-network",
+ "pallas-traverse 1.0.0-alpha.5",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "tap",
+ "thiserror",
+ "tracing",
 ]
 
 [[package]]

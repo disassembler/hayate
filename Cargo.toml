@@ -66,6 +66,7 @@ pallas = "1.0.0-alpha.5"
 pallas-codec = "1.0.0-alpha.5"
 pallas-primitives = "1.0.0-alpha.5"
 pallas-txbuilder = "1.0.0-alpha.5"
+pallas-hardano = "1.0.0-alpha.5"
 # Use aiken's uplc from crates.io (uses pallas 0.33)
 uplc = "1.1"
 
