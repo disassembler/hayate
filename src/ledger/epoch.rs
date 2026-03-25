@@ -28,6 +28,22 @@ impl LedgerState {
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
         tracing::debug!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
 
+        // Propagate Conway curPParams → protocol_params starting from the SECOND Conway epoch.
+        // At the Conway genesis epoch (e.g. 492), protocol_params stays as Babbage params so
+        // the epoch dump shows the correct "prevPParams = Babbage params" relationship.
+        // From the next epoch onwards, protocol_params reflects the current Conway params.
+        if let Some(genesis_epoch) = self.conway_genesis_epoch {
+            if new_epoch.0 > genesis_epoch {
+                if let Some(cur_params) = self.governance.conway_cur_params.as_deref().cloned() {
+                    self.protocol_params = cur_params;
+                    tracing::debug!(
+                        "Propagated conway_cur_params → protocol_params at epoch {} (genesis epoch: {})",
+                        new_epoch.0, genesis_epoch
+                    );
+                }
+            }
+        }
+
         // Step 1: Calculate rewards FIRST using existing snapshots
         // CRITICAL: Haskell's RUPD runs BEFORE SNAP, so we calculate rewards using:
         // - Stake distribution from ssStakeGo (existing go snapshot)
@@ -50,14 +66,14 @@ impl LedgerState {
         // - d < 0.8: eta = min(1, actual_blocks / expected_blocks)
         let blocks_for_rewards = if let Some(ref mark_snapshot) = self.snapshots.mark {
             let mark_total_blocks: u64 = mark_snapshot.epoch_blocks_by_pool.values().sum();
-            tracing::info!(
+            tracing::debug!(
                 "Using blocks from mark snapshot: epoch={}, blocks={}",
                 mark_snapshot.epoch.0,
                 mark_total_blocks
             );
             Arc::clone(&mark_snapshot.epoch_blocks_by_pool)
         } else {
-            tracing::info!("No mark snapshot available, using empty blocks");
+            tracing::debug!("No mark snapshot available, using empty blocks");
             Arc::new(HashMap::new())
         };
 
@@ -90,7 +106,7 @@ impl LedgerState {
 
         // Store for debugging/comparison
         self.last_applied_rupd = Some(rupd.clone());
-        tracing::info!(
+        tracing::debug!(
             "Stored last_applied_rupd with eta={}, deltaR1={}",
             rupd.eta,
             rupd.delta_r1
@@ -127,7 +143,7 @@ impl LedgerState {
         // computed rewards (including unregistered ones), so reserves were correctly adjusted
         // via the existing +rupd.undistributed above. Subtracting again would double-deduct.
         if unregistered_rewards.0 > 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Unregistered account rewards going to treasury: {} lovelace",
                 unregistered_rewards.0
             );
@@ -146,7 +162,7 @@ impl LedgerState {
         // This must happen AFTER reward calculation because epoch N→N+1 transition
         // uses epoch N's parameters, not epoch N+1's parameters
         if new_epoch.0 >= 2 && self.protocol_params.decentralization.numerator != 0 {
-            tracing::info!(
+            tracing::debug!(
                 "Babbage era: setting decentralization parameter d=0 (was {}/{})",
                 self.protocol_params.decentralization.numerator,
                 self.protocol_params.decentralization.denominator
@@ -168,7 +184,7 @@ impl LedgerState {
         // For now, we skip this and assume stake_distribution is maintained incrementally
         // TODO: Implement rebuild_stake_distribution() that queries utxo_tree
 
-        // Step 5: Build new mark snapshot
+        // Step 5b: Build new mark snapshot (SNAP runs BEFORE POOLREAP in Haskell's EPOCH STS)
         // Per Cardano spec, stake snapshot = UTxO-delegated stake + reward account balance.
         // Deposits are NOT included — they are tracked separately in esDeposited and do not
         // contribute to pool sigma or member reward calculations. Including deposits would
@@ -247,14 +263,92 @@ impl LedgerState {
             epoch_blocks_by_pool: Arc::clone(&self.epoch_blocks_by_pool),
         };
 
-        // Store in mark for the 3-snapshot rotation pattern
-        self.snapshots.mark = Some(new_snapshot.clone());
+        // Store in mark for the 3-snapshot rotation pattern.
+        // No bootstrap needed: Haskell starts all snapshots empty, so at epoch 2 go=empty
+        // (activeStake=0) and at epoch 3 go=epoch0 snapshot.  Any pre-seeding of set at
+        // epoch 0 would advance go by one epoch too early.
+        self.snapshots.mark = Some(new_snapshot);
 
-        // Bootstrap: In epoch 0 only, populate set so that rotation at epoch 1→2 gives us go=epoch0
-        // This ensures at epoch 2→3, we use go=epoch0 for reward calculation
-        // Only bootstrap in epoch 0 (before first Babbage epoch)
-        if self.epoch.0 == 0 {
-            self.snapshots.set = Some(new_snapshot);
+        // Step 5a: POOLREAP — retire pools after taking the mark snapshot.
+        // Matches Haskell's EPOCH STS: SNAP runs before POOL (POOLREAP).
+        // Haskell's POOLREAP retires pools where retire_epoch <= new_epoch (current epoch number).
+        // The mark snapshot above includes pools that are being retired in this same transition.
+        {
+            let pool_deposit = Lovelace(self.protocol_params.pool_deposit);
+            let retiring: Vec<Hash28> = self.pending_retirements
+                .range(..=new_epoch)
+                .flat_map(|(_, pools)| pools.iter().copied())
+                .collect();
+            self.pending_retirements.retain(|epoch, _| *epoch > new_epoch);
+            for pool_id in retiring {
+                if let Some(pool_reg) = Arc::make_mut(&mut self.pool_params).remove(&pool_id) {
+                    let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
+                    let is_registered = self.reward_accounts.contains_key(&op_key)
+                        || self.delegations.contains_key(&op_key);
+                    if is_registered {
+                        *Arc::make_mut(&mut self.reward_accounts)
+                            .entry(op_key)
+                            .or_insert(Lovelace(0)) += pool_deposit;
+                    } else {
+                        // Operator reward account is unregistered: deposit goes to reserves
+                        // (Haskell POOLREAP: unclaimed deposits → reserves)
+                        self.reserves += pool_deposit;
+                    }
+                    // Deposit was stored under pool_id (28 bytes, zero-padded to 32).
+                    // Must refund with the same key, NOT op_key.
+                    let pool_dep_key = {
+                        let mut k = [0u8; 32];
+                        k[..28].copy_from_slice(&pool_id);
+                        k
+                    };
+                    self.deposit_tracker
+                        .refund_deposit(&pool_dep_key, super::state::DepositType::Pool);
+                    tracing::info!(
+                        "Pool retired at epoch→{}: {} (deposit {} refunded, registered={})",
+                        new_epoch.0,
+                        hex::encode(&pool_id[..8]),
+                        pool_deposit.0,
+                        is_registered,
+                    );
+                }
+            }
+        }
+
+        // ENACT: Apply proposals ratified at the PREVIOUS epoch boundary.
+        //
+        // Matches Haskell's NEWEPOCH STS order: EPOCH (→ SNAP) then ENACT then RATIFY.
+        // ENACT runs AFTER the mark snapshot, so the deposit does NOT appear in this epoch's
+        // mark. It will appear in the mark at the NEXT epoch boundary (one epoch later).
+        //
+        // Example: proposal passes RATIFY at epoch N → pending_enactments.
+        //   Epoch N+1: mark taken (deposit NOT in reward_accounts) → ENACT (deposit added)
+        //   Epoch N+2: mark taken (deposit IS in reward_accounts) ← matches Haskell
+        let pending = std::mem::take(&mut self.pending_enactments);
+        if !pending.is_empty() {
+            tracing::info!(
+                epoch = new_epoch.0,
+                n = pending.len(),
+                "ENACT: applying {} proposal(s) ratified at previous epoch boundary",
+                pending.len()
+            );
+            for enactment in pending {
+                self.enact_gov_action(&enactment.gov_action);
+                if enactment.deposit.0 > 0 {
+                    *Arc::make_mut(&mut self.reward_accounts)
+                        .entry(enactment.return_cred_hash)
+                        .or_insert(Lovelace(0)) += enactment.deposit;
+                    self.deposit_tracker.refund_deposit(
+                        &enactment.return_cred_hash,
+                        super::state::DepositType::Governance(enactment.action_id),
+                    );
+                    tracing::debug!(
+                        action_id = %hex::encode(&enactment.action_id.tx_hash),
+                        deposit = enactment.deposit.0,
+                        return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
+                        "ENACT: deposit returned to reward_accounts"
+                    );
+                }
+            }
         }
 
         // Apply queued pool re-registrations AFTER taking the mark snapshot.
@@ -275,36 +369,7 @@ impl LedgerState {
         // This will be used by RUPD at the NEXT epoch boundary
         self.snapshots.current_epoch_fees = self.epoch_fees;
 
-        // Step 6: Process pending pool retirements for this epoch
-        if let Some(retiring_pools) = self.pending_retirements.remove(&new_epoch) {
-            let pool_deposit = Lovelace(self.protocol_params.pool_deposit);
-            for pool_id in &retiring_pools {
-                // Refund pool deposit to operator's registered reward account
-                if let Some(pool_reg) = Arc::make_mut(&mut self.pool_params).remove(pool_id) {
-                    let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .entry(op_key)
-                        .or_insert(Lovelace(0)) += pool_deposit;
-
-                    // Also refund deposit from tracker
-                    self.deposit_tracker
-                        .refund_deposit(&op_key, super::state::DepositType::Pool);
-
-                    tracing::debug!(
-                        "Pool retired at epoch {}: {} (deposit {} refunded)",
-                        new_epoch.0,
-                        hex::encode(pool_id),
-                        pool_deposit.0
-                    );
-                }
-            }
-        }
-
-        // Clean up retirements from past epochs
-        self.pending_retirements
-            .retain(|epoch, _| *epoch >= new_epoch);
-
-        // Step 7: Apply pre-Conway protocol parameter updates (PPUP rule)
+        // Step 6: Apply pre-Conway protocol parameter updates (PPUP rule)
         //
         // Proposals submitted in epoch N carry CBOR epoch=N in their Update field.
         // Haskell applies them two transitions later: the proposals from epoch N are
@@ -317,7 +382,7 @@ impl LedgerState {
         if let Some(proposals) = self.pending_pp_updates.remove(&ppup_key) {
             let quorum = self.update_quorum;
             let n_proposals = proposals.len() as u64;
-            tracing::info!(
+            tracing::debug!(
                 epoch = new_epoch.0,
                 n_proposals,
                 quorum,
@@ -349,7 +414,7 @@ impl LedgerState {
                 if let Err(e) = self.apply_protocol_param_update(&merged) {
                     tracing::warn!(epoch = new_epoch.0, error = %e, "Failed to apply protocol parameter update");
                 } else {
-                    tracing::info!(
+                    tracing::debug!(
                         epoch = new_epoch.0,
                         n_opt = ?merged.n_opt,
                         rho = ?merged.rho,
@@ -487,6 +552,18 @@ impl LedgerState {
             );
         }
 
+        // Snapshot DRep power distribution for use in next epoch's ratification.
+        // Matches Haskell's `setFreshDRepPulsingState` at each epoch boundary.
+        // Ratification at epoch N+1→N+2 uses the snapshot frozen at N→N+1.
+        // Only meaningful in Conway era (vote_delegations will be empty otherwise).
+        if !self.governance.vote_delegations.is_empty() {
+            let (drep_power, no_confidence, abstain) = self.compute_drep_distribution_for_snapshot();
+            let gov = Arc::make_mut(&mut self.governance);
+            gov.drep_power_snapshot = drep_power;
+            gov.drep_no_confidence_snapshot = no_confidence;
+            gov.drep_abstain_snapshot = abstain;
+        }
+
         // Step 12: Compute new epoch nonce per Haskell TICKN rule
         self.compute_epoch_nonce();
 
@@ -498,6 +575,179 @@ impl LedgerState {
         self.epoch = new_epoch;
     }
 
+    /// Compute DRep voting power distribution from live state for snapshotting.
+    ///
+    /// Uses Haskell's `computeDRepDistr` formula:
+    ///   stake[cred] = instantStake[cred] + rewardBalance[cred] + proposalDeposits[cred]
+    /// Only active registered DReps (KeyHash/ScriptHash) are included in the cache.
+    /// Returns (drep_cache, no_confidence_stake, abstain_stake).
+    pub(crate) fn compute_drep_distribution_for_snapshot(
+        &self,
+    ) -> (std::collections::HashMap<crate::ledger::primitives::Hash32, u64>, u64, u64) {
+        let mut cache = std::collections::HashMap::new();
+        let mut no_confidence = 0u64;
+        let mut abstain = 0u64;
+        for (stake_cred, drep) in &self.governance.vote_delegations {
+            let utxo = self.stake_distribution.stake_map.get(stake_cred).map(|l| l.0).unwrap_or(0);
+            let reward = self.reward_accounts.get(stake_cred).map(|l| l.0).unwrap_or(0);
+            let gov_deps = self.deposit_tracker.governance_deposits_by_return_cred(stake_cred);
+            let stake = utxo + reward + gov_deps;
+            match drep {
+                DRep::KeyHash(h) => {
+                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                        *cache.entry(*h).or_default() += stake;
+                    }
+                }
+                DRep::ScriptHash(h) => {
+                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                        *cache.entry(*h).or_default() += stake;
+                    }
+                }
+                DRep::AlwaysNoConfidence => no_confidence += stake,
+                DRep::AlwaysAbstain => abstain += stake,
+            }
+        }
+        (cache, no_confidence, abstain)
+    }
+
+    /// Apply Conway genesis: initialize governance state from the Conway genesis configuration.
+    ///
+    /// Called when the first Conway-era block is detected, BEFORE the epoch transition.
+    /// Sets up `conway_cur_params`, committee, constitution, and marks the genesis epoch.
+    pub fn apply_conway_genesis(
+        &mut self,
+        genesis: &crate::genesis::ConwayGenesis,
+        new_epoch: EpochNo,
+    ) {
+        if self.conway_genesis_epoch.is_some() {
+            return; // Already applied
+        }
+
+        // Build conway_cur_params: copy current protocol_params and apply Conway overrides.
+        // Protocol version is set to 9 (Conway).
+        let mut cur_params = self.protocol_params.clone();
+        cur_params.protocol_version_major = 9;
+        cur_params.protocol_version_minor = 0;
+
+        if let Some(v) = genesis.committee_max_term_length {
+            cur_params.committee_max_term_length = v;
+        }
+        if let Some(v) = genesis.gov_action_lifetime {
+            cur_params.gov_action_lifetime = v;
+        }
+        if let Some(v) = genesis.gov_action_deposit {
+            cur_params.gov_action_deposit = v;
+        }
+        if let Some(v) = genesis.d_rep_deposit {
+            cur_params.drep_deposit = v;
+        }
+        if let Some(v) = genesis.d_rep_activity {
+            cur_params.drep_activity_period = v;
+        }
+        if let Some(v) = genesis.committee_min_size {
+            cur_params.committee_min_size = v;
+        }
+
+        // Apply pool voting thresholds from genesis
+        if let Some(pvt) = &genesis.pool_voting_thresholds {
+            cur_params.pvt_motion_no_confidence = Self::f64_to_rational(pvt.motion_no_confidence);
+            cur_params.pvt_committee_normal = Self::f64_to_rational(pvt.committee_normal);
+            cur_params.pvt_committee_no_confidence = Self::f64_to_rational(pvt.committee_no_confidence);
+            cur_params.pvt_hard_fork = Self::f64_to_rational(pvt.hard_fork_initiation);
+            cur_params.pvt_pp_security_group = Self::f64_to_rational(pvt.pp_security_group);
+        }
+
+        // Apply DRep voting thresholds from genesis
+        if let Some(dvt) = &genesis.d_rep_voting_thresholds {
+            cur_params.dvt_motion_no_confidence = Self::f64_to_rational(dvt.motion_no_confidence);
+            cur_params.dvt_committee_normal = Self::f64_to_rational(dvt.committee_normal);
+            cur_params.dvt_committee_no_confidence = Self::f64_to_rational(dvt.committee_no_confidence);
+            cur_params.dvt_constitution = Self::f64_to_rational(dvt.update_to_constitution);
+            cur_params.dvt_hard_fork = Self::f64_to_rational(dvt.hard_fork_initiation);
+            cur_params.dvt_pp_network_group = Self::f64_to_rational(dvt.pp_network_group);
+            cur_params.dvt_pp_economic_group = Self::f64_to_rational(dvt.pp_economic_group);
+            cur_params.dvt_pp_technical_group = Self::f64_to_rational(dvt.pp_technical_group);
+            cur_params.dvt_pp_gov_group = Self::f64_to_rational(dvt.pp_gov_group);
+            cur_params.dvt_treasury_withdrawal = Self::f64_to_rational(dvt.treasury_withdrawal);
+        }
+
+        Arc::make_mut(&mut self.governance).conway_cur_params = Some(Box::new(cur_params));
+
+        // Initialize committee from genesis
+        if let Some(committee) = &genesis.committee {
+            let gov = Arc::make_mut(&mut self.governance);
+            gov.committee_expiration.clear();
+            for (cred_str, term_end) in &committee.members {
+                if let Some(hash) = Self::parse_credential_key(cred_str) {
+                    // Mark script credentials
+                    if cred_str.starts_with("scriptHash-") {
+                        gov.script_committee_credentials.insert(hash);
+                    }
+                    gov.committee_expiration.insert(hash, EpochNo(*term_end));
+                }
+            }
+            if let Some(threshold) = &committee.threshold {
+                gov.committee_threshold = Some(Rational {
+                    numerator: threshold.numerator,
+                    denominator: threshold.denominator,
+                });
+            }
+        }
+
+        // Initialize constitution from genesis
+        if let Some(c) = &genesis.constitution {
+            let anchor = c.anchor.as_ref().map(|a| {
+                let mut hash = [0u8; 32];
+                if let Ok(hash_bytes) = hex::decode(&a.data_hash) {
+                    let n = hash_bytes.len().min(32);
+                    hash[..n].copy_from_slice(&hash_bytes[..n]);
+                }
+                Anchor { url: a.url.clone(), hash }
+            });
+            let script_hash = c.script.as_ref().and_then(|s| {
+                let bytes = hex::decode(s).ok()?;
+                if bytes.len() >= 28 {
+                    let mut hash = [0u8; 32];
+                    hash[..28].copy_from_slice(&bytes[..28]);
+                    Some(hash)
+                } else {
+                    None
+                }
+            });
+            Arc::make_mut(&mut self.governance).constitution = Some(Constitution { anchor, script_hash });
+        }
+
+        self.conway_genesis_epoch = Some(new_epoch.0);
+
+        tracing::info!(
+            epoch = new_epoch.0,
+            "Applied Conway genesis"
+        );
+    }
+
+    /// Convert a floating-point threshold (e.g., 0.67) to a Rational with denominator 100.
+    fn f64_to_rational(v: f64) -> Rational {
+        let d = 100u64;
+        let n = (v * d as f64).round() as u64;
+        Rational { numerator: n, denominator: d }
+    }
+
+    /// Parse a credential string like "keyHash-aabbcc..." or "scriptHash-aabbcc..."
+    /// into a 32-byte padded hash (credential stored as Hash32 with 28 bytes of hash data).
+    fn parse_credential_key(cred_str: &str) -> Option<Hash32> {
+        let hex_part = cred_str
+            .strip_prefix("keyHash-")
+            .or_else(|| cred_str.strip_prefix("scriptHash-"))?;
+
+        let bytes = hex::decode(hex_part).ok()?;
+        if bytes.len() < 28 {
+            return None;
+        }
+        let mut hash = [0u8; 32];
+        hash[..28].copy_from_slice(&bytes[..28]);
+        Some(hash)
+    }
+
     /// Dump epoch state to JSON file for comparison with Haskell cardano-node
     pub fn dump_epoch_state(&self, dump_dir: &Path, slot: u64) -> Result<(), std::io::Error> {
         let filename = format!("{}-hayate.json", self.epoch.0);
@@ -507,7 +757,7 @@ impl LedgerState {
         let format_stake = |stake: &HashMap<Hash32, Lovelace>| {
             stake
                 .iter()
-                .map(|(k, v)| (format!("keyHash-{}", hex::encode(k)), json!(v.0)))
+                .map(|(k, v)| (format!("keyHash-{}", hex::encode(&k[..28])), json!(v.0)))
                 .collect::<serde_json::Map<String, serde_json::Value>>()
         };
 
@@ -515,7 +765,7 @@ impl LedgerState {
         let format_delegations = |delegations: &HashMap<Hash32, Hash28>| {
             delegations
                 .iter()
-                .map(|(k, v)| (format!("keyHash-{}", hex::encode(k)), json!(hex::encode(v))))
+                .map(|(k, v)| (format!("keyHash-{}", hex::encode(&k[..28])), json!(hex::encode(v))))
                 .collect::<serde_json::Map<String, serde_json::Value>>()
         };
 
@@ -619,7 +869,7 @@ impl LedgerState {
 
         // Include RUPD intermediate values for comparison with Haskell
         let rupd_values = if let Some(rupd) = &self.last_applied_rupd {
-            tracing::info!("Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
+            tracing::debug!("Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
             json!({
                 "eta": rupd.eta,
                 "deltaR1": rupd.delta_r1,
@@ -630,7 +880,7 @@ impl LedgerState {
                 "deltaR2": rupd.undistributed,
             })
         } else {
-            tracing::info!(
+            tracing::debug!(
                 "last_applied_rupd is None when dumping epoch {}",
                 self.epoch.0
             );
@@ -643,9 +893,19 @@ impl LedgerState {
         let a0_f = pp.a0.numerator as f64 / pp.a0.denominator.max(1) as f64;
         let d_f = pp.decentralization.numerator as f64 / pp.decentralization.denominator.max(1) as f64;
 
-        // Conway era = protocol_version_major >= 9
-        let is_conway = pp.protocol_version_major >= 9;
-        let era_name = if is_conway { "Conway" } else { "Babbage" };
+        // Conway era = governance has conway_cur_params initialized (set at Conway genesis)
+        let is_conway = self.governance.conway_cur_params.is_some();
+        // Era name from protocol major version, matching Haskell's snapshotEraName field.
+        let era_name = match self.protocol_params.protocol_version_major {
+            0..=1 => "Byron",
+            2     => "Shelley",
+            3     => "Allegra",
+            4     => "Mary",
+            5..=6 => "Alonzo",
+            7..=8 => "Babbage",
+            9..=11 => "Conway",
+            _     => "Dijkstra",
+        };
 
         // activeStake = sum of all go snapshot stake (= delegated lovelace in go snapshot)
         // Matches Haskell's sumAllStake (ssStake goSnap)
@@ -673,6 +933,7 @@ impl LedgerState {
                 "monetaryExpansion": rat_json(p.rho),
                 "treasuryCut": rat_json(p.tau),
                 "minPoolCost": p.min_pool_cost,
+                "utxoCostPerByte": p.utxo_cost_per_byte,
                 "maxValueSize": p.max_value_size,
                 "collateralPercentage": p.collateral_percentage,
                 "maxCollateralInputs": p.max_collateral_inputs,
@@ -688,12 +949,14 @@ impl LedgerState {
                     "memory": p.max_block_execution_units_mem,
                     "steps": p.max_block_execution_units_steps,
                 },
+                "minFeeRefScriptCostPerByte": p.min_fee_ref_script_cost_per_byte,
                 // Conway-specific
                 "dRepDeposit": p.drep_deposit,
                 "dRepActivity": p.drep_activity_period,
                 "govActionLifetime": p.gov_action_lifetime,
                 "govActionDeposit": p.gov_action_deposit,
                 "committeeMinSize": p.committee_min_size,
+                "committeeMaxTermLength": p.committee_max_term_length,
                 "dRepVotingThresholds": {
                     "motionNoConfidence": rat_json(p.dvt_motion_no_confidence),
                     "committeeNormal": rat_json(p.dvt_committee_normal),
@@ -722,14 +985,16 @@ impl LedgerState {
             let gov = &*self.governance;
 
             // Committee members: cold_cred_hex -> expiration_epoch
+            // Committee credentials are stored as Hash32 (28-byte hash padded to 32).
+            // Output only the first 28 bytes (56 hex chars) to match Haskell format.
             let committee_members: serde_json::Map<String, serde_json::Value> = gov
                 .committee_expiration
                 .iter()
                 .map(|(cold_hash, exp)| {
                     let key = if gov.script_committee_credentials.contains(cold_hash) {
-                        format!("scriptHash-{}", hex::encode(cold_hash))
+                        format!("scriptHash-{}", hex::encode(&cold_hash[..28]))
                     } else {
-                        format!("keyHash-{}", hex::encode(cold_hash))
+                        format!("keyHash-{}", hex::encode(&cold_hash[..28]))
                     };
                     (key, json!(exp.0))
                 })
@@ -746,23 +1011,23 @@ impl LedgerState {
                 // Hot key authorizations
                 for (cold_hash, hot_hash) in &gov.committee_hot_keys {
                     let cold_key = if gov.script_committee_credentials.contains(cold_hash) {
-                        format!("scriptHash-{}", hex::encode(cold_hash))
+                        format!("scriptHash-{}", hex::encode(&cold_hash[..28]))
                     } else {
-                        format!("keyHash-{}", hex::encode(cold_hash))
+                        format!("keyHash-{}", hex::encode(&cold_hash[..28]))
                     };
                     let hot_tag = if gov.script_committee_hot_credentials.contains(hot_hash) {
-                        json!({"tag": "CommitteeHotCredential", "contents": {"scriptHash": hex::encode(hot_hash)}})
+                        json!({"tag": "CommitteeHotCredential", "contents": {"scriptHash": hex::encode(&hot_hash[..28])}})
                     } else {
-                        json!({"tag": "CommitteeHotCredential", "contents": {"keyHash": hex::encode(hot_hash)}})
+                        json!({"tag": "CommitteeHotCredential", "contents": {"keyHash": hex::encode(&hot_hash[..28])}})
                     };
                     map.insert(cold_key, hot_tag);
                 }
                 // Resignations
                 for (cold_hash, _anchor) in &gov.committee_resigned {
                     let cold_key = if gov.script_committee_credentials.contains(cold_hash) {
-                        format!("scriptHash-{}", hex::encode(cold_hash))
+                        format!("scriptHash-{}", hex::encode(&cold_hash[..28]))
                     } else {
-                        format!("keyHash-{}", hex::encode(cold_hash))
+                        format!("keyHash-{}", hex::encode(&cold_hash[..28]))
                     };
                     map.entry(cold_key).or_insert(json!({"tag": "MemberResigned", "contents": null}));
                 }
@@ -776,27 +1041,32 @@ impl LedgerState {
                 } else {
                     json!(null)
                 };
-                let script_json = c.script_hash.map(|h| json!(hex::encode(h))).unwrap_or(json!(null));
+                // Script hash is 28 bytes stored in Hash32 (padded); output first 28 bytes
+                let script_json = c.script_hash.map(|h| json!(hex::encode(&h[..28]))).unwrap_or(json!(null));
                 json!({"anchor": anchor_json, "script": script_json})
             } else {
                 json!(null)
             };
 
-            // DRep stake distribution: compute from mark snapshot vote_delegations
+            // DRep stake distribution: compute from live state per Haskell's computeDRepDistr.
+            // Formula: stake = instantStake[cred] + rewardBalance[cred] + proposalDeposits[cred]
+            // instantStake = UTxO-owning credentials (NOT pool-delegation-restricted).
+            // This matches Haskell's `instantStakeCredentialsL` from the live UTxO map.
             let drep_distr: serde_json::Map<String, serde_json::Value> = {
                 let mut distr: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-                if let Some(mark) = &self.snapshots.mark {
-                    for (stake_cred, drep) in &gov.vote_delegations {
-                        let stake = mark.stake_distribution.get(stake_cred).map(|l| l.0).unwrap_or(0);
-                        if stake == 0 { continue; }
-                        let key = match drep {
-                            DRep::KeyHash(h) => format!("keyHash-{}", hex::encode(h)),
-                            DRep::ScriptHash(h) => format!("scriptHash-{}", hex::encode(h)),
-                            DRep::AlwaysAbstain => "alwaysAbstain".to_string(),
-                            DRep::AlwaysNoConfidence => "alwaysNoConfidence".to_string(),
-                        };
-                        *distr.entry(key).or_insert(0) += stake;
-                    }
+                for (stake_cred, drep) in &gov.vote_delegations {
+                    let utxo = self.stake_distribution.stake_map.get(stake_cred).map(|l| l.0).unwrap_or(0);
+                    let reward = self.reward_accounts.get(stake_cred).map(|l| l.0).unwrap_or(0);
+                    let gov_deps = self.deposit_tracker.governance_deposits_by_return_cred(stake_cred);
+                    let stake = utxo + reward + gov_deps;
+                    if stake == 0 { continue; }
+                    let key = match drep {
+                        DRep::KeyHash(h) => format!("drep-keyHash-{}", hex::encode(&h[..28])),
+                        DRep::ScriptHash(h) => format!("drep-scriptHash-{}", hex::encode(&h[..28])),
+                        DRep::AlwaysAbstain => "drep-alwaysAbstain".to_string(),
+                        DRep::AlwaysNoConfidence => "drep-alwaysNoConfidence".to_string(),
+                    };
+                    *distr.entry(key).or_insert(0) += stake;
                 }
                 distr.into_iter().map(|(k, v)| (k, json!(v))).collect()
             };
@@ -819,6 +1089,10 @@ impl LedgerState {
                 .map(|p| serialize_pp(p))
                 .unwrap_or_else(|| serialize_pp(pp));
 
+            // curPParams = Conway governance's current params (initialized from Conway genesis,
+            // updated by ParameterChange governance actions). Falls back to protocol_params.
+            let conway_cur = self.governance.conway_cur_params.as_deref().unwrap_or(pp);
+
             json!({
                 "committee": {
                     "members": committee_members,
@@ -835,7 +1109,7 @@ impl LedgerState {
                         "threshold": committee_threshold,
                     },
                     "constitution": constitution_json,
-                    "curPParams": serialize_pp(pp),
+                    "curPParams": serialize_pp(conway_cur),
                     "prevPParams": prev_pp_json,
                     "prevGovActionIds": prev_gov_action_ids,
                 },
@@ -884,7 +1158,7 @@ impl LedgerState {
         });
 
         std::fs::write(&filepath, serde_json::to_string_pretty(&json_output)?)?;
-        tracing::info!(
+        tracing::debug!(
             "📝 Dumped epoch {} state to {}",
             self.epoch.0,
             filepath.display()

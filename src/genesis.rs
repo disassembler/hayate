@@ -416,26 +416,26 @@ pub struct ConwayGenesis {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PoolVotingThresholds {
-    pub pvt_motion_no_confidence: Rational,
-    pub pvt_committee_normal: Rational,
-    pub pvt_committee_no_confidence: Rational,
-    pub pvt_hard_fork_initiation: Rational,
-    pub pvtpp_security_group: Rational,
+    pub motion_no_confidence: f64,
+    pub committee_normal: f64,
+    pub committee_no_confidence: f64,
+    pub hard_fork_initiation: f64,
+    pub pp_security_group: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DRepVotingThresholds {
-    pub dvt_motion_no_confidence: Rational,
-    pub dvt_committee_normal: Rational,
-    pub dvt_committee_no_confidence: Rational,
-    pub dvt_update_to_constitution: Rational,
-    pub dvt_hard_fork_initiation: Rational,
-    pub dvt_p_p_network_group: Rational,
-    pub dvt_p_p_economic_group: Rational,
-    pub dvt_p_p_technical_group: Rational,
-    pub dvt_p_p_gov_group: Rational,
-    pub dvt_treasury_withdrawal: Rational,
+    pub motion_no_confidence: f64,
+    pub committee_normal: f64,
+    pub committee_no_confidence: f64,
+    pub update_to_constitution: f64,
+    pub hard_fork_initiation: f64,
+    pub pp_network_group: f64,
+    pub pp_economic_group: f64,
+    pub pp_technical_group: f64,
+    pub pp_gov_group: f64,
+    pub treasury_withdrawal: f64,
 }
 
 #[derive(Debug, Clone, Deserialize)]

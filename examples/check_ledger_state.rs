@@ -5,10 +5,11 @@ use std::path::PathBuf;
 use anyhow::Result;
 
 fn main() -> Result<()> {
-    let storage = NodeStorage::open(PathBuf::from("./data"), Network::SanchoNet)?;
+    let mut storage = NodeStorage::open(PathBuf::from("./data"), Network::SanchoNet)?;
 
-    if let Some((epoch, ledger_state)) = storage.restore_latest_ledger_state()? {
-        println!("\n=== LEDGER STATE (Epoch {}) ===\n", epoch);
+    if let Some((ledger_state, slot, _hash)) = storage.restore_latest_snapshot()? {
+        let epoch = ledger_state.epoch.0;
+        println!("\n=== LEDGER STATE (Epoch {}, resume slot {}) ===\n", epoch, slot);
 
         println!("📊 Reward Accounts: {}", ledger_state.reward_accounts.len());
         println!("🔗 Delegations: {}", ledger_state.delegations.len());

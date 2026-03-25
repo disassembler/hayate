@@ -171,6 +171,19 @@ pub struct LedgerState {
     /// Used for nextEnactState.prevPParams in Conway epoch dumps.
     #[serde(default)]
     pub prev_protocol_params: Option<ProtocolParameters>,
+
+    /// Epoch when Conway genesis was applied (the first Conway-era epoch number).
+    /// Used to determine when to propagate conway_cur_params → protocol_params.
+    #[serde(default)]
+    pub conway_genesis_epoch: Option<u64>,
+
+    /// Proposals ratified at the most recent epoch boundary, waiting to be enacted.
+    ///
+    /// Matches Haskell's 2-phase RATIFY → ENACT ordering:
+    /// - RATIFY at epoch N populates this list
+    /// - ENACT at epoch N+1 (after the mark snapshot) applies actions and returns deposits
+    #[serde(default)]
+    pub pending_enactments: Vec<PendingEnactment>,
 }
 
 fn default_update_quorum() -> u64 {
@@ -213,6 +226,8 @@ impl LedgerState {
             last_applied_rupd: None,
             script_stake_credentials: HashSet::new(),
             prev_protocol_params: None,
+            conway_genesis_epoch: None,
+            pending_enactments: Vec::new(),
         }
     }
 
@@ -508,6 +523,32 @@ pub struct GovernanceState {
     pub last_expired: Vec<GovActionId>,
     #[serde(default)]
     pub last_ratify_delayed: bool,
+
+    /// Conway current protocol parameters (initialized from Conway genesis at era transition,
+    /// updated by ParameterChange governance actions). None in Babbage era.
+    ///
+    /// This is separate from LedgerState.protocol_params because:
+    /// - At the Conway genesis epoch: protocol_params still shows Babbage params (for that epoch's rewards)
+    /// - From the next epoch onwards: protocol_params is updated to match conway_cur_params
+    #[serde(default)]
+    pub conway_cur_params: Option<Box<ProtocolParameters>>,
+
+    /// DRep voting power snapshot taken at the END of each epoch transition.
+    ///
+    /// Maps DRep credential hash → total delegated stake (UTxO + rewards + govDeposits).
+    /// Ratification at epoch N+1 uses this snapshot (frozen at epoch N boundary).
+    /// Matches Haskell's `setFreshDRepPulsingState` / `DRepPulser` behaviour.
+    /// Empty until the first Conway epoch transition completes.
+    #[serde(default)]
+    pub drep_power_snapshot: HashMap<Hash32, u64>,
+
+    /// AlwaysNoConfidence stake in the DRep power snapshot
+    #[serde(default)]
+    pub drep_no_confidence_snapshot: u64,
+
+    /// AlwaysAbstain stake in the DRep power snapshot
+    #[serde(default)]
+    pub drep_abstain_snapshot: u64,
 }
 
 /// Registration state for a DRep
@@ -723,6 +764,17 @@ impl DepositTracker {
     pub fn get_staking_stake(&self, cred: &Hash32) -> Lovelace {
         self.deposits.get(cred).map(|d| d.staking_stake()).unwrap_or(Lovelace(0))
     }
+
+    /// Sum all governance proposal deposits for a given return credential.
+    ///
+    /// The deposit_tracker indexes governance deposits by the proposal's `return_addr` credential.
+    /// This returns the total governance deposit amount attributed to `cred` as a return address.
+    pub fn governance_deposits_by_return_cred(&self, cred: &Hash32) -> u64 {
+        self.deposits
+            .get(cred)
+            .map(|d| d.governance.iter().map(|(_, amount)| amount.0).sum())
+            .unwrap_or(0)
+    }
 }
 
 /// Deposit type enum for tracking different deposit kinds
@@ -770,5 +822,17 @@ mod tests {
 
         // This is the critical property: voting > staking when governance deposits exist
         assert!(voting.0 > staking.0);
+    }
+
+    #[test]
+    fn test_ledger_state_bincode_roundtrip() {
+        let state = LedgerState::new(crate::ledger::primitives::ProtocolParameters::default());
+        let bytes = bincode::serialize(&state).expect("serialize");
+        let restored: LedgerState = bincode::deserialize(&bytes).expect("deserialize");
+        assert_eq!(state.epoch, restored.epoch);
+        assert_eq!(state.treasury, restored.treasury);
+        assert_eq!(state.reserves, restored.reserves);
+        assert_eq!(state.delegations.len(), restored.delegations.len());
+        assert_eq!(state.reward_accounts.len(), restored.reward_accounts.len());
     }
 }

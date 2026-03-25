@@ -125,7 +125,6 @@ impl LedgerState {
             self.build_drep_power_cache();
 
         let total_drep_stake = self.compute_total_drep_stake();
-        let total_spo_stake = self.compute_total_spo_stake();
 
         // Sort proposals by priority (lower number = higher priority)
         // Clone proposals so we don't hold a borrow during iteration
@@ -152,7 +151,6 @@ impl LedgerState {
                 action_id,
                 state,
                 total_drep_stake,
-                total_spo_stake,
                 &drep_power_cache,
                 no_confidence_stake,
             ) {
@@ -165,37 +163,31 @@ impl LedgerState {
                     continue;
                 }
 
-                // Enact the proposal
-                self.enact_gov_action(&state.procedure.gov_action);
-
-                // Update enacted roots to reflect this action
+                // Update enacted roots to reflect this action (for within-epoch chain validation:
+                // sequential proposals in the same RATIFY round can depend on each other's roots).
                 self.update_enacted_roots(&action_id, &state.procedure.gov_action);
 
-                // Refund deposit to return address
-                let deposit = state.procedure.deposit;
-                if deposit.0 > 0 {
-                    let return_cred_hash = match &state.procedure.return_addr {
-                        Credential::Key(hash) => *hash,
-                        Credential::Script(hash) => *hash,
-                    };
-
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .entry(return_cred_hash)
-                        .or_insert(Lovelace(0)) += deposit;
-
-                    // Refund from deposit tracker
-                    self.deposit_tracker.refund_deposit(
-                        &return_cred_hash,
-                        super::state::DepositType::Governance(*action_id),
-                    );
-                }
+                // Stage for ENACT at the NEXT epoch boundary (after the mark snapshot).
+                // Matches Haskell's 2-phase RATIFY → ENACT ordering:
+                //   RATIFY at epoch N: proposal passes → stored in pending_enactments
+                //   ENACT  at epoch N+1: action applied, deposit returned (after SNAP/mark)
+                let return_cred_hash = match &state.procedure.return_addr {
+                    Credential::Key(hash) => *hash,
+                    Credential::Script(hash) => *hash,
+                };
+                self.pending_enactments.push(PendingEnactment {
+                    action_id: *action_id,
+                    gov_action: state.procedure.gov_action.clone(),
+                    return_cred_hash,
+                    deposit: state.procedure.deposit,
+                });
 
                 ratified.push((*action_id, state.clone()));
                 ratified_ids.push(*action_id);
 
                 tracing::info!(
                     action_id = %hex::encode(&action_id.tx_hash),
-                    "Governance proposal ratified and enacted"
+                    "Governance proposal ratified (staged for enactment at next epoch boundary)"
                 );
 
                 // Check if this is a delaying action
@@ -250,15 +242,14 @@ impl LedgerState {
         action_id: &GovActionId,
         state: &ProposalState,
         _total_drep_stake: u64,
-        total_spo_stake: u64,
         drep_power_cache: &HashMap<Hash32, u64>,
         no_confidence_stake: u64,
     ) -> bool {
         // Count votes by voter type (uses pre-computed DRep power cache)
         // Per CIP-1694:
         // - DRep denominator = yes + no voted stake (abstain excluded)
-        // - SPO denominator = total active SPO stake (non-voting SPOs effectively vote No)
-        let (drep_yes, drep_total, spo_yes, _spo_voted, _cc_yes, _cc_total) = self
+        // - SPO denominator = total non-abstain SPO stake (accounts for default vote logic)
+        let (drep_yes, drep_total, spo_yes, spo_effective_total, _cc_yes, _cc_total) = self
             .count_votes_by_type(
                 action_id,
                 &state.procedure.gov_action,
@@ -294,7 +285,7 @@ impl LedgerState {
                 let spo_met = if let Some(ref spo_threshold) =
                     pp_change_spo_threshold(protocol_param_update, &self.protocol_params)
                 {
-                    check_threshold(spo_yes, total_spo_stake, spo_threshold)
+                    check_threshold(spo_yes, spo_effective_total, spo_threshold)
                 } else {
                     true // No SPO vote required for non-security params
                 };
@@ -322,7 +313,7 @@ impl LedgerState {
                 };
                 let spo_threshold = &self.protocol_params.pvt_hard_fork;
                 let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
-                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
+                let spo_met = check_threshold(spo_yes, spo_effective_total, spo_threshold);
                 let cc_met = check_cc_approval(
                     action_id,
                     &self.governance,
@@ -337,7 +328,7 @@ impl LedgerState {
                     drep_yes, drep_total,
                     drep_threshold = drep_threshold.numerator as f64 / drep_threshold.denominator as f64,
                     drep_met,
-                    spo_yes, total_spo_stake,
+                    spo_yes, spo_effective_total,
                     spo_threshold = spo_threshold.numerator as f64 / spo_threshold.denominator as f64,
                     spo_met,
                     cc_met,
@@ -358,7 +349,7 @@ impl LedgerState {
                 };
                 let spo_threshold = &self.protocol_params.pvt_motion_no_confidence;
                 let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
-                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
+                let spo_met = check_threshold(spo_yes, spo_effective_total, spo_threshold);
                 drep_met && spo_met
             }
             GovernanceAction::UpdateCommittee { .. } => {
@@ -387,7 +378,7 @@ impl LedgerState {
                     )
                 };
                 let drep_met = check_threshold(drep_yes, drep_total, &drep_threshold);
-                let spo_met = check_threshold(spo_yes, total_spo_stake, spo_threshold);
+                let spo_met = check_threshold(spo_yes, spo_effective_total, spo_threshold);
                 drep_met && spo_met
             }
             GovernanceAction::NewConstitution { .. } => {
@@ -440,10 +431,15 @@ impl LedgerState {
     /// Per Haskell `dRepAcceptedRatio` / `spoAcceptedRatio`:
     /// - DRep denominator = total active DRep-delegated stake - abstain stake
     ///   (non-voting active DReps count as implicit No in denominator)
-    /// - SPO: returns explicit yes votes; total SPO stake used as denominator
+    /// - SPO: iterates ALL mark pools; non-voting SPOs get a default vote based on
+    ///   the pool operator's DRep delegation (AlwaysAbstain → excluded from denominator,
+    ///   AlwaysNoConfidence → Yes on NoConfidence else No, otherwise → No)
     /// - AlwaysNoConfidence stake counts as Yes for NoConfidence, No otherwise
     /// - AlwaysAbstain stake is excluded from both numerator and denominator
     /// - Inactive/expired DReps are excluded (handled by drep_power_cache)
+    ///
+    /// Returns (drep_yes, drep_total, spo_yes, spo_effective_total, cc_yes, cc_total)
+    /// where spo_effective_total is the SPO denominator (total non-abstain SPO stake).
     pub(crate) fn count_votes_by_type(
         &self,
         action_id: &GovActionId,
@@ -451,13 +447,16 @@ impl LedgerState {
         drep_power_cache: &HashMap<Hash32, u64>,
         no_confidence_stake: u64,
     ) -> (u64, u64, u64, u64, u64, u64) {
-        let mut spo_yes = 0u64;
-        let mut spo_total = 0u64;
         let mut cc_yes = 0u64;
         let mut cc_total = 0u64;
 
-        // Build DRep hash -> Vote map for this specific action
+        let is_no_confidence = matches!(action, GovernanceAction::NoConfidence { .. });
+        let is_hard_fork = matches!(action, GovernanceAction::HardForkInitiation { .. });
+        let bootstrap = self.is_bootstrap_phase();
+
+        // Build per-voter vote maps for this specific action
         let mut drep_votes: HashMap<Hash32, Vote> = HashMap::new();
+        let mut spo_votes: HashMap<Hash28, Vote> = HashMap::new();
 
         let empty = vec![];
         let action_votes = self
@@ -473,19 +472,74 @@ impl LedgerState {
                     drep_votes.insert(drep_hash, procedure.vote);
                 }
                 Voter::StakePool(pool_hash) => {
-                    let pool_stake = self.compute_spo_voting_power(pool_hash);
-                    // SPO denominator = total active SPO stake, so only count yes here
-                    // Non-voting SPOs are implicitly No (in denominator but not numerator)
-                    spo_total += pool_stake;
-                    if procedure.vote == Vote::Yes {
-                        spo_yes += pool_stake;
-                    }
+                    spo_votes.insert(*pool_hash, procedure.vote);
                 }
                 Voter::ConstitutionalCommittee(_) => {
                     cc_total += 1;
                     if procedure.vote == Vote::Yes {
                         cc_yes += 1;
                     }
+                }
+            }
+        }
+
+        // SPO vote counting: iterate ALL pools in the mark snapshot (not just voters).
+        // Per Haskell `spoAccepted` / `spoVotingPower`:
+        // - Voted pools: use their explicit vote.
+        // - Bootstrap phase non-voted: Abstain (excluded from denominator).
+        // - Non-bootstrap non-voted: check pool operator's DRep delegation for default vote.
+        //   * AlwaysAbstain → Abstain (excluded from denominator)
+        //   * AlwaysNoConfidence → Yes on NoConfidence, No on everything else
+        //   * Other (or no delegation) → No (in denominator, not numerator)
+        let mut spo_yes = 0u64;
+        let mut spo_effective_total = 0u64; // denominator = total non-abstain SPO stake
+
+        if let Some(ref mark) = self.snapshots.mark {
+            for (pool_id, pool_stake) in &mark.pool_stake {
+                let stake = pool_stake.0;
+                let vote = if let Some(&v) = spo_votes.get(pool_id) {
+                    v
+                } else if is_hard_fork {
+                    // Per Haskell spoAcceptedRatio: for HardForkInitiation, non-voting SPOs
+                    // ALWAYS count as No regardless of bootstrap phase or DRep delegation.
+                    // This differs from all other proposal types.
+                    Vote::No
+                } else if bootstrap {
+                    // Bootstrap phase, non-HardFork: non-voting SPOs count as Abstain
+                    Vote::Abstain
+                } else {
+                    // Post-bootstrap, non-HardFork: check pool operator's DRep delegation
+                    let pool_reg = mark.pool_params.get(pool_id)
+                        .or_else(|| self.pool_params.get(pool_id));
+                    let op_cred = pool_reg.map(|p| Self::reward_account_to_hash(&p.reward_account));
+                    match op_cred.and_then(|h| self.governance.vote_delegations.get(&h)) {
+                        Some(DRep::AlwaysAbstain) => Vote::Abstain,
+                        Some(DRep::AlwaysNoConfidence) => {
+                            if is_no_confidence { Vote::Yes } else { Vote::No }
+                        }
+                        _ => Vote::No,
+                    }
+                };
+                match vote {
+                    Vote::Yes => {
+                        spo_yes += stake;
+                        spo_effective_total += stake;
+                    }
+                    Vote::No => {
+                        spo_effective_total += stake;
+                    }
+                    Vote::Abstain => {
+                        // Excluded from both numerator and denominator
+                    }
+                }
+            }
+        } else {
+            // Fallback when mark snapshot not available: use only explicit voters
+            for (pool_hash, vote) in &spo_votes {
+                let pool_stake = self.compute_spo_voting_power(pool_hash);
+                spo_effective_total += pool_stake;
+                if *vote == Vote::Yes {
+                    spo_yes += pool_stake;
                 }
             }
         }
@@ -516,7 +570,6 @@ impl LedgerState {
         // - For NoConfidence actions: counts as Yes
         // - For all other actions: counts as No (in denominator, not numerator)
         // AlwaysNoConfidence is always in the denominator.
-        let is_no_confidence = matches!(action, GovernanceAction::NoConfidence { .. });
         if no_confidence_stake > 0 {
             drep_total_all += no_confidence_stake;
             if is_no_confidence {
@@ -529,7 +582,7 @@ impl LedgerState {
         // DRep denominator = total active stake - abstain stake
         let drep_total = drep_total_all.saturating_sub(drep_abstain);
 
-        (drep_yes, drep_total, spo_yes, spo_total, cc_yes, cc_total)
+        (drep_yes, drep_total, spo_yes, spo_effective_total, cc_yes, cc_total)
     }
 
     /// Get the total stake for a credential: UTxO stake + reward account balance.
@@ -548,40 +601,57 @@ impl LedgerState {
         utxo + reward
     }
 
-    /// Build a cache of DRep voting power (Hash32 -> delegated stake).
-    /// Iterates vote_delegations once, O(n), instead of per-DRep O(n) lookups.
-    /// Only includes active DReps (inactive DReps are excluded from voting power).
+    /// Build a cache of DRep voting power for ratification.
+    ///
+    /// Returns the DRep power snapshot frozen at the PREVIOUS epoch boundary.
+    /// This matches Haskell's `setFreshDRepPulsingState`: ratification at epoch N uses
+    /// the drepDistr snapshotted at epoch N-1.
+    ///
+    /// Falls back to live computation on the first Conway epoch (no snapshot yet).
     /// Returns (drep_power_cache, always_no_confidence_stake, always_abstain_stake).
     pub(crate) fn build_drep_power_cache(&self) -> (HashMap<Hash32, u64>, u64, u64) {
+        // Return stored snapshot if non-empty (set at previous epoch boundary)
+        let snap = &self.governance.drep_power_snapshot;
+        let no_conf = self.governance.drep_no_confidence_snapshot;
+        let abstain = self.governance.drep_abstain_snapshot;
+        if !snap.is_empty() || no_conf > 0 || abstain > 0 {
+            return (snap.clone(), no_conf, abstain);
+        }
+
+        // Fallback: compute live for first Conway epoch (bootstrap — no snapshot yet).
+        // Uses the full formula: UTxO stake + reward balance + governance proposal deposits.
         let mut cache: HashMap<Hash32, u64> = HashMap::new();
         let mut no_confidence_stake = 0u64;
         let mut abstain_stake = 0u64;
         for (stake_cred, drep) in &self.governance.vote_delegations {
-            let stake = self.credential_stake(stake_cred);
+            let stake = self.credential_drep_stake(stake_cred);
             match drep {
                 DRep::KeyHash(h) => {
-                    // Only count stake for active DReps
                     if self.governance.dreps.get(h).is_some_and(|d| d.active) {
                         *cache.entry(*h).or_default() += stake;
                     }
                 }
                 DRep::ScriptHash(h) => {
-                    // Only count stake for active DReps
                     if self.governance.dreps.get(h).is_some_and(|d| d.active) {
                         *cache.entry(*h).or_default() += stake;
                     }
                 }
-                DRep::AlwaysNoConfidence => {
-                    no_confidence_stake += stake;
-                }
-                DRep::AlwaysAbstain => {
-                    abstain_stake += stake;
-                }
+                DRep::AlwaysNoConfidence => no_confidence_stake += stake,
+                DRep::AlwaysAbstain => abstain_stake += stake,
             }
         }
-        // Per Haskell `reDRepDistr`: only DReps with actual delegated stake appear.
-        // DReps registered but with no delegators have 0 voting power.
         (cache, no_confidence_stake, abstain_stake)
+    }
+
+    /// Compute the full DRep stake for a credential: UTxO + rewards + governance proposal deposits.
+    ///
+    /// Matches Haskell's `computeDRepDistr` formula where:
+    ///   stake[cred] = instantStake[cred] + rewardBalance[cred] + proposalDeposits[cred]
+    pub(crate) fn credential_drep_stake(&self, cred_hash: &Hash32) -> u64 {
+        let utxo = self.stake_distribution.stake_map.get(cred_hash).map(|s| s.0).unwrap_or(0);
+        let reward = self.reward_accounts.get(cred_hash).map(|s| s.0).unwrap_or(0);
+        let gov_deps = self.deposit_tracker.governance_deposits_by_return_cred(cred_hash);
+        utxo + reward + gov_deps
     }
 
     /// Compute total active DRep-delegated stake across all DReps.
@@ -670,16 +740,35 @@ impl LedgerState {
     pub(crate) fn enact_gov_action(&mut self, action: &GovernanceAction) {
         match action {
             GovernanceAction::ParameterChange { update, .. } => {
-                // Save current pparams as prevPParams before applying update (for dump output)
-                self.prev_protocol_params = Some(self.protocol_params.clone());
-                if let Err(e) = self.apply_protocol_param_update(update) {
-                    tracing::warn!(
-                        error = %e,
-                        "Governance protocol parameter update rejected"
-                    );
-                    self.prev_protocol_params = None; // rollback if rejected
+                let is_conway = self.governance.conway_cur_params.is_some();
+                if is_conway {
+                    // In Conway era: save old conway_cur_params as prevPParams, apply to protocol_params,
+                    // then sync conway_cur_params to reflect the update.
+                    self.prev_protocol_params = self.governance.conway_cur_params.as_deref().cloned();
+                    if let Err(e) = self.apply_protocol_param_update(update) {
+                        tracing::warn!(
+                            error = %e,
+                            "Governance protocol parameter update rejected"
+                        );
+                        self.prev_protocol_params = None;
+                    } else {
+                        // Sync conway_cur_params to the updated protocol_params
+                        Arc::make_mut(&mut self.governance).conway_cur_params =
+                            Some(Box::new(self.protocol_params.clone()));
+                        tracing::debug!("Governance protocol parameters updated (Conway)");
+                    }
                 } else {
-                    tracing::debug!("Governance protocol parameters updated");
+                    // Babbage era: update protocol_params directly
+                    self.prev_protocol_params = Some(self.protocol_params.clone());
+                    if let Err(e) = self.apply_protocol_param_update(update) {
+                        tracing::warn!(
+                            error = %e,
+                            "Governance protocol parameter update rejected"
+                        );
+                        self.prev_protocol_params = None;
+                    } else {
+                        tracing::debug!("Governance protocol parameters updated");
+                    }
                 }
             }
             GovernanceAction::HardForkInitiation {
@@ -687,6 +776,11 @@ impl LedgerState {
             } => {
                 self.protocol_params.protocol_version_major = protocol_version.0;
                 self.protocol_params.protocol_version_minor = protocol_version.1;
+                // Also update conway_cur_params so curPParams in dumps reflects the new version
+                if let Some(ref mut cp) = Arc::make_mut(&mut self.governance).conway_cur_params {
+                    cp.protocol_version_major = protocol_version.0;
+                    cp.protocol_version_minor = protocol_version.1;
+                }
                 tracing::debug!(
                     "Governance hard fork initiated (protocol version {}.{})",
                     protocol_version.0,
@@ -826,6 +920,31 @@ impl LedgerState {
         if let Some(v) = update.n_opt { self.protocol_params.n_opt = v; }
         if let Some(v) = update.e_max { self.protocol_params.e_max = v; }
         if let Some(v) = update.decentralization { self.protocol_params.decentralization = v; }
+        // Conway governance group
+        if let Some(v) = update.drep_deposit { self.protocol_params.drep_deposit = v; }
+        if let Some(v) = update.drep_activity { self.protocol_params.drep_activity_period = v; }
+        if let Some(v) = update.gov_action_lifetime { self.protocol_params.gov_action_lifetime = v; }
+        if let Some(v) = update.gov_action_deposit { self.protocol_params.gov_action_deposit = v; }
+        if let Some(v) = update.committee_min_size { self.protocol_params.committee_min_size = v; }
+        if let Some(v) = update.committee_max_term_length { self.protocol_params.committee_max_term_length = v; }
+        if let Some(v) = update.min_fee_ref_script_cost_per_byte.clone() { self.protocol_params.min_fee_ref_script_cost_per_byte = v.numerator / v.denominator.max(1); }
+        // DRep voting thresholds
+        if let Some(v) = update.dvt_motion_no_confidence.clone() { self.protocol_params.dvt_motion_no_confidence = v; }
+        if let Some(v) = update.dvt_committee_normal.clone() { self.protocol_params.dvt_committee_normal = v; }
+        if let Some(v) = update.dvt_committee_no_confidence.clone() { self.protocol_params.dvt_committee_no_confidence = v; }
+        if let Some(v) = update.dvt_update_to_constitution.clone() { self.protocol_params.dvt_constitution = v; }
+        if let Some(v) = update.dvt_hard_fork_initiation.clone() { self.protocol_params.dvt_hard_fork = v; }
+        if let Some(v) = update.dvt_pp_network_group.clone() { self.protocol_params.dvt_pp_network_group = v; }
+        if let Some(v) = update.dvt_pp_economic_group.clone() { self.protocol_params.dvt_pp_economic_group = v; }
+        if let Some(v) = update.dvt_pp_technical_group.clone() { self.protocol_params.dvt_pp_technical_group = v; }
+        if let Some(v) = update.dvt_pp_gov_group.clone() { self.protocol_params.dvt_pp_gov_group = v; }
+        if let Some(v) = update.dvt_treasury_withdrawal.clone() { self.protocol_params.dvt_treasury_withdrawal = v; }
+        // SPO voting thresholds
+        if let Some(v) = update.pvt_motion_no_confidence.clone() { self.protocol_params.pvt_motion_no_confidence = v; }
+        if let Some(v) = update.pvt_committee_normal.clone() { self.protocol_params.pvt_committee_normal = v; }
+        if let Some(v) = update.pvt_committee_no_confidence.clone() { self.protocol_params.pvt_committee_no_confidence = v; }
+        if let Some(v) = update.pvt_hard_fork_initiation.clone() { self.protocol_params.pvt_hard_fork = v; }
+        if let Some(v) = update.pvt_pp_security_group.clone() { self.protocol_params.pvt_pp_security_group = v; }
 
         tracing::debug!("Protocol parameters updated");
         Ok(())
@@ -887,6 +1006,32 @@ pub(crate) fn modified_pp_groups(ppu: &ProtocolParamUpdate) -> Vec<PPGroup> {
     if ppu.n_opt.is_some() { groups.push((Technical, Security)); }
     if ppu.e_max.is_some() { groups.push((Technical, NoVote)); }
     if ppu.decentralization.is_some() { groups.push((Technical, Security)); }
+
+    // Economic + NoVote (Conway)
+    if ppu.min_fee_ref_script_cost_per_byte.is_some() { groups.push((Economic, NoVote)); }
+
+    // Governance group (Conway) — NoVote for SPOs
+    if ppu.drep_deposit.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.drep_activity.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.gov_action_lifetime.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.gov_action_deposit.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.committee_min_size.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.committee_max_term_length.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_motion_no_confidence.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_committee_normal.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_committee_no_confidence.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_update_to_constitution.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_hard_fork_initiation.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_pp_network_group.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_pp_economic_group.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_pp_technical_group.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_pp_gov_group.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.dvt_treasury_withdrawal.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.pvt_motion_no_confidence.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.pvt_committee_normal.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.pvt_committee_no_confidence.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.pvt_hard_fork_initiation.is_some() { groups.push((Gov, NoVote)); }
+    if ppu.pvt_pp_security_group.is_some() { groups.push((Gov, NoVote)); }
 
     groups
 }

@@ -229,12 +229,16 @@ pub struct ProtocolParameters {
     pub n_opt: u64,  // optimal pool count
     pub a0: Rational,  // pool pledge influence
     pub e_max: u64,  // maximum epoch for pool retirement (epochs in future)
+    // Babbage-era cost parameters
+    pub utxo_cost_per_byte: u64,
+    pub min_fee_ref_script_cost_per_byte: u64,
     // Governance (Conway)
     pub drep_deposit: u64,
     pub drep_activity_period: u64,
     pub gov_action_lifetime: u64,
     pub gov_action_deposit: u64,
     pub committee_min_size: u64,
+    pub committee_max_term_length: u64,
     // DRep voting thresholds
     pub dvt_motion_no_confidence: Rational,
     pub dvt_committee_normal: Rational,
@@ -295,11 +299,14 @@ impl Default for ProtocolParameters {
             n_opt: 500,
             a0: Rational { numerator: 3, denominator: 10 },  // 0.3
             e_max: 18,  // Pool retirement can be scheduled max 18 epochs in future
+            utxo_cost_per_byte: 4_310,
+            min_fee_ref_script_cost_per_byte: 15,
             drep_deposit: 500_000_000,
             drep_activity_period: 20,  // epochs
             gov_action_lifetime: 6,    // epochs
             gov_action_deposit: 100_000_000_000,  // 100k ADA
             committee_min_size: 7,
+            committee_max_term_length: 1_000,
             // DRep voting thresholds (mainnet Conway defaults)
             dvt_motion_no_confidence: Rational { numerator: 51, denominator: 100 },  // 51%
             dvt_committee_normal: Rational { numerator: 51, denominator: 100 },  // 51%
@@ -380,9 +387,23 @@ pub enum GovernanceAction {
     InfoAction,
 }
 
+/// A governance proposal ratified at epoch N that must be enacted (and its deposit returned)
+/// at epoch N+1, after the mark snapshot is taken.
+///
+/// Matches Haskell's 2-phase RATIFY → ENACT ordering:
+/// - RATIFY at epoch N: proposal passes, stored here
+/// - ENACT at epoch N+1: action applied, deposit returned to reward_accounts (after SNAP)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingEnactment {
+    pub action_id: GovActionId,
+    pub gov_action: GovernanceAction,
+    pub return_cred_hash: Hash32,
+    pub deposit: Lovelace,
+}
+
 /// Protocol parameter update (pre-Conway and Conway governance)
 ///
-/// Fields correspond to the CDDL protocol_param_update map (Shelley through Babbage).
+/// Fields correspond to the CDDL protocol_param_update map (Shelley through Conway).
 /// All fields are optional; only set fields are applied when an update is enacted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ProtocolParamUpdate {
@@ -404,6 +425,31 @@ pub struct ProtocolParamUpdate {
     pub n_opt: Option<u64>,         // optimal pool count (k)
     pub e_max: Option<u64>,         // max pool retirement epoch
     pub decentralization: Option<Rational>, // d parameter
+    // Conway governance group
+    pub drep_deposit: Option<u64>,
+    pub drep_activity: Option<u64>,
+    pub gov_action_lifetime: Option<u64>,
+    pub gov_action_deposit: Option<u64>,
+    pub committee_min_size: Option<u64>,
+    pub committee_max_term_length: Option<u64>,
+    pub min_fee_ref_script_cost_per_byte: Option<Rational>,
+    // DRep voting thresholds (Conway)
+    pub dvt_motion_no_confidence: Option<Rational>,
+    pub dvt_committee_normal: Option<Rational>,
+    pub dvt_committee_no_confidence: Option<Rational>,
+    pub dvt_update_to_constitution: Option<Rational>,
+    pub dvt_hard_fork_initiation: Option<Rational>,
+    pub dvt_pp_network_group: Option<Rational>,
+    pub dvt_pp_economic_group: Option<Rational>,
+    pub dvt_pp_technical_group: Option<Rational>,
+    pub dvt_pp_gov_group: Option<Rational>,
+    pub dvt_treasury_withdrawal: Option<Rational>,
+    // SPO voting thresholds (Conway)
+    pub pvt_motion_no_confidence: Option<Rational>,
+    pub pvt_committee_normal: Option<Rational>,
+    pub pvt_committee_no_confidence: Option<Rational>,
+    pub pvt_hard_fork_initiation: Option<Rational>,
+    pub pvt_pp_security_group: Option<Rational>,
 }
 
 /// Constitution

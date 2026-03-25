@@ -1,7 +1,7 @@
 // Hayate-Node (疾風ノード) - Full Cardano node with ledger state snapshots
 
 use clap::Parser;
-use tracing::{info, error, warn};
+use tracing::{info, debug, error, warn};
 use std::path::PathBuf;
 use anyhow::{Result, Context};
 
@@ -13,7 +13,7 @@ use hayate::ledger::{
     state::LedgerState,
     primitives::{ProtocolParameters, EpochNo},
 };
-use hayate::genesis::{ByronGenesis, ShelleyGenesis};
+use hayate::genesis::{ByronGenesis, ShelleyGenesis, ConwayGenesis};
 use pallas_network::miniprotocols::Point;
 use pallas_network::miniprotocols::chainsync::NextResponse;
 use pallas_crypto::nonce::generate_rolling_nonce;
@@ -52,10 +52,29 @@ struct Args {
     #[arg(long)]
     dump_epoch_dir: Option<PathBuf>,
 
+    /// Directory containing Haskell cardano-node epoch reference dumps.
+    /// When set, Hayate compares its epoch dump against the reference after each transition.
+    /// If treasury, reserves, or activeStake diverge the node writes the dump and exits.
+    #[arg(long)]
+    haskell_epoch_dir: Option<PathBuf>,
+
     /// Wipe all ledger state and re-sync from genesis.
     /// Use this when genesis parameters have changed or state is known to be corrupt.
     #[arg(long, default_value_t = false)]
     reset_genesis: bool,
+
+    /// Restore ledger state from a specific epoch snapshot and re-sync from that point.
+    ///
+    /// Use this to roll back after a divergence is detected.  Typical workflow:
+    ///   1. Run compare-epoch-dumps and find the first epoch with any WARNING.
+    ///   2. Subtract 2:  TARGET = first_warning_epoch - 2
+    ///   3. Delete hayate dump files for epochs >= TARGET so they regenerate.
+    ///   4. Restart with --restore-from-epoch TARGET
+    ///
+    /// Snapshots are kept for the last 5 epochs.  Hard-fork boundary snapshots
+    /// (e.g. epoch 492 on sanchonet) are never pruned so they are always available.
+    #[arg(long)]
+    restore_from_epoch: Option<u64>,
 }
 
 #[tokio::main]
@@ -96,13 +115,6 @@ async fn main() -> Result<()> {
     // Open node storage
     let mut storage = NodeStorage::open(PathBuf::from(&args.db_path), network.clone())?;
 
-    // Check for existing tip
-    if let Some((tip_slot, tip_hash)) = storage.get_chain_tip()? {
-        info!("Resuming from slot {}, hash: {}", tip_slot, hex::encode(&tip_hash));
-    } else {
-        info!("Starting fresh sync");
-    }
-
     // Determine socket path
     let socket_path = if let Some(socket) = args.socket {
         socket
@@ -130,32 +142,62 @@ async fn main() -> Result<()> {
 
     info!("Network magic: {}", magic);
 
-    // Connect to node via chain sync
-    let start_point = if let Some((tip_slot, tip_hash)) = storage.get_chain_tip()? {
-        info!("Resuming from slot {}", tip_slot);
-        Point::Specific(tip_slot, tip_hash)
-    } else {
-        info!("Starting from origin");
-        Point::Origin
-    };
+    // Initialize or restore ledger state and determine chain-sync start point.
+    //
+    // Priority (highest first):
+    //   1. --restore-from-epoch N  — roll back to a specific epoch snapshot
+    //   2. latest snapshot          — resume from the most recent epoch boundary
+    //   3. genesis                  — first run or after --reset-genesis
+    let ((mut ledger_state, conway_genesis), start_point, resume_slot_hash) =
+        if let Some(target_epoch) = args.restore_from_epoch {
+            let (state, slot, hash) = storage
+                .restore_epoch_snapshot(target_epoch)
+                .with_context(|| format!("Failed to restore from epoch {}", target_epoch))?;
+            let epoch = state.epoch.0;
+            info!(
+                "⏪ Rolled back to epoch {} snapshot (slot {}). \
+                 Re-syncing from that point forward.",
+                epoch, slot
+            );
+            if let Some(ref dump_dir) = args.dump_epoch_dir {
+                info!(
+                    "  Tip: delete dump files for epochs >= {} in {} so they regenerate.",
+                    epoch,
+                    dump_dir.display()
+                );
+            }
+            let conway = load_conway_genesis(args.config.as_ref());
+            ((state, conway), Point::Specific(slot, hash.to_vec()), Some((slot, hash)))
+        } else {
+            match storage.restore_latest_snapshot()? {
+                Some((state, slot, hash)) => {
+                    let epoch = state.epoch.0;
+                    info!("Restored ledger state from epoch {} (resuming from slot {})", epoch, slot);
+                    let conway = load_conway_genesis(args.config.as_ref());
+                    ((state, conway), Point::Specific(slot, hash.to_vec()), Some((slot, hash)))
+                }
+                None => {
+                    info!("🆕 No epoch snapshot found, initializing from genesis");
+                    let result = load_genesis_and_init_ledger(args.config.as_ref(), &network)?;
+                    (result, Point::Origin, None)
+                }
+            }
+        };
 
     info!("Connecting to chain sync...");
     let mut sync = HayateSync::connect(&socket_path, magic, start_point).await?;
     info!("✅ Connected to Cardano node via chain sync");
 
-    // Initialize or restore ledger state
-    let mut ledger_state = if let Some((restored_epoch, state)) = storage.restore_latest_ledger_state()? {
-        info!("✅ Restored ledger state from epoch {}", restored_epoch);
-        state
-    } else {
-        info!("🆕 Initializing fresh ledger state");
-        load_genesis_and_init_ledger(args.config.as_ref(), &network)?
-    };
-
-
     // Start processing blocks
     let mut blocks_processed = 0u64;
     let mut current_epoch = ledger_state.epoch.0;
+    let mut epoch_tx_count: u64 = 0;
+
+    // Track the last block processed. At epoch transitions, last_slot/last_hash hold
+    // the slot and hash of the final block of the ending epoch — these are the correct
+    // resume point for save_epoch_snapshot (the current block hasn't been processed yet).
+    let (mut last_slot, mut last_hash): (u64, [u8; 32]) =
+        resume_slot_hash.unwrap_or((0, [0u8; 32]));
 
     // Initialize rolling nonce with Shelley genesis nonce for Preview network
     // This is the starting point for nonce evolution
@@ -175,7 +217,7 @@ async fn main() -> Result<()> {
                 awaiting = false;
                 // Parse block using pallas
                 match parse_block_with_nonce(&block_bytes) {
-                    Ok((slot, block_hash, tx_count, vrf_output_opt)) => {
+                    Ok((slot, block_hash, tx_count, vrf_output_opt, is_conway_block)) => {
                         // Update rolling nonce if VRF is present
                         if let Some(vrf_output) = vrf_output_opt {
                             // VRF output should be at least 32 bytes
@@ -204,23 +246,36 @@ async fn main() -> Result<()> {
                         // the first block of the new epoch — causing a 1-block misattribution.
                         let epoch = slot_to_epoch(slot, &network);
 
+                        // Detect first Conway block and apply Conway genesis BEFORE the epoch
+                        // transition. This ensures the epoch dump shows Conway state.
+                        if is_conway_block {
+                            if ledger_state.conway_genesis_epoch.is_none() {
+                                if let Some(ref cg) = conway_genesis {
+                                    ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
+                                    info!("🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
+                                } else {
+                                    warn!("⚠️  First Conway block detected but no Conway genesis loaded!");
+                                }
+                            }
+                        }
+
                         // When we transition to a new epoch, snapshot the previous epoch
                         if epoch > current_epoch {
-                            info!("🎯 Epoch transition detected: epoch {} → {} at slot {}",
-                                current_epoch, epoch, slot);
-                            info!("💰 Epoch {} accumulated fees: {} lovelace ({} ADA)",
-                                current_epoch,
-                                ledger_state.epoch_fees.0,
-                                ledger_state.epoch_fees.0 / 1_000_000);
+                            let era = era_name(ledger_state.protocol_params.protocol_version_major);
+                            let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
+
+                            // Capture enactments before process_epoch_transition consumes them
+                            let pending_enactments: Vec<_> = ledger_state.pending_enactments
+                                .iter()
+                                .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
+                                .collect();
 
                             // 1. Rebuild stake distribution from UTxO set
-                            info!("🔄 Rebuilding stake distribution from UTxO tree...");
                             if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
-                                error!("❌ Failed to rebuild stake distribution: {}", e);
+                                error!("Failed to rebuild stake distribution: {}", e);
                             }
 
                             // 2. Process epoch transition in ledger state
-                            info!("⚙️  Processing epoch transition in ledger state...");
                             ledger_state.process_epoch_transition(EpochNo(epoch));
 
                             // 2a. Dump epoch state to JSON for comparison with Haskell
@@ -228,56 +283,40 @@ async fn main() -> Result<()> {
                                 if let Err(e) = ledger_state.dump_epoch_state(dump_dir.as_path(), slot) {
                                     error!("Failed to dump epoch state: {}", e);
                                 }
-                            }
 
-                            // 3. Snapshot complete ledger state to disk
-                            info!("💾 Snapshotting complete ledger state for epoch {} at slot {}...", epoch, slot);
-                            match storage.snapshot_full_ledger_state(epoch, slot, &ledger_state) {
-                                Ok(()) => {
-                                    info!("✅ Complete ledger state snapshot saved");
-
-                                    // Log summary statistics
-                                    let stake_count = ledger_state.stake_distribution.stake_map.len();
-                                    let total_stake: u64 = ledger_state.stake_distribution.stake_map.values()
-                                        .map(|l| l.0).sum();
-                                    let pool_count = ledger_state.pool_params.len();
-                                    let reward_accounts = ledger_state.reward_accounts.len();
-
-                                    info!("📊 Ledger State Summary:");
-                                    info!("   • Stake credentials: {}", stake_count);
-                                    info!("   • Total staked: {} ADA", total_stake / 1_000_000);
-                                    info!("   • Active pools: {}", pool_count);
-                                    info!("   • Reward accounts: {}", reward_accounts);
-                                    info!("   • Treasury: {} lovelace ({} ADA)", ledger_state.treasury.0, ledger_state.treasury.0 / 1_000_000);
-                                    info!("   • Reserves: {} lovelace ({} ADA)", ledger_state.reserves.0, ledger_state.reserves.0 / 1_000_000);
-                                }
-                                Err(e) => {
-                                    error!("❌ Failed to snapshot ledger state: {}", e);
-                                }
-                            }
-
-                            // 3. Store epoch nonce
-                            if let Some(nonce) = &rolling_nonce {
-                                let nonce_slice: &[u8] = nonce.as_ref();
-                                if nonce_slice.len() == 32 {
-                                    let mut nonce_bytes = [0u8; 32];
-                                    nonce_bytes.copy_from_slice(nonce_slice);
-                                    match storage.store_nonce(epoch, &nonce_bytes) {
-                                        Ok(()) => {
-                                            info!("🔐 Stored epoch nonce for epoch {}: {}",
-                                                epoch, hex::encode(&nonce_bytes[..8]));
-                                        }
-                                        Err(e) => {
-                                            error!("Failed to store epoch nonce: {}", e);
+                                // Mismatch detection: compare against Haskell reference if provided
+                                if let Some(ref haskell_dir) = args.haskell_epoch_dir {
+                                    let epoch_num = ledger_state.epoch.0;
+                                    let hayate_dump = dump_dir.join(format!("{}-hayate.json", epoch_num));
+                                    if let Some(haskell_dump) = find_haskell_dump(haskell_dir, epoch_num) {
+                                        match compare_epoch_dumps(&hayate_dump, &haskell_dump, haskell_dir, epoch_num) {
+                                            Ok(true) => debug!("Epoch {} matches Haskell reference", epoch_num),
+                                            Ok(false) => {
+                                                error!("EPOCH {} DIVERGED", epoch_num);
+                                                std::process::exit(1);
+                                            }
+                                            Err(e) => warn!("Could not compare epoch {} dumps: {}", epoch_num, e),
                                         }
                                     }
-                                } else {
-                                    error!("Invalid nonce length: {}", nonce_slice.len());
                                 }
-                            } else {
-                                warn!("No rolling nonce available at epoch boundary");
                             }
 
+                            // 3. Save epoch snapshot (UTxO hard-links + bincode file).
+                            // last_slot/last_hash = final block of the ending epoch
+                            // (the current block hasn't been processed yet at this point).
+                            if let Err(e) = storage.save_epoch_snapshot(epoch, last_slot, last_hash, &ledger_state) {
+                                error!("Failed to save epoch {} snapshot: {}", epoch, e);
+                            }
+
+                            info!(
+                                "Epoch {} ({}) slot={}  txs: {}  fees: {} ADA",
+                                current_epoch, era, slot, epoch_tx_count, epoch_fees_ada
+                            );
+                            for desc in &pending_enactments {
+                                info!("  enacted: {desc}");
+                            }
+
+                            epoch_tx_count = 0;
                             current_epoch = epoch;
                         }
 
@@ -289,14 +328,17 @@ async fn main() -> Result<()> {
                         }
 
                         blocks_processed += 1;
+                        epoch_tx_count += tx_count as u64;
 
-                        // Update chain tip
-                        storage.store_chain_tip(slot, &block_hash)?;
+                        // Track last processed block for epoch snapshot resume point.
+                        last_slot = slot;
+                        let n = block_hash.len().min(32);
+                        last_hash[..n].copy_from_slice(&block_hash[..n]);
 
                         // Log progress
                         if blocks_processed % 1000 == 0 {
-                            info!("Processed {} blocks, slot: {}, epoch: {}, txs: {}",
-                                blocks_processed, slot, epoch, tx_count);
+                            debug!("Processed {} blocks, slot: {}, epoch: {}",
+                                blocks_processed, slot, epoch);
                         }
                     }
                     Err(e) => {
@@ -318,8 +360,225 @@ async fn main() -> Result<()> {
     }
 }
 
-/// Parse block and extract VRF nonce for epoch nonce calculation
-fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Option<Vec<u8>>)> {
+fn era_name(protocol_version_major: u64) -> &'static str {
+    match protocol_version_major {
+        0 | 1 => "Byron",
+        2 => "Shelley",
+        3 => "Allegra",
+        4 => "Mary",
+        5 | 6 => "Alonzo",
+        7 | 8 => "Babbage",
+        9..=11 => "Conway",
+        12 => "Dijkstra",
+        _ => "Unknown",
+    }
+}
+
+fn describe_gov_action(
+    action: &hayate::ledger::primitives::GovernanceAction,
+    params: &hayate::ledger::primitives::ProtocolParameters,
+) -> String {
+    use hayate::ledger::primitives::{GovernanceAction::*, Rational};
+
+    fn fmt_rat(r: Rational) -> String { format!("{}/{}", r.numerator, r.denominator) }
+
+    match action {
+        HardForkInitiation { protocol_version: (major, minor), .. } => {
+            let from_era = era_name(params.protocol_version_major);
+            let to_era   = era_name(*major);
+            if from_era != to_era {
+                format!("HardFork {from_era}→{to_era}")
+            } else {
+                format!("HardFork {from_era} v{}.{}→v{major}.{minor}",
+                    params.protocol_version_major, params.protocol_version_minor)
+            }
+        }
+        ParameterChange { update, .. } => {
+            let mut changes: Vec<String> = Vec::new();
+
+            macro_rules! chg_u64 {
+                ($upd:expr, $cur:expr, $name:literal) => {
+                    if let Some(new) = $upd { if new != $cur { changes.push(format!("{}: {}→{}", $name, $cur, new)); } }
+                }
+            }
+            macro_rules! chg_rat {
+                ($upd:expr, $cur:expr, $name:literal) => {
+                    if let Some(new) = $upd { if new != $cur { changes.push(format!("{}: {}→{}", $name, fmt_rat($cur), fmt_rat(new))); } }
+                }
+            }
+
+            chg_u64!(update.min_fee_a,   params.min_fee_a,   "minFeeA");
+            chg_u64!(update.min_fee_b,   params.min_fee_b,   "minFeeB");
+            chg_u64!(update.n_opt,       params.n_opt,       "nOpt");
+            chg_u64!(update.key_deposit, params.key_deposit, "keyDeposit");
+            chg_u64!(update.pool_deposit,params.pool_deposit,"poolDeposit");
+            chg_u64!(update.e_max,       params.e_max,       "eMax");
+            chg_u64!(update.min_pool_cost,params.min_pool_cost,"minPoolCost");
+            chg_rat!(update.rho,         params.rho,         "rho");
+            chg_rat!(update.tau,         params.tau,         "tau");
+            chg_rat!(update.a0,          params.a0,          "a0");
+            chg_u64!(update.drep_deposit,        params.drep_deposit,        "drepDeposit");
+            chg_u64!(update.drep_activity,       params.drep_activity_period,"drepActivity");
+            chg_u64!(update.gov_action_lifetime, params.gov_action_lifetime, "govActionLifetime");
+            chg_u64!(update.gov_action_deposit,  params.gov_action_deposit,  "govActionDeposit");
+            chg_u64!(update.committee_min_size,  params.committee_min_size,  "committeeMinSize");
+            chg_u64!(update.committee_max_term_length, params.committee_max_term_length, "committeeMaxTermLength");
+            if let Some((mj, mn)) = update.protocol_version {
+                if mj != params.protocol_version_major || mn != params.protocol_version_minor {
+                    changes.push(format!("protocolVersion: v{}.{}→v{}.{}", params.protocol_version_major, params.protocol_version_minor, mj, mn));
+                }
+            }
+
+            // Count threshold changes without listing each one
+            let threshold_fields: &[(Option<Rational>, Rational)] = &[
+                (update.dvt_motion_no_confidence,    params.dvt_motion_no_confidence),
+                (update.dvt_committee_normal,        params.dvt_committee_normal),
+                (update.dvt_committee_no_confidence, params.dvt_committee_no_confidence),
+                (update.dvt_hard_fork_initiation,    params.dvt_hard_fork),
+                (update.dvt_pp_network_group,        params.dvt_pp_network_group),
+                (update.dvt_pp_economic_group,       params.dvt_pp_economic_group),
+                (update.dvt_pp_technical_group,      params.dvt_pp_technical_group),
+                (update.dvt_pp_gov_group,            params.dvt_pp_gov_group),
+                (update.dvt_treasury_withdrawal,     params.dvt_treasury_withdrawal),
+                (update.pvt_motion_no_confidence,    params.pvt_motion_no_confidence),
+                (update.pvt_committee_normal,        params.pvt_committee_normal),
+                (update.pvt_committee_no_confidence, params.pvt_committee_no_confidence),
+                (update.pvt_hard_fork_initiation,    params.pvt_hard_fork),
+                (update.pvt_pp_security_group,       params.pvt_pp_security_group),
+            ];
+            let n_threshold_changes = threshold_fields.iter()
+                .filter(|(new, old)| new.is_some_and(|v| v != *old))
+                .count();
+            if n_threshold_changes > 0 {
+                changes.push(format!("{n_threshold_changes} voting threshold(s)"));
+            }
+
+            if changes.is_empty() {
+                "ParameterChange (no fields changed)".to_string()
+            } else {
+                format!("ParameterChange: {}", changes.join(", "))
+            }
+        }
+        TreasuryWithdrawals { withdrawals, .. } => {
+            let total_ada: u64 = withdrawals.iter().map(|(_, l)| l.0).sum::<u64>() / 1_000_000;
+            format!("TreasuryWithdrawals ({} recipients, {} ADA)", withdrawals.len(), total_ada)
+        }
+        NoConfidence { .. } =>
+            "NoConfidence".to_string(),
+        UpdateCommittee { members_to_add, members_to_remove, .. } =>
+            format!("UpdateCommittee (+{} -{} members)", members_to_add.len(), members_to_remove.len()),
+        NewConstitution { .. } =>
+            "NewConstitution".to_string(),
+        InfoAction =>
+            "InfoAction".to_string(),
+    }
+}
+
+/// Find the Haskell reference dump file for a given epoch.
+///
+/// Haskell dumps are named `"{epoch}-{slot}.json"` (e.g. `"492-12345678.json"`).
+fn find_haskell_dump(dir: &std::path::Path, epoch: u64) -> Option<PathBuf> {
+    let prefix = format!("{}-", epoch);
+    std::fs::read_dir(dir).ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix) && n.ends_with(".json"))
+                .unwrap_or(false)
+        })
+}
+
+/// Compare critical fields between a Hayate dump and a Haskell reference dump.
+/// Returns `Ok(true)` if all fields match, `Ok(false)` if any diverge, `Err` if
+/// either file cannot be read or parsed.
+fn compare_epoch_dumps(
+    hayate_path: &std::path::Path,
+    haskell_path: &std::path::Path,
+    haskell_dir: &std::path::Path,
+    epoch_num: u64,
+) -> anyhow::Result<bool> {
+    use serde_json::Value;
+
+    let hayate: Value = serde_json::from_str(&std::fs::read_to_string(hayate_path)?)?;
+    let haskell: Value = serde_json::from_str(&std::fs::read_to_string(haskell_path)?)?;
+
+    let mut criticals: Vec<String> = Vec::new();
+
+    // Helper: compare u64 field with ADA display
+    let mut cmp_u64 = |key: &str, hv: Option<u64>, rv: Option<u64>| {
+        match (hv, rv) {
+            (Some(h), Some(r)) if h != r => {
+                let diff = r as i128 - h as i128;
+                criticals.push(format!(
+                    "{key}: haskell={h} hayate={r} diff={diff} ({:.3} ADA)",
+                    diff as f64 / 1_000_000.0
+                ));
+            }
+            (Some(h), None) => criticals.push(format!("{key}: haskell={h} hayate=missing")),
+            (None, Some(r)) => criticals.push(format!("{key}: haskell=missing hayate={r}")),
+            _ => {}
+        }
+    };
+
+    let get_u64 = |v: &Value, k: &str| v.get(k).and_then(|x| x.as_u64());
+
+    cmp_u64("treasury", get_u64(&haskell, "treasury"), get_u64(&hayate, "treasury"));
+    cmp_u64("reserves", get_u64(&haskell, "reserves"), get_u64(&hayate, "reserves"));
+    cmp_u64("activeStake", get_u64(&haskell, "activeStake"), get_u64(&hayate, "activeStake"));
+
+    // drepDistr total stake
+    let drep_total = |v: &Value| -> u64 {
+        v.pointer("/conwayGov/drepDistr")
+            .and_then(|d| d.as_object())
+            .map(|m| m.values().filter_map(|x| x.as_u64()).sum())
+            .unwrap_or(0)
+    };
+    let (hd, rd) = (drep_total(&haskell), drep_total(&hayate));
+    cmp_u64("conwayGov.drepDistr total stake", Some(hd), Some(rd));
+
+    // RUPD: compare haskell[N-1].rupdNext vs hayate[N].rupd
+    if epoch_num > 0 {
+        if let Some(prev_haskell_path) = find_haskell_dump(haskell_dir, epoch_num - 1) {
+            if let Ok(prev_haskell) = std::fs::read_to_string(&prev_haskell_path)
+                .and_then(|s| Ok(serde_json::from_str::<Value>(&s)?))
+            {
+                let hr = prev_haskell.get("rupdNext").filter(|v| !v.is_null());
+                let rr = hayate.get("rupd").filter(|v| !v.is_null());
+                if let (Some(hr), Some(rr)) = (hr, rr) {
+                    let prefix = format!("rupdNext (haskell[{}] vs hayate[{epoch_num}])", epoch_num - 1);
+                    for key in &["deltaR1", "deltaR2", "deltaT1", "rPot", "rewardPot", "totalDistributed"] {
+                        let hv = hr.get(key).and_then(|v| v.as_u64());
+                        let rv = rr.get(key).and_then(|v| v.as_u64());
+                        match (hv, rv) {
+                            (Some(h), Some(r)) if h != r => {
+                                let diff = r as i128 - h as i128;
+                                criticals.push(format!(
+                                    "{prefix}.{key}: haskell={h} hayate={r} diff={diff} ({:.3} ADA)",
+                                    diff as f64 / 1_000_000.0
+                                ));
+                            }
+                            (None, Some(r)) => criticals.push(format!("{prefix}.{key}: missing in haskell, hayate={r}")),
+                            (Some(h), None) => criticals.push(format!("{prefix}.{key}: haskell={h}, missing in hayate")),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for msg in &criticals {
+        error!("  CRITICAL: {msg}");
+    }
+
+    Ok(criticals.is_empty())
+}
+
+/// Parse block and extract VRF nonce for epoch nonce calculation.
+/// Returns (slot, hash, tx_count, vrf_output, is_conway).
+fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Option<Vec<u8>>, bool)> {
     use pallas_traverse::MultiEraBlock;
 
     let block = MultiEraBlock::decode(block_bytes)
@@ -332,12 +591,18 @@ fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Op
 
     // ALWAYS log any block with transactions
     if tx_count > 0 {
-        tracing::info!("🔍 Found block with {} transactions at slot {} (block_size={} bytes)",
+        tracing::debug!("Found block with {} transactions at slot {} (block_size={} bytes)",
             tx_count, slot, block_bytes.len());
     }
 
+    let is_conway = block.as_conway().is_some();
+
     // Extract VRF output from block header
-    let vrf_output: Option<Vec<u8>> = if let Some(babbage_block) = block.as_babbage() {
+    let vrf_output: Option<Vec<u8>> = if let Some(conway_block) = block.as_conway() {
+        // Conway era blocks use the same vrf_result as Babbage
+        let vrf_cert = &conway_block.header.header_body.vrf_result;
+        Some(vrf_cert.0.to_vec())
+    } else if let Some(babbage_block) = block.as_babbage() {
         // Babbage era blocks have vrf_result in header_body
         let vrf_cert = &babbage_block.header.header_body.vrf_result;
         // VrfCert is (output, proof) - we need the output (field .0)
@@ -351,7 +616,7 @@ fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Op
         None
     };
 
-    Ok((slot, hash, tx_count, vrf_output))
+    Ok((slot, hash, tx_count, vrf_output, is_conway))
 }
 
 async fn process_block_simple(
@@ -482,16 +747,302 @@ async fn process_block_simple(
             process_ppup_proposal(update, ledger_state);
         }
 
-        // Process withdrawals (reward account withdrawals)
-        // Note: MultiEraWithdrawals needs special handling, simplified for now
-        // TODO: Extract withdrawals from transaction and update reward accounts
+        // Process Conway governance proposals (proposal_procedures in tx body)
+        // Each submitted proposal pays a deposit; the deposit is refunded when the proposal
+        // expires (epoch.rs) to the return_addr's reward account.
+        for (proposal_index, proposal) in tx.gov_proposals().into_iter().enumerate() {
+            if let Some(conway_proposal) = proposal.as_conway() {
+                let tx_hash_bytes = tx_hash.as_ref();
+                let mut tx_hash_arr = [0u8; 32];
+                let len = tx_hash_bytes.len().min(32);
+                tx_hash_arr[..len].copy_from_slice(&tx_hash_bytes[..len]);
+
+                let action_id = hayate::ledger::primitives::GovActionId {
+                    tx_hash: tx_hash_arr,
+                    index: proposal_index as u32,
+                };
+
+                // Parse return_addr from RewardAccount bytes (header + 28-byte cred hash)
+                let reward_account_bytes: &[u8] = conway_proposal.reward_account.as_ref();
+                let return_addr = if reward_account_bytes.len() >= 29 {
+                    let header = reward_account_bytes[0];
+                    let is_script = (header & 0x10) != 0;
+                    let mut hash = [0u8; 32];
+                    hash[..28].copy_from_slice(&reward_account_bytes[1..29]);
+                    if is_script {
+                        hayate::ledger::primitives::Credential::Script(hash)
+                    } else {
+                        hayate::ledger::primitives::Credential::Key(hash)
+                    }
+                } else {
+                    continue;
+                };
+
+                let deposit = hayate::ledger::primitives::Lovelace(conway_proposal.deposit);
+
+                // Track deposit for accounting
+                let return_hash = match &return_addr {
+                    hayate::ledger::primitives::Credential::Key(h) => *h,
+                    hayate::ledger::primitives::Credential::Script(h) => *h,
+                };
+                ledger_state.deposit_tracker.add_deposit(
+                    return_hash,
+                    hayate::ledger::state::DepositType::Governance(action_id),
+                    deposit,
+                );
+
+                // Map pallas GovAction to hayate GovernanceAction (full parse).
+                let gov_action = {
+                    use pallas_primitives::conway::GovAction as PGA;
+                    // Convert Option<pallas GovActionId> → Option<hayate GovActionId>
+                    let convert_action_id =
+                        |opt: &Option<pallas_primitives::conway::GovActionId>| {
+                            opt.as_ref().map(|id| {
+                                let mut arr = [0u8; 32];
+                                let b = id.transaction_id.as_ref();
+                                arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                                hayate::ledger::primitives::GovActionId {
+                                    tx_hash: arr,
+                                    index: id.action_index,
+                                }
+                            })
+                        };
+                    match &conway_proposal.gov_action {
+                        PGA::ParameterChange(prev_id, update, _guardrail) => {
+                            let hayate_update = pallas_ppu_to_hayate(update.as_ref());
+                            hayate::ledger::primitives::GovernanceAction::ParameterChange {
+                                prev_action_id: convert_action_id(prev_id),
+                                update: hayate_update,
+                                guardrails_hash: None,
+                            }
+                        }
+                        PGA::HardForkInitiation(prev_id, version) => {
+                            hayate::ledger::primitives::GovernanceAction::HardForkInitiation {
+                                prev_action_id: convert_action_id(prev_id),
+                                protocol_version: (version.0, version.1),
+                            }
+                        }
+                        PGA::TreasuryWithdrawals(withdrawals, _guardrail) => {
+                            let converted = withdrawals
+                                .iter()
+                                .filter_map(|(acct, amount)| {
+                                    let bytes: &[u8] = acct.as_ref();
+                                    if bytes.len() >= 29 {
+                                        let is_script = (bytes[0] & 0x10) != 0;
+                                        let mut hash = [0u8; 32];
+                                        hash[..28].copy_from_slice(&bytes[1..29]);
+                                        let cred = if is_script {
+                                            hayate::ledger::primitives::Credential::Script(hash)
+                                        } else {
+                                            hayate::ledger::primitives::Credential::Key(hash)
+                                        };
+                                        Some((cred, hayate::ledger::primitives::Lovelace(*amount)))
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect();
+                            hayate::ledger::primitives::GovernanceAction::TreasuryWithdrawals {
+                                withdrawals: converted,
+                                guardrails_hash: None,
+                            }
+                        }
+                        PGA::NoConfidence(prev_id) => {
+                            hayate::ledger::primitives::GovernanceAction::NoConfidence {
+                                prev_action_id: convert_action_id(prev_id),
+                            }
+                        }
+                        PGA::UpdateCommittee(prev_id, remove, add, threshold) => {
+                            let members_to_remove = remove
+                                .iter()
+                                .filter_map(|cred| {
+                                    stake_credential_to_hash28(cred).map(|h28| {
+                                        let mut hash = [0u8; 32];
+                                        hash[..28].copy_from_slice(&h28);
+                                        if matches!(
+                                            cred,
+                                            pallas_primitives::StakeCredential::ScriptHash(_)
+                                        ) {
+                                            hayate::ledger::primitives::Credential::Script(hash)
+                                        } else {
+                                            hayate::ledger::primitives::Credential::Key(hash)
+                                        }
+                                    })
+                                })
+                                .collect();
+                            let members_to_add = add
+                                .iter()
+                                .filter_map(|(cred, epoch)| {
+                                    stake_credential_to_hash28(cred).map(|h28| {
+                                        let mut hash = [0u8; 32];
+                                        hash[..28].copy_from_slice(&h28);
+                                        let credential = if matches!(
+                                            cred,
+                                            pallas_primitives::StakeCredential::ScriptHash(_)
+                                        ) {
+                                            hayate::ledger::primitives::Credential::Script(hash)
+                                        } else {
+                                            hayate::ledger::primitives::Credential::Key(hash)
+                                        };
+                                        (credential, hayate::ledger::primitives::EpochNo(*epoch))
+                                    })
+                                })
+                                .collect();
+                            hayate::ledger::primitives::GovernanceAction::UpdateCommittee {
+                                prev_action_id: convert_action_id(prev_id),
+                                members_to_remove,
+                                members_to_add,
+                                quorum: hayate::ledger::primitives::Rational {
+                                    numerator: threshold.numerator,
+                                    denominator: threshold.denominator,
+                                },
+                            }
+                        }
+                        PGA::NewConstitution(prev_id, constitution) => {
+                            let anchor = Some(hayate::ledger::primitives::Anchor {
+                                url: constitution.anchor.url.clone(),
+                                hash: {
+                                    let mut h = [0u8; 32];
+                                    let b = constitution.anchor.content_hash.as_ref();
+                                    h[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                                    h
+                                },
+                            });
+                            let script_hash = constitution.guardrail_script.map(|h| {
+                                let mut hash = [0u8; 32];
+                                hash[..28].copy_from_slice(h.as_ref());
+                                hash
+                            });
+                            hayate::ledger::primitives::GovernanceAction::NewConstitution {
+                                prev_action_id: convert_action_id(prev_id),
+                                constitution: hayate::ledger::primitives::Constitution {
+                                    anchor,
+                                    script_hash,
+                                },
+                            }
+                        }
+                        PGA::Information => hayate::ledger::primitives::GovernanceAction::InfoAction,
+                    }
+                };
+
+                let procedure = hayate::ledger::primitives::ProposalProcedure {
+                    deposit,
+                    return_addr,
+                    gov_action,
+                    anchor: None,
+                };
+
+                if let Err(e) = ledger_state.process_proposal(&action_id, &procedure) {
+                    tracing::debug!("Governance proposal rejected: {}", e);
+                } else {
+                    tracing::debug!(
+                        "Governance proposal stored: tx={} idx={} deposit={}",
+                        hex::encode(&tx_hash_arr[..8]),
+                        proposal_index,
+                        deposit.0
+                    );
+                }
+            }
+        }
+
+        // Process Conway governance votes and treasury donations (Conway tx body only)
+        if let pallas_traverse::MultiEraTx::Conway(conway_tx) = &tx {
+            if let Some(voting_procedures) = &conway_tx.transaction_body.voting_procedures {
+                for (pallas_voter, action_votes) in voting_procedures {
+                    let hayate_voter = match pallas_voter {
+                        pallas_primitives::conway::Voter::ConstitutionalCommitteeKey(h) => {
+                            let mut hash = [0u8; 32];
+                            hash[..28].copy_from_slice(h.as_ref());
+                            hayate::ledger::primitives::Voter::ConstitutionalCommittee(
+                                hayate::ledger::primitives::Credential::Key(hash),
+                            )
+                        }
+                        pallas_primitives::conway::Voter::ConstitutionalCommitteeScript(h) => {
+                            let mut hash = [0u8; 32];
+                            hash[..28].copy_from_slice(h.as_ref());
+                            hayate::ledger::primitives::Voter::ConstitutionalCommittee(
+                                hayate::ledger::primitives::Credential::Script(hash),
+                            )
+                        }
+                        pallas_primitives::conway::Voter::DRepKey(h) => {
+                            let mut hash = [0u8; 32];
+                            hash[..28].copy_from_slice(h.as_ref());
+                            hayate::ledger::primitives::Voter::DRep(
+                                hayate::ledger::primitives::Credential::Key(hash),
+                            )
+                        }
+                        pallas_primitives::conway::Voter::DRepScript(h) => {
+                            let mut hash = [0u8; 32];
+                            hash[..28].copy_from_slice(h.as_ref());
+                            hayate::ledger::primitives::Voter::DRep(
+                                hayate::ledger::primitives::Credential::Script(hash),
+                            )
+                        }
+                        pallas_primitives::conway::Voter::StakePoolKey(h) => {
+                            let mut pool_id = [0u8; 28];
+                            pool_id.copy_from_slice(h.as_ref());
+                            hayate::ledger::primitives::Voter::StakePool(pool_id)
+                        }
+                    };
+                    for (pallas_action_id, procedure) in action_votes {
+                        let mut id_arr = [0u8; 32];
+                        let b = pallas_action_id.transaction_id.as_ref();
+                        id_arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                        let hayate_action_id = hayate::ledger::primitives::GovActionId {
+                            tx_hash: id_arr,
+                            index: pallas_action_id.action_index,
+                        };
+                        let vote = match procedure.vote {
+                            pallas_primitives::conway::Vote::Yes =>
+                                hayate::ledger::primitives::Vote::Yes,
+                            pallas_primitives::conway::Vote::No =>
+                                hayate::ledger::primitives::Vote::No,
+                            pallas_primitives::conway::Vote::Abstain =>
+                                hayate::ledger::primitives::Vote::Abstain,
+                        };
+                        ledger_state.process_vote(
+                            &hayate_voter,
+                            &hayate_action_id,
+                            &hayate::ledger::primitives::VotingProcedure { vote, anchor: None },
+                        );
+                    }
+                }
+            }
+            if let Some(donation) = conway_tx.transaction_body.donation {
+                ledger_state.treasury.0 =
+                    ledger_state.treasury.0.saturating_add(u64::from(donation));
+            }
+        }
+
+        // Process withdrawals (reward account withdrawals).
+        // When a TX withdraws from a reward account, the full balance moves into a UTxO
+        // output (already added to utxo_tree above). We must zero out the reward_accounts
+        // entry, otherwise snapshot_stake will double-count: UTxO stake (which now includes
+        // the withdrawn funds) + the still-non-zero reward_accounts balance.
+        {
+            // Bind to a local so the temporary outlives the borrow in collect().
+            let raw_withdrawals = tx.withdrawals();
+            let withdrawals: Vec<(&[u8], u64)> = raw_withdrawals.collect();
+            if !withdrawals.is_empty() {
+                let reward_accounts = Arc::make_mut(&mut ledger_state.reward_accounts);
+                for (reward_addr_bytes, _amount) in &withdrawals {
+                    if reward_addr_bytes.len() < 29 {
+                        continue;
+                    }
+                    let mut cred_hash = [0u8; 32];
+                    cred_hash[..28].copy_from_slice(&reward_addr_bytes[1..29]);
+                    // Cardano requires withdrawing the full balance; set to 0 by removing.
+                    reward_accounts.remove(&cred_hash);
+                }
+            }
+        }
 
         // Track transaction fees
         let tx_fee = tx.fee().unwrap_or(0);
         ledger_state.epoch_fees.0 += tx_fee;
         if tx_fee > 0 {
-            tracing::info!(
-                "💰 Fee extracted: tx_fee={}, total_epoch_fees={} lovelace (slot {})",
+            tracing::debug!(
+                "fee extracted: tx_fee={}, total_epoch_fees={} lovelace (slot {})",
                 tx_fee,
                 ledger_state.epoch_fees.0,
                 slot
@@ -532,7 +1083,17 @@ fn extract_pool_id_from_block(block: &pallas_traverse::MultiEraBlock) -> Option<
 
     // The pool ID is the blake2b-224 hash (28 bytes) of the cold vkey
     // The block header contains the full vkey (32 bytes), so we need to hash it
-    if let Some(babbage_block) = block.as_babbage() {
+    if let Some(conway_block) = block.as_conway() {
+        let issuer_vkey: &[u8] = conway_block.header.header_body.issuer_vkey.as_ref();
+        if issuer_vkey.len() == 32 {
+            let mut hasher = Blake2b::<blake2::digest::consts::U28>::new();
+            hasher.update(issuer_vkey);
+            let hash_result = hasher.finalize();
+            let mut pool_id = [0u8; 28];
+            pool_id.copy_from_slice(&hash_result);
+            return Some(pool_id);
+        }
+    } else if let Some(babbage_block) = block.as_babbage() {
         let issuer_vkey: &[u8] = babbage_block.header.header_body.issuer_vkey.as_ref();
         if issuer_vkey.len() == 32 {
             let mut hasher = Blake2b::<blake2::digest::consts::U28>::new();
@@ -629,7 +1190,7 @@ fn process_ppup_proposal(
         return;
     }
 
-    tracing::info!(
+    tracing::debug!(
         target_epoch = target_epoch.0,
         n_proposals = proposals.len(),
         "Recording pre-Conway protocol parameter update proposals"
@@ -813,7 +1374,10 @@ fn process_alonzo_certificate(
                     metadata_hash: None,
                 };
 
-                // Re-registrations must be queued to future_pool_params (applied after mark snapshot)
+                // New registrations go directly to pool_params; re-registrations go to
+                // future_pool_params so updated params appear in the NEXT mark snapshot.
+                // Note: re-registration does NOT cancel a pending retirement — both Haskell and
+                // Hayate leave psRetiring unchanged when a RegPool cert is processed.
                 let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
                     Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
                     false
@@ -833,7 +1397,7 @@ fn process_alonzo_certificate(
                     ledger_state.deposit_tracker.add_deposit(pool_dep_key, DepositType::Pool, pool_deposit);
                 }
 
-                tracing::info!("Pool registered: {} (pledge: {} ADA)",
+                tracing::debug!("Pool registered: {} (pledge: {} ADA)",
                     hex::encode(&pool_id[..8]),
                     pledge / 1_000_000);
             }
@@ -845,9 +1409,12 @@ fn process_alonzo_certificate(
                 let mut pool_id = [0u8; 28];
                 pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                ledger_state.pending_retirements.insert(EpochNo(*retirement_epoch), vec![pool_id]);
+                ledger_state.pending_retirements
+                    .entry(EpochNo(*retirement_epoch))
+                    .or_insert_with(Vec::new)
+                    .push(pool_id);
 
-                tracing::info!("Pool retirement scheduled: {} at epoch {}",
+                tracing::debug!("Pool retirement scheduled: {} at epoch {}",
                     hex::encode(&pool_id[..8]),
                     retirement_epoch);
             }
@@ -860,6 +1427,83 @@ fn process_alonzo_certificate(
     }
 
     Ok(())
+}
+
+fn pallas_drep_to_hayate(drep: &pallas_primitives::conway::DRep) -> hayate::ledger::primitives::DRep {
+    use hayate::ledger::primitives::DRep;
+    match drep {
+        pallas_primitives::conway::DRep::Key(hash) => {
+            let bytes = hash.as_ref();
+            let mut h = [0u8; 32];
+            let len = bytes.len().min(28);
+            h[..len].copy_from_slice(&bytes[..len]);
+            DRep::KeyHash(h)
+        }
+        pallas_primitives::conway::DRep::Script(hash) => {
+            let bytes = hash.as_ref();
+            let mut h = [0u8; 32];
+            let len = bytes.len().min(28);
+            h[..len].copy_from_slice(&bytes[..len]);
+            DRep::ScriptHash(h)
+        }
+        pallas_primitives::conway::DRep::Abstain => DRep::AlwaysAbstain,
+        pallas_primitives::conway::DRep::NoConfidence => DRep::AlwaysNoConfidence,
+    }
+}
+
+/// Convert a pallas Conway ProtocolParamUpdate to a hayate ProtocolParamUpdate.
+///
+/// Only Conway-era fields that have hayate equivalents are mapped.
+fn pallas_ppu_to_hayate(
+    ppu: &pallas_primitives::conway::ProtocolParamUpdate,
+) -> hayate::ledger::primitives::ProtocolParamUpdate {
+    use hayate::ledger::primitives::{ProtocolParamUpdate, Rational};
+
+    // Helper: convert pallas RationalNumber → hayate Rational
+    let rat = |r: &pallas_primitives::RationalNumber| Rational {
+        numerator: r.numerator,
+        denominator: r.denominator,
+    };
+
+    ProtocolParamUpdate {
+        min_fee_a: ppu.minfee_a,
+        min_fee_b: ppu.minfee_b,
+        max_block_body_size: ppu.max_block_body_size,
+        max_transaction_size: ppu.max_transaction_size,
+        max_block_header_size: ppu.max_block_header_size,
+        protocol_version: None, // protocol_version not in Conway PPU
+        key_deposit: ppu.key_deposit,
+        pool_deposit: ppu.pool_deposit,
+        min_pool_cost: ppu.min_pool_cost,
+        rho: ppu.expansion_rate.as_ref().map(&rat),
+        tau: ppu.treasury_growth_rate.as_ref().map(&rat),
+        a0: ppu.pool_pledge_influence.as_ref().map(&rat),
+        n_opt: ppu.desired_number_of_stake_pools,
+        e_max: ppu.maximum_epoch,
+        decentralization: None,
+        drep_deposit: ppu.drep_deposit,
+        drep_activity: ppu.drep_inactivity_period,
+        gov_action_lifetime: ppu.governance_action_validity_period,
+        gov_action_deposit: ppu.governance_action_deposit,
+        committee_min_size: ppu.min_committee_size,
+        committee_max_term_length: ppu.committee_term_limit,
+        min_fee_ref_script_cost_per_byte: ppu.minfee_refscript_cost_per_byte.as_ref().map(&rat),
+        dvt_motion_no_confidence: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.motion_no_confidence)),
+        dvt_committee_normal: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.committee_normal)),
+        dvt_committee_no_confidence: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.committee_no_confidence)),
+        dvt_update_to_constitution: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.update_constitution)),
+        dvt_hard_fork_initiation: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.hard_fork_initiation)),
+        dvt_pp_network_group: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.pp_network_group)),
+        dvt_pp_economic_group: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.pp_economic_group)),
+        dvt_pp_technical_group: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.pp_technical_group)),
+        dvt_pp_gov_group: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.pp_governance_group)),
+        dvt_treasury_withdrawal: ppu.drep_voting_thresholds.as_ref().map(|t| rat(&t.treasury_withdrawal)),
+        pvt_motion_no_confidence: ppu.pool_voting_thresholds.as_ref().map(|t| rat(&t.motion_no_confidence)),
+        pvt_committee_normal: ppu.pool_voting_thresholds.as_ref().map(|t| rat(&t.committee_normal)),
+        pvt_committee_no_confidence: ppu.pool_voting_thresholds.as_ref().map(|t| rat(&t.committee_no_confidence)),
+        pvt_hard_fork_initiation: ppu.pool_voting_thresholds.as_ref().map(|t| rat(&t.hard_fork_initiation)),
+        pvt_pp_security_group: ppu.pool_voting_thresholds.as_ref().map(|t| rat(&t.security_voting_threshold)),
+    }
 }
 
 fn process_conway_certificate(
@@ -979,7 +1623,9 @@ fn process_conway_certificate(
                     metadata_hash: None,
                 };
 
-                // Re-registrations must be queued to future_pool_params (applied after mark snapshot)
+                // New registrations go directly to pool_params; re-registrations go to
+                // future_pool_params so updated params appear in the NEXT mark snapshot.
+                // Note: re-registration does NOT cancel a pending retirement.
                 let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
                     Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
                     false
@@ -999,7 +1645,7 @@ fn process_conway_certificate(
                     ledger_state.deposit_tracker.add_deposit(pool_dep_key, DepositType::Pool, pool_deposit);
                 }
 
-                tracing::info!("Pool registered: {} (pledge: {} ADA)",
+                tracing::debug!("Pool registered: {} (pledge: {} ADA)",
                     hex::encode(&pool_id[..8]),
                     pledge / 1_000_000);
             }
@@ -1011,9 +1657,12 @@ fn process_conway_certificate(
                 let mut pool_id = [0u8; 28];
                 pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                ledger_state.pending_retirements.insert(EpochNo(*retirement_epoch), vec![pool_id]);
+                ledger_state.pending_retirements
+                    .entry(EpochNo(*retirement_epoch))
+                    .or_insert_with(Vec::new)
+                    .push(pool_id);
 
-                tracing::info!("Pool retirement scheduled: {} at epoch {}",
+                tracing::debug!("Pool retirement scheduled: {} at epoch {}",
                     hex::encode(&pool_id[..8]),
                     retirement_epoch);
             }
@@ -1055,26 +1704,194 @@ fn process_conway_certificate(
             }
         }
 
-        Certificate::VoteDeleg(_, _) |
-        Certificate::StakeVoteDeleg(_, _, _) |
-        Certificate::StakeRegDeleg(_, _, _) |
-        Certificate::VoteRegDeleg(_, _, _) |
-        Certificate::StakeVoteRegDeleg(_, _, _, _) => {
-            tracing::debug!("Conway delegation certificate");
-            // TODO: Track vote delegations separately from stake delegations
+        Certificate::VoteDeleg(stake_cred, drep) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let hayate_drep = pallas_drep_to_hayate(drep);
+                Arc::make_mut(&mut ledger_state.governance).vote_delegations.insert(hash, hayate_drep);
+                tracing::debug!("Vote delegation: {}", hex::encode(&cred_hash[..8]));
+            }
         }
 
-        Certificate::AuthCommitteeHot(_, _) |
-        Certificate::ResignCommitteeCold(_, _) => {
-            tracing::debug!("Conway committee certificate");
-            // TODO: Update governance state
+        Certificate::StakeVoteDeleg(stake_cred, pool_keyhash, drep) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let pool_bytes = pool_keyhash.as_ref();
+                if pool_bytes.len() >= 28 {
+                    let mut pool_id = [0u8; 28];
+                    pool_id.copy_from_slice(&pool_bytes[..28]);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
+                }
+                let hayate_drep = pallas_drep_to_hayate(drep);
+                Arc::make_mut(&mut ledger_state.governance).vote_delegations.insert(hash, hayate_drep);
+                tracing::debug!("Stake+vote delegation: {}", hex::encode(&cred_hash[..8]));
+            }
         }
 
-        Certificate::RegDRepCert(_, _, _) |
-        Certificate::UnRegDRepCert(_, _) |
-        Certificate::UpdateDRepCert(_, _) => {
-            tracing::debug!("Conway DRep certificate");
-            // TODO: Track DRep registrations and updates
+        Certificate::StakeRegDeleg(stake_cred, pool_keyhash, deposit) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
+                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                if is_new {
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, Lovelace(*deposit));
+                }
+                let pool_bytes = pool_keyhash.as_ref();
+                if pool_bytes.len() >= 28 {
+                    let mut pool_id = [0u8; 28];
+                    pool_id.copy_from_slice(&pool_bytes[..28]);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
+                }
+                tracing::debug!("Stake reg+delegate: {}", hex::encode(&cred_hash[..8]));
+            }
+        }
+
+        Certificate::VoteRegDeleg(stake_cred, drep, deposit) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
+                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                if is_new {
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, Lovelace(*deposit));
+                }
+                let hayate_drep = pallas_drep_to_hayate(drep);
+                Arc::make_mut(&mut ledger_state.governance).vote_delegations.insert(hash, hayate_drep);
+                tracing::debug!("Vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
+            }
+        }
+
+        Certificate::StakeVoteRegDeleg(stake_cred, pool_keyhash, drep, deposit) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
+                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
+                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                if is_new {
+                    ledger_state.deposit_tracker.add_deposit(hash, DepositType::Stake, Lovelace(*deposit));
+                }
+                let pool_bytes = pool_keyhash.as_ref();
+                if pool_bytes.len() >= 28 {
+                    let mut pool_id = [0u8; 28];
+                    pool_id.copy_from_slice(&pool_bytes[..28]);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
+                }
+                let hayate_drep = pallas_drep_to_hayate(drep);
+                Arc::make_mut(&mut ledger_state.governance).vote_delegations.insert(hash, hayate_drep);
+                tracing::debug!("Stake+vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
+            }
+        }
+
+        Certificate::AuthCommitteeHot(cold_cred, hot_cred) => {
+            if let (Some(cold_28), Some(hot_28)) = (
+                stake_credential_to_hash28(cold_cred),
+                stake_credential_to_hash28(hot_cred),
+            ) {
+                let mut cold_hash = [0u8; 32];
+                cold_hash[..28].copy_from_slice(&cold_28);
+                let mut hot_hash = [0u8; 32];
+                hot_hash[..28].copy_from_slice(&hot_28);
+                let gov = Arc::make_mut(&mut ledger_state.governance);
+                gov.committee_hot_keys.insert(cold_hash, hot_hash);
+                gov.committee_resigned.remove(&cold_hash);
+                if matches!(cold_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    gov.script_committee_credentials.insert(cold_hash);
+                }
+                if matches!(hot_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    gov.script_committee_hot_credentials.insert(hot_hash);
+                }
+                tracing::debug!("Committee hot key authorized: {} -> {}",
+                    hex::encode(&cold_28[..8]), hex::encode(&hot_28[..8]));
+            }
+        }
+
+        Certificate::ResignCommitteeCold(cold_cred, _anchor) => {
+            if let Some(cold_28) = stake_credential_to_hash28(cold_cred) {
+                let mut cold_hash = [0u8; 32];
+                cold_hash[..28].copy_from_slice(&cold_28);
+                let gov = Arc::make_mut(&mut ledger_state.governance);
+                gov.committee_resigned.insert(cold_hash, None);
+                gov.committee_hot_keys.remove(&cold_hash);
+                if matches!(cold_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    gov.script_committee_credentials.insert(cold_hash);
+                }
+                tracing::debug!("Committee member resigned: {}", hex::encode(&cold_28[..8]));
+            }
+        }
+
+        Certificate::RegDRepCert(drep_cred, deposit, anchor) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                ledger_state.deposit_tracker.add_deposit(hash, DepositType::DRep, Lovelace(*deposit));
+                // Issue 5: distinguish Key vs Script credentials for DRep registration
+                let is_script = matches!(drep_cred, pallas_primitives::StakeCredential::ScriptHash(_));
+                let credential = if is_script {
+                    hayate::ledger::primitives::Credential::Script(hash)
+                } else {
+                    hayate::ledger::primitives::Credential::Key(hash)
+                };
+                // Issue 6: store anchor from registration
+                let hayate_anchor = anchor.as_ref().map(|a| {
+                    let mut hash_bytes = [0u8; 32];
+                    let b = a.content_hash.as_ref();
+                    hash_bytes[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                    hayate::ledger::primitives::Anchor { url: a.url.clone(), hash: hash_bytes }
+                });
+                let gov = Arc::make_mut(&mut ledger_state.governance);
+                let current_epoch = ledger_state.epoch;
+                gov.dreps.insert(hash, hayate::ledger::state::DRepRegistration {
+                    credential,
+                    deposit: Lovelace(*deposit),
+                    anchor: hayate_anchor,
+                    registered_epoch: current_epoch,
+                    last_active_epoch: current_epoch,
+                    active: true,
+                });
+                gov.drep_registration_count += 1;
+                tracing::debug!("DRep registered: {} deposit={}", hex::encode(&cred_hash[..8]), deposit);
+            }
+        }
+
+        Certificate::UnRegDRepCert(drep_cred, _deposit) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                if let Some(refund) = ledger_state.deposit_tracker.refund_deposit(&hash, DepositType::DRep) {
+                    *Arc::make_mut(&mut ledger_state.reward_accounts)
+                        .entry(hash)
+                        .or_insert(Lovelace(0)) += refund;
+                }
+                Arc::make_mut(&mut ledger_state.governance).dreps.remove(&hash);
+                tracing::debug!("DRep deregistered: {}", hex::encode(&cred_hash[..8]));
+            }
+        }
+
+        Certificate::UpdateDRepCert(drep_cred, anchor) => {
+            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_hash);
+                let current_epoch = ledger_state.epoch;
+                // Issue 6: store updated anchor
+                let hayate_anchor = anchor.as_ref().map(|a| {
+                    let mut hash_bytes = [0u8; 32];
+                    let b = a.content_hash.as_ref();
+                    hash_bytes[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                    hayate::ledger::primitives::Anchor { url: a.url.clone(), hash: hash_bytes }
+                });
+                let gov = Arc::make_mut(&mut ledger_state.governance);
+                if let Some(reg) = gov.dreps.get_mut(&hash) {
+                    reg.last_active_epoch = current_epoch;
+                    reg.anchor = hayate_anchor;
+                }
+                tracing::debug!("DRep updated: {}", hex::encode(&cred_hash[..8]));
+            }
         }
 
         _ => {}
@@ -1083,11 +1900,31 @@ fn process_conway_certificate(
     Ok(())
 }
 
+/// Load only the Conway genesis (does not require full ledger init)
+fn load_conway_genesis(config_path: Option<&PathBuf>) -> Option<ConwayGenesis> {
+    let config_file = config_path?;
+    let config_content = std::fs::read_to_string(config_file).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config_content).ok()?;
+    let config_dir = config_file.parent().unwrap_or(std::path::Path::new("./"));
+    let conway_path_str = config.get("ConwayGenesisFile")?.as_str()?;
+    let full_path = config_dir.join(conway_path_str);
+    match ConwayGenesis::load_with_hash(&full_path) {
+        Ok((genesis, _)) => {
+            info!("✅ Conway genesis loaded from {}", full_path.display());
+            Some(genesis)
+        }
+        Err(e) => {
+            warn!("Failed to load Conway genesis: {}", e);
+            None
+        }
+    }
+}
+
 /// Load genesis files and initialize ledger state with correct reserves
 fn load_genesis_and_init_ledger(
     config_path: Option<&PathBuf>,
     network: &Network,
-) -> Result<LedgerState> {
+) -> Result<(LedgerState, Option<ConwayGenesis>)> {
     let mut ledger_state = LedgerState::new(ProtocolParameters::default());
 
     // Try to load genesis files if config is provided or we can find default paths
@@ -1171,17 +2008,18 @@ fn load_genesis_and_init_ledger(
             }
         }
 
-        // Alonzo and Conway genesis can be loaded here in the future for:
-        // - Plutus cost models (Alonzo)
-        // - Governance parameters (Conway)
+        // Load Conway genesis for governance parameters (applied at era transition)
+        let conway_genesis = load_conway_genesis(config_path);
 
-    } else {
-        warn!("No config file provided - using default mainnet values");
-        warn!("⚠️  Treasury and reserves will be incorrect!");
-        warn!("⚠️  Provide --config <path> to load proper genesis values");
+        return Ok((ledger_state, conway_genesis));
+
     }
 
-    Ok(ledger_state)
+    warn!("No config file provided - using default mainnet values");
+    warn!("⚠️  Treasury and reserves will be incorrect!");
+    warn!("⚠️  Provide --config <path> to load proper genesis values");
+
+    Ok((ledger_state, None))
 }
 
 
