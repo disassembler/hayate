@@ -31,6 +31,10 @@ struct Args {
     /// Stop after this epoch (default: compare all)
     #[arg(long)]
     to_epoch: Option<u64>,
+
+    /// Continue comparing after finding critical divergences (default: stop on first critical)
+    #[arg(long)]
+    keep_going: bool,
 }
 
 fn main() -> Result<()> {
@@ -70,8 +74,8 @@ fn main() -> Result<()> {
         compare_u64(haskell, hayate, "treasury", &mut critical);
         compare_u64(haskell, hayate, "reserves", &mut critical);
         compare_u64(haskell, hayate, "epochFees", &mut warnings);
-        compare_u64(haskell, hayate, "activeStake", &mut warnings);
-        compare_deposits(haskell, hayate, &mut warnings);
+        compare_u64(haskell, hayate, "activeStake", &mut critical);
+        compare_deposits(haskell, hayate, &mut critical);
 
         // --- Critical: protocol parameters (if Haskell dump has them) ---
         compare_protocol_params(haskell, hayate, &mut critical);
@@ -87,8 +91,8 @@ fn main() -> Result<()> {
         // --- Conway governance (only present for Conway epochs) ---
         compare_conway_gov(haskell, hayate, &mut critical, &mut warnings);
 
-        // --- Informational: snapshot contents ---
-        compare_snapshots(haskell, hayate, &mut warnings);
+        // --- Snapshot contents (stake/pool mismatches are upstream causes) ---
+        compare_snapshots(haskell, hayate, &mut critical, &mut warnings);
 
         if critical.is_empty() && warnings.is_empty() {
             println!("epoch {epoch}: OK");
@@ -106,6 +110,10 @@ fn main() -> Result<()> {
                 println!("  WARN: {w}");
             }
             all_ok = false;
+            if !args.keep_going {
+                println!("\nStopped at first critical divergence (use --keep-going to continue).");
+                break;
+            }
         }
     }
 
@@ -405,7 +413,7 @@ fn compare_conway_gov(haskell: &Value, hayate: &Value, critical: &mut Vec<String
     let h_drep_count = hg.get("drepDistr").and_then(|v| v.as_object()).map(|m| m.len());
     let r_drep_count = rg.get("drepDistr").and_then(|v| v.as_object()).map(|m| m.len());
     match (h_drep_count, r_drep_count) {
-        (Some(h), Some(r)) if h != r => warnings.push(format!(
+        (Some(h), Some(r)) if h != r => critical.push(format!(
             "conwayGov.drepDistr entry count: haskell={h} hayate={r}"
         )),
         _ => {}
@@ -422,7 +430,7 @@ fn compare_conway_gov(haskell: &Value, hayate: &Value, critical: &mut Vec<String
     let r_drep_total = drep_total(rg);
     if h_drep_total != r_drep_total {
         let diff = r_drep_total as i128 - h_drep_total as i128;
-        warnings.push(format!(
+        critical.push(format!(
             "conwayGov.drepDistr total stake: haskell={h_drep_total} hayate={r_drep_total} diff={diff}"
         ));
     }
@@ -447,30 +455,32 @@ fn compare_conway_gov(haskell: &Value, hayate: &Value, critical: &mut Vec<String
     }
 }
 
-fn compare_snapshots(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {
+fn compare_snapshots(haskell: &Value, hayate: &Value, critical: &mut Vec<String>, warnings: &mut Vec<String>) {
     let snaps = &[("mark", "mark"), ("set", "set"), ("go", "go")];
     for (hname, rname) in snaps {
         let hs = haskell.get("snapshots").and_then(|s| s.get(hname));
         let rs = hayate.get("snapshots").and_then(|s| s.get(rname));
         match (hs, rs) {
             (None, None) => {}
-            (None, Some(_)) => out.push(format!("snapshots.{hname}: missing in haskell")),
-            (Some(_), None) => out.push(format!("snapshots.{hname}: missing in hayate")),
+            (None, Some(_)) => warnings.push(format!("snapshots.{hname}: missing in haskell")),
+            (Some(_), None) => critical.push(format!("snapshots.{hname}: missing in hayate")),
             (Some(h), Some(r)) => {
                 if h.is_null() && r.is_null() {
                     continue;
                 }
-                // Total stake
+                // Total stake — drives eta and reward calculations
                 let ht = snapshot_stake_total(h);
                 let rt = snapshot_stake_total(r);
                 if ht != rt {
-                    out.push(format!(
+                    critical.push(format!(
                         "snapshots.{hname}.totalStake: haskell={ht} hayate={rt} diff={}",
                         rt as i128 - ht as i128
                     ));
                 }
 
                 // Per-credential stake (normalized to 28-byte cred key)
+                // Critical: any difference in non-zero values affects totalStake / reward calc.
+                // Warning: extra credential with stake=0 in hayate is spurious but harmless.
                 let hstake: HashMap<String, u64> = h.get("stake")
                     .and_then(|s| s.as_object())
                     .map(|m| m.iter().map(|(k, v)| (normalize_cred(k), v.as_u64().unwrap_or(0))).collect())
@@ -482,20 +492,20 @@ fn compare_snapshots(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {
                 for (cred, hv) in &hstake {
                     let rv = rstake.get(cred).copied().unwrap_or(0);
                     if *hv != rv {
-                        out.push(format!(
+                        critical.push(format!(
                             "snapshots.{hname}.stake[{cred}]: haskell={hv} hayate={rv}"
                         ));
                     }
                 }
                 for (cred, rv) in &rstake {
                     if !hstake.contains_key(cred) {
-                        out.push(format!(
+                        critical.push(format!(
                             "snapshots.{hname}.stake[{cred}]: missing in haskell, hayate={rv}"
                         ));
                     }
                 }
 
-                // Pool params: pledge, margin, cost
+                // Pool params: pledge, margin, cost — affect reward calculations
                 let hparams = h.get("poolParams").and_then(|v| v.as_object());
                 let rparams = r.get("poolParams").and_then(|v| v.as_object());
                 if let (Some(hp), Some(rp)) = (hparams, rparams) {
@@ -506,7 +516,7 @@ fn compare_snapshots(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {
                                 let hv = hpool.get(field).and_then(|v| v.as_u64());
                                 let rv = rpool.get(field).and_then(|v| v.as_u64());
                                 if hv != rv {
-                                    out.push(format!(
+                                    critical.push(format!(
                                         "snapshots.{hname}.poolParams[{pool_key}].{field}: haskell={hv:?} hayate={rv:?}"
                                     ));
                                 }
@@ -516,14 +526,23 @@ fn compare_snapshots(haskell: &Value, hayate: &Value, out: &mut Vec<String>) {
                             let rm = rpool.get("margin").and_then(|v| v.as_f64());
                             if let (Some(h), Some(r)) = (hm, rm) {
                                 if (h - r).abs() > 1e-9 {
-                                    out.push(format!(
+                                    critical.push(format!(
                                         "snapshots.{hname}.poolParams[{pool_key}].margin: haskell={h} hayate={r}"
                                     ));
                                 }
                             }
                         } else {
-                            out.push(format!(
+                            critical.push(format!(
                                 "snapshots.{hname}.poolParams[{pool_key}]: missing in hayate"
+                            ));
+                        }
+                    }
+                    // Check for pools in hayate that Haskell doesn't have
+                    for (pool_id, _) in rp {
+                        let pool_key = &pool_id[..56.min(pool_id.len())];
+                        if !hp.contains_key(pool_id.as_str()) && !hp.contains_key(pool_key) {
+                            critical.push(format!(
+                                "snapshots.{hname}.poolParams[{pool_key}]: extra pool in hayate, missing in haskell"
                             ));
                         }
                     }

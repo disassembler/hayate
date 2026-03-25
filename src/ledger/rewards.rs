@@ -73,7 +73,7 @@ impl LedgerState {
         //
         // When d >= 0.8 (federated phase), eta is assumed to be 1.0 because federated
         // nodes are guaranteed to produce all expected blocks. This matches Haskell behavior.
-        tracing::info!(
+        tracing::debug!(
             "calculate_rewards called: epoch={}, rho={}/{}, tau={}/{}, reserves={} lovelace, fees={} lovelace (from go snapshot epoch {})",
             self.epoch.0,
             rho_num,
@@ -93,7 +93,7 @@ impl LedgerState {
         // This ensures we're using blocks from the same epoch as the stake distribution
         let total_stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
 
-        tracing::info!(
+        tracing::debug!(
             "Reward calculation for epoch {}: d = {}/{} = {:.2}, stake_pool_blocks = {} (from snapshot epoch {})",
             self.epoch.0,
             d_num,
@@ -183,7 +183,7 @@ impl LedgerState {
         let expansion = expansion_rat.floor_u64();
         let total_rewards_available = expansion + fees_for_rewards;
 
-        tracing::info!(
+        tracing::debug!(
             "Expansion calculation: expansion={} lovelace, fees={} lovelace, total={} lovelace",
             expansion,
             fees_for_rewards,
@@ -228,7 +228,7 @@ impl LedgerState {
             //                       = expansion - ((expansion + fees) - treasury_cut)
             //                       = treasury_cut - fees
             let delta_reserves = treasury_cut.saturating_sub(fees_for_rewards);
-            tracing::info!(
+            tracing::debug!(
                 "No circulation: expansion={}, fees={}, treasury_cut={}, undistributed={}, delta_reserves={}",
                 expansion,
                 fees_for_rewards,
@@ -274,7 +274,7 @@ impl LedgerState {
                 0
             };
 
-            tracing::info!(
+            tracing::debug!(
                 "No active stake: expansion={}, fees={}, treasury_cut={}, undistributed={}, delta_reserves={}, fees_exceed_cut={}",
                 expansion,
                 fees_for_rewards,
@@ -395,7 +395,7 @@ impl LedgerState {
                 perf.mul(&Rat::from_i128(max_pool as i128, 1)).floor_u64()
             };
 
-            tracing::info!(
+            tracing::debug!(
                 "Pool {} reward calc: blocks={}, total_blocks={}, pool_stake={}, total_active={}, max_pool={}, pool_reward={}",
                 hex::encode(pool_id),
                 blocks_made,
@@ -489,7 +489,7 @@ impl LedgerState {
         // This reduces the net reserves decrease: deltaR = expansion - undistributed
         let undistributed = reward_pot.saturating_sub(total_distributed);
 
-        tracing::info!(
+        tracing::debug!(
             "Reward calculation: expansion={}, fees={}, treasury_cut={}, reward_pot={}, total_distributed={}, undistributed={}",
             expansion,
             fees_for_rewards,
@@ -500,7 +500,7 @@ impl LedgerState {
         );
 
         // Detailed breakdown for debugging
-        tracing::info!(
+        tracing::debug!(
             "RUPD details: deltaR1(expansion)={}, fees={}, rPot(expansion+fees)={}, deltaT1(treasury_cut)={}, _R(reward_pot)={}, distributed={}, deltaR2(undistributed)={}",
             expansion,
             fees_for_rewards,

@@ -66,7 +66,7 @@ impl LedgerState {
 
         self.stake_distribution.stake_map = new_map;
 
-        tracing::info!(
+        tracing::debug!(
             "Rebuilt stake distribution: {} credentials",
             self.stake_distribution.stake_map.len()
         );
@@ -148,13 +148,13 @@ impl LedgerState {
             }
         }
 
-        tracing::info!("DEBUG: Scanned {} total entries, {} UTxOs with stake credentials", total_scanned, count);
-        tracing::info!("DEBUG: Sample UTxO amounts (first 10): {:?}", amount_samples);
+        tracing::debug!("Scanned {} total entries, {} UTxOs with stake credentials", total_scanned, count);
+        tracing::debug!("Sample UTxO amounts (first 10): {:?}", amount_samples);
 
         // Rebuild stake distribution from collected UTxOs
         self.rebuild_stake_distribution(utxos.into_iter());
 
-        tracing::info!("✓ Rebuilt stake distribution: {} credentials, {} total stake",
+        tracing::debug!("✓ Rebuilt stake distribution: {} credentials, {} total stake",
             self.stake_distribution.stake_map.len(),
             self.stake_distribution.stake_map.values().map(|l| l.0).sum::<u64>() / 1_000_000
         );
