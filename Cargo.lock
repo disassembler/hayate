@@ -369,9 +369,9 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "cardano-lsm"
-version = "1.0.1"
+version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6689cb8e1c76c54391bfc88ed8426fd98ada43c942ee6452fff1028690ad5eaf"
+checksum = "afb2d113ec635291bcb88767259a387f199865c03296ba7622f74b61808fab7c"
 dependencies = [
  "anyhow",
  "async-trait",

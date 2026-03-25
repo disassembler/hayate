@@ -23,7 +23,7 @@ path = "src/bin/compare_epoch_dumps.rs"
 
 [dependencies]
 # LSM storage engine
-cardano-lsm = "1.0.0"
+cardano-lsm = "1.0.2"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
