@@ -1,32 +1,33 @@
 // Hayate (疾風) - Swift Cardano Indexer with UTxORPC API
 
-mod cli;
-mod mock_types;
-mod wallet;
-mod gpg;
+mod api;
 mod chain_sync;
+mod cli;
+mod config;
+mod genesis; // Genesis file parsing
+mod gpg;
+mod indexer;
 mod keys;
+mod ledger; // Ledger state management
+mod mock_types;
+mod node;
+mod protocol_params;
 mod rewards;
 mod snapshot_manager;
-mod genesis;  // Genesis file parsing
-mod ledger;   // Ledger state management
-mod indexer;
-mod api;
-mod config;
+mod wallet;
 mod wallet_stats;
-mod protocol_params;
-mod node;
 
-use clap::{CommandFactory, Parser};
-use tracing::info;
-use std::sync::Arc;
-use indexer::{HayateIndexer, Network};
-use std::path::PathBuf;
-use cli::Args;
 use chain_sync::HayateSync;
+use clap::{CommandFactory, Parser};
+use cli::Args;
+use indexer::{HayateIndexer, Network};
 use pallas_network::miniprotocols::chainsync::NextResponse;
 use pallas_network::miniprotocols::Point;
 use pallas_traverse::MultiEraBlock;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::info;
+use tracing::trace;
 
 /// Run chain sync from a node socket
 async fn run_chain_sync(
@@ -44,15 +45,23 @@ async fn run_chain_sync(
 
     // Get storage handle
     let networks = indexer.networks.read().await;
-    let storage_handle = networks.get(&network)
+    let storage_handle = networks
+        .get(&network)
         .ok_or_else(|| anyhow::anyhow!("Network storage not found"))?
         .clone();
     drop(networks); // Release read lock
 
     // Get minimum wallet tip for resume point
     // This ensures newly added wallets are indexed from their last known tip (or origin)
-    let start_point = if let Some(tip) = storage_handle.get_min_wallet_tip(wallet_ids.clone()).await? {
-        info!("Resuming from slot {} (minimum across {} wallets)", tip.slot, wallet_ids.len());
+    let start_point = if let Some(tip) = storage_handle
+        .get_min_wallet_tip(wallet_ids.clone())
+        .await?
+    {
+        info!(
+            "Resuming from slot {} (minimum across {} wallets)",
+            tip.slot,
+            wallet_ids.len()
+        );
         Point::Specific(tip.slot, tip.hash)
     } else {
         info!("Starting from origin (new wallets or empty database)");
@@ -81,7 +90,8 @@ async fn run_chain_sync(
                 match keys::derive_account_keys(account_xpub, indexer.gap_limit) {
                     Ok(wallet_account) => {
                         // Add all derived payment key hashes and stake key hash to filter
-                        let (payment_hashes, stake_hash) = keys::get_wallet_key_hashes(&wallet_account);
+                        let (payment_hashes, stake_hash) =
+                            keys::get_wallet_key_hashes(&wallet_account);
 
                         info!(
                             "Indexing wallet {} with {} payment addresses and stake key",
@@ -95,7 +105,11 @@ async fn run_chain_sync(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!("Failed to derive keys from xpub {}: {}", wallet_xpub_str, e);
+                        tracing::warn!(
+                            "Failed to derive keys from xpub {}: {}",
+                            wallet_xpub_str,
+                            e
+                        );
                     }
                 }
             }
@@ -123,7 +137,11 @@ async fn run_chain_sync(
                 match hex::decode(address_str) {
                     Ok(bytes) => bytes,
                     Err(e) => {
-                        tracing::warn!("Failed to parse address {} (not bech32 or hex): {}", address_str, e);
+                        tracing::warn!(
+                            "Failed to parse address {} (not bech32 or hex): {}",
+                            address_str,
+                            e
+                        );
                         continue;
                     }
                 }
@@ -150,8 +168,9 @@ async fn run_chain_sync(
 
         #[cfg(unix)]
         {
-            let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                .expect("Failed to setup SIGTERM handler");
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                    .expect("Failed to setup SIGTERM handler");
             tokio::select! {
                 _ = ctrl_c => info!("🛑 Received SIGINT (Ctrl+C)"),
                 _ = sigterm.recv() => info!("🛑 Received SIGTERM"),
@@ -270,7 +289,9 @@ async fn run_chain_sync(
     };
 
     // Check if this is a restart - if so, skip final tip save to preserve the rewound tip
-    let is_restart = result.as_ref().err()
+    let is_restart = result
+        .as_ref()
+        .err()
         .map(|e| e.to_string().starts_with("RESTART:"))
         .unwrap_or(false);
 
@@ -297,7 +318,9 @@ async fn run_chain_sync(
 
 async fn handle_wallet_command(wallet_cmd: &cli::WalletCommand, args: &Args) -> anyhow::Result<()> {
     // Determine wallet directory
-    let wallet_dir = args.db_path.as_ref()
+    let wallet_dir = args
+        .db_path
+        .as_ref()
         .map(|p| PathBuf::from(p).join("wallets"))
         .unwrap_or_else(|| PathBuf::from("./hayate-wallets"));
 
@@ -316,7 +339,12 @@ async fn handle_wallet_command(wallet_cmd: &cli::WalletCommand, args: &Args) -> 
 
 async fn handle_query_command(query_cmd: &cli::QueryCommand) -> anyhow::Result<()> {
     match query_cmd {
-        cli::QueryCommand::ProtocolParams { socket, magic, output, json } => {
+        cli::QueryCommand::ProtocolParams {
+            socket,
+            magic,
+            output,
+            json,
+        } => {
             info!("Querying protocol parameters from node...");
             info!("  Socket: {}", socket);
             info!("  Magic:  {}", magic);
@@ -367,11 +395,22 @@ Plutus Parameters:
                     params.max_tx_size,
                     params.max_block_body_size,
                     params.utxo_cost_per_byte,
-                    params.key_deposit, params.key_deposit / 1_000_000,
-                    params.pool_deposit, params.pool_deposit / 1_000_000,
-                    params.min_pool_cost, params.min_pool_cost / 1_000_000,
-                    params.price_memory.as_ref().map(|r| format!("{}/{}", r.numerator, r.denominator)).unwrap_or_else(|| "N/A".to_string()),
-                    params.price_steps.as_ref().map(|r| format!("{}/{}", r.numerator, r.denominator)).unwrap_or_else(|| "N/A".to_string()),
+                    params.key_deposit,
+                    params.key_deposit / 1_000_000,
+                    params.pool_deposit,
+                    params.pool_deposit / 1_000_000,
+                    params.min_pool_cost,
+                    params.min_pool_cost / 1_000_000,
+                    params
+                        .price_memory
+                        .as_ref()
+                        .map(|r| format!("{}/{}", r.numerator, r.denominator))
+                        .unwrap_or_else(|| "N/A".to_string()),
+                    params
+                        .price_steps
+                        .as_ref()
+                        .map(|r| format!("{}/{}", r.numerator, r.denominator))
+                        .unwrap_or_else(|| "N/A".to_string()),
                     params.max_tx_execution_units,
                     params.max_block_execution_units,
                 );
@@ -429,8 +468,7 @@ async fn handle_rollback_command(
 
     // Parse network
     let network = if let Some(net_str) = network_str {
-        Network::parse(&net_str)
-            .ok_or_else(|| anyhow::anyhow!("Invalid network: {}", net_str))?
+        Network::parse(&net_str).ok_or_else(|| anyhow::anyhow!("Invalid network: {}", net_str))?
     } else {
         Network::Preview // Default
     };
@@ -490,14 +528,13 @@ async fn main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| {
-                    // Default to info if RUST_LOG not set, but allow RUST_LOG to override
-                    tracing_subscriber::EnvFilter::new("hayate=info,h2=warn")
-                })
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                // Default to info if RUST_LOG not set, but allow RUST_LOG to override
+                tracing_subscriber::EnvFilter::new("hayate=info,h2=warn")
+            }),
         )
         .init();
-    
+
     let args = Args::parse();
 
     // Handle commands
@@ -511,7 +548,11 @@ async fn main() -> anyhow::Result<()> {
         Some(cli::Command::Config { config_cmd }) => {
             return handle_config_command(config_cmd).await;
         }
-        Some(cli::Command::Rollback { epoch, network, db_path }) => {
+        Some(cli::Command::Rollback {
+            epoch,
+            network,
+            db_path,
+        }) => {
             return handle_rollback_command(*epoch, network.clone(), db_path.clone()).await;
         }
         Some(cli::Command::Completions { shell }) => {
@@ -521,7 +562,7 @@ async fn main() -> anyhow::Result<()> {
             // Continue with sync (default behavior)
         }
     }
-    
+
     // Load configuration
     let mut config = if let Some(config_path) = args.config {
         info!("Loading config from: {}", config_path);
@@ -530,14 +571,19 @@ async fn main() -> anyhow::Result<()> {
         info!("Using default configuration");
         config::HayateConfig::default()
     };
-    
+
     // Apply CLI overrides from global args
     if let Some(db_path) = &args.db_path {
         config.data_dir = PathBuf::from(db_path);
     }
 
     // Apply overrides from Sync command if present
-    if let Some(cli::Command::Sync { gap_limit, api_bind, .. }) = &args.command {
+    if let Some(cli::Command::Sync {
+        gap_limit,
+        api_bind,
+        ..
+    }) = &args.command
+    {
         if let Some(gap_limit) = gap_limit {
             config.gap_limit = *gap_limit;
         }
@@ -545,7 +591,7 @@ async fn main() -> anyhow::Result<()> {
             config.api.bind = api_bind.clone();
         }
     }
-    
+
     info!("疾風 Hayate starting...");
     info!("Database: {:?}", config.data_dir);
     info!("UTxORPC API: {}", config.api.bind);
@@ -555,7 +601,10 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(config);
 
     // Create indexer
-    let indexer = Arc::new(HayateIndexer::new(config.data_dir.clone(), config.gap_limit)?);
+    let indexer = Arc::new(HayateIndexer::new(
+        config.data_dir.clone(),
+        config.gap_limit,
+    )?);
 
     // Determine network to use
     let socket = if let Some(cli::Command::Sync { socket, .. }) = &args.command {
@@ -571,7 +620,9 @@ async fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("--network is required when using --socket"));
     } else {
         // From config file - use first enabled network
-        config.networks.iter()
+        config
+            .networks
+            .iter()
             .find(|(_, cfg)| cfg.enabled)
             .and_then(|(name, _)| Network::parse(name))
             .ok_or_else(|| anyhow::anyhow!("No network enabled in config"))?
@@ -581,7 +632,9 @@ async fn main() -> anyhow::Result<()> {
     info!("Magic: {}", network.magic());
 
     // Add network storage
-    indexer.add_network(network.clone(), config.data_dir.clone()).await?;
+    indexer
+        .add_network(network.clone(), config.data_dir.clone())
+        .await?;
 
     // Load wallets, addresses, and tokens from config
     if config.wallets.is_empty() && config.tokens.is_empty() && config.addresses.is_empty() {
@@ -626,7 +679,15 @@ async fn main() -> anyhow::Result<()> {
         let network_clone = network.clone();
         tokio::spawn(async move {
             info!("🚀 Starting UTxORPC server on {}...", api_bind);
-            if let Err(e) = api::start_utxorpc_server(indexer_clone, config_clone, api_bind, network_clone, Some(socket_clone)).await {
+            if let Err(e) = api::start_utxorpc_server(
+                indexer_clone,
+                config_clone,
+                api_bind,
+                network_clone,
+                Some(socket_clone),
+            )
+            .await
+            {
                 tracing::error!("API server error: {}", e);
             }
         });
@@ -634,7 +695,14 @@ async fn main() -> anyhow::Result<()> {
         // Run chain sync in main task (this will block)
         // Wrap in loop to handle restarts from AddAddressAndRollback
         loop {
-            match run_chain_sync(indexer.clone(), network.clone(), socket_path.clone(), config.tokens.clone()).await {
+            match run_chain_sync(
+                indexer.clone(),
+                network.clone(),
+                socket_path.clone(),
+                config.tokens.clone(),
+            )
+            .await
+            {
                 Ok(()) => {
                     // Normal shutdown
                     return Ok(());
@@ -659,12 +727,17 @@ async fn main() -> anyhow::Result<()> {
     info!("Running in API-only mode (reading from existing DB)");
 
     // Get socket path from network config (for GetBlockByHash support)
-    let socket_path = config.networks.get(network.as_str())
+    let socket_path = config
+        .networks
+        .get(network.as_str())
         .and_then(|cfg| cfg.socket_path.as_ref())
         .map(|p| p.to_string_lossy().to_string());
 
     if socket_path.is_none() {
-        info!("⚠️  No socket_path configured for {} - GetBlockByHash will not be available", network.as_str());
+        info!(
+            "⚠️  No socket_path configured for {} - GetBlockByHash will not be available",
+            network.as_str()
+        );
         info!("💡 Add socket_path to network config to enable block-by-hash queries");
     }
 

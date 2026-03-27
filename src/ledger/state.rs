@@ -126,6 +126,12 @@ pub struct LedgerState {
     #[serde(default)]
     pub stability_window_3kf: u64,
 
+    /// RUPD stability window: ceiling(2k/f) — the slot offset within an epoch
+    /// at which Haskell's `createRUpd` / reward pulsing starts.
+    /// Hayate computes the RUPD at the first block whose `slot_in_epoch >= stability_window_2kf`.
+    #[serde(default = "default_stability_window_2kf")]
+    pub stability_window_2kf: u64,
+
     /// Shelley genesis hash (used for initial nonce state)
     pub genesis_hash: Hash32,
 
@@ -215,6 +221,10 @@ fn default_prev_epoch_decentralization() -> Rational {
     Rational { numerator: 1, denominator: 1 }
 }
 
+fn default_stability_window_2kf() -> u64 {
+    86400 // 2k/f on mainnet: 2*2160/0.05 = 86400
+}
+
 impl LedgerState {
     pub fn new(params: ProtocolParameters) -> Self {
         LedgerState {
@@ -243,6 +253,7 @@ impl LedgerState {
             last_epoch_block_nonce: [0u8; 32],
             randomness_stabilisation_window: 172800, // 4k/f on mainnet
             stability_window_3kf: 129600,            // 3k/f on mainnet
+            stability_window_2kf: default_stability_window_2kf(), // 2k/f on mainnet
             genesis_hash: [0u8; 32],
             pending_pp_updates: BTreeMap::new(),
             update_quorum: default_update_quorum(),

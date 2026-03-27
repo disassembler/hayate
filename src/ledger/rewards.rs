@@ -17,27 +17,29 @@ impl LedgerState {
     /// deferred application pattern.
     pub fn apply_pending_reward_update(&mut self) {
         if let Some(rupd) = self.pending_reward_update.take() {
-            // Net reserves decrease = deltaR1 - deltaR2
-            //   deltaR1 = expansion (monetary expansion drawn from reserves)
-            //   deltaR2 = undistributed (reward_pot - total_distributed, returned to reserves)
-            // Only the net amount leaves reserves permanently.
-            let net_reserves_decrease = rupd.delta_reserves.saturating_sub(rupd.undistributed);
-            self.reserves.0 = self.reserves.0.saturating_sub(net_reserves_decrease);
+            // Reserves: subtract expansion (deltaR1), add back undistributed (deltaR2).
+            self.reserves.0 = self.reserves.0.saturating_sub(rupd.delta_reserves);
+            self.reserves.0 = self.reserves.0.saturating_add(rupd.undistributed);
 
-            // Treasury receives only the tau cut (deltaT1). Undistributed goes back to reserves,
-            // not to treasury.
-            self.treasury.0 = self.treasury.0.saturating_add(rupd.delta_treasury);
-
-            // Apply per-account rewards
+            // Apply per-account rewards; rewards for deregistered accounts go to treasury (unregRU').
+            let mut unreg_treasury = 0u64;
             let mut total_applied = 0u64;
             for (cred_hash, reward) in &rupd.rewards {
                 if reward.0 > 0 {
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .entry(*cred_hash)
-                        .or_insert(Lovelace(0)) += *reward;
-                    total_applied += reward.0;
+                    if let Some(balance) = Arc::make_mut(&mut self.reward_accounts).get_mut(cred_hash) {
+                        *balance += *reward;
+                        total_applied += reward.0;
+                    } else {
+                        unreg_treasury += reward.0;
+                    }
                 }
             }
+
+            // Treasury: tau cut (deltaT1) + unregRU' (accounts deregistered at application).
+            // Haskell: treasury_5 = treasury_4 + Δt₁ + unregRU'
+            self.treasury.0 = self.treasury.0
+                .saturating_add(rupd.delta_treasury)
+                .saturating_add(unreg_treasury);
 
             tracing::debug!(
                 "Applied pending reward update: {} lovelace to {} accounts, \
@@ -90,13 +92,12 @@ impl LedgerState {
             go_snapshot.epoch.0
         );
 
-        // CRITICAL: Use prev_epoch_decentralization for the eta d-threshold.
-        // Haskell's RUPD uses `d` from the epoch whose blocks are being measured (nesBprev's
-        // epoch), not the current epoch's `d`. When d transitions (e.g. epoch 1 d=1 → epoch 2
-        // d=0), the blocks being rewarded at epoch 2→3 come from epoch 1 (mark snapshot = epoch
-        // 1 blocks), so we must use d=1 to correctly apply eta=1 (federated phase).
-        let d_num = self.prev_epoch_decentralization.numerator as i128;
-        let d_den = self.prev_epoch_decentralization.denominator.max(1) as i128;
+        // Use `d` from prevPp (the previous epoch's protocol parameters), per the Shelley
+        // spec: createRUpd destructures the epoch state as (acnt, ss, ls, prevPp, ) = es
+        // and uses `d prevPp` in the eta formula.  This is prev_pp.decentralization, not
+        // any value stored in the snapshot.
+        let d_num = prev_pp.decentralization.numerator as i128;
+        let d_den = prev_pp.decentralization.denominator.max(1) as i128;
         let d_value = d_num as f64 / d_den as f64;
 
         // CRITICAL: Use blocks from go snapshot, not current epoch's blocks
@@ -116,9 +117,8 @@ impl LedgerState {
         // Expected blocks formula from Shelley spec: floor((1 - d) * activeSlotCoeff * epochLength)
         // When d >= 0.8 (federated), very few blocks expected from stake pools
         // When d < 0.8 (decentralized), more blocks expected from stake pools
-        let d_value_f64 = d_num as f64 / d_den as f64;
         let raw_expected_blocks =
-            ((1.0 - d_value_f64) * prev_pp.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
+            ((1.0 - d_value) * prev_pp.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
         if raw_expected_blocks == 0 {
             tracing::warn!(
                 "expected_blocks rounded to 0 (active_slot_coeff={}, epoch_length={}), clamping to 1",
@@ -462,8 +462,8 @@ impl LedgerState {
             }
         }
 
-        // Undistributed rewards return to reserves (deltaR2 in Haskell)
-        // This reduces the net reserves decrease: deltaR = expansion - undistributed
+        // Undistributed = rounding remainder (reward_pot - Σrewards due to floor ops).
+        // Goes back to reserves as deltaR2 at application time.
         let undistributed = reward_pot.saturating_sub(total_distributed);
 
         tracing::debug!(
