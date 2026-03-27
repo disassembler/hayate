@@ -51,18 +51,14 @@ Fix any compilation errors before proceeding.
 
 ### 3. Run hayate in validation mode
 
-Substitute `<env_name>` and paths from memory throughout:
-
-```
-RUST_LOG=info ./target/release/hayate-node \
-  --db-path {hayate_data_base}-<env_name> \
-  -n <env_name> \
-  -c {config_base}/<env_name>/config.json \
-  --immutable-db {immutable_db_base}/<env_name>/chain/immutable \
-  --haskell-epoch-dir {haskell_dumps_base}/cardano-<env_name>/snap-dumps \
-  --dump-epoch-dir {hayate_data_base}-<env_name>/hayate-ledger-dumps \
-  2>&1 | tee /tmp/hayate-resync.log
-```
+**Use the pre-expanded canonical commands from your memory file** (`epoch-validator.md`).
+For the default environment (preview), copy those commands exactly.
+For a non-default environment, substitute the env name using the path config values from memory:
+- `db-path`:        `<hayate_data_base>-<env_name>`
+- `config`:         `<config_base>/<env_name>/config.json`
+- `immutable-db`:   `<immutable_db_base>/<env_name>/chain/immutable`
+- `haskell-epoch-dir`: `<haskell_dumps_base>/cardano-<env_name>/snap-dumps`
+- `dump-epoch-dir`: `<hayate_data_base>-<env_name>/hayate-ledger-dumps`
 
 **Which flags to add:**
 - No flags (99% of cases): resumes from last saved epoch snapshot
@@ -72,12 +68,9 @@ RUST_LOG=info ./target/release/hayate-node \
 Hayate dump files are overwritten on sync — no need to delete them manually. Divergence can lag the root cause by 3+ epochs.
 
 ### 4. Compare
-```
-./target/release/compare-epoch-dumps compare \
-  --hayate {hayate_data_base}-<env_name>/hayate-ledger-dumps \
-  --haskell {haskell_dumps_base}/cardano-<env_name>/snap-dumps \
-  2>&1 | tee /tmp/comparison-result.txt
-```
+
+**Use the pre-expanded canonical compare command from your memory file.**
+For a non-default environment substitute `<env_name>` into the paths using the config values from memory.
 
 ### 5. Find divergences
 ```bash
