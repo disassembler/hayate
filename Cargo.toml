@@ -9,6 +9,10 @@ repository = "https://github.com/yourusername/hayate"
 keywords = ["cardano", "blockchain", "indexer", "utxorpc"]
 categories = ["database", "cryptography::cryptocurrencies"]
 
+[features]
+# Enable full Phase-1 + Phase-2 transaction validation (not yet implemented)
+full-validation = []
+
 [[bin]]
 name = "hayate"
 path = "src/main.rs"

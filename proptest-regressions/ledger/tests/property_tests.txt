@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 03f6d15a61a7c5fba86334a6505aaf84c1247bbb3a5bcaeb4c053688a1c9a60b # shrinks to rho = Rational { numerator: 0, denominator: 1 }, tau = Rational { numerator: 0, denominator: 1 }, treasury_initial = 0, reserves_initial = 0, fees = 1

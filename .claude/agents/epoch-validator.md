@@ -73,9 +73,9 @@ Hayate dump files are overwritten on sync — no need to delete them manually. D
 
 ### 4. Compare
 ```
-./target/release/compare-epoch-dumps \
-  {hayate_data_base}-<env_name>/hayate-ledger-dumps \
-  {haskell_dumps_base}/cardano-<env_name>/snap-dumps \
+./target/release/compare-epoch-dumps compare \
+  --hayate {hayate_data_base}-<env_name>/hayate-ledger-dumps \
+  --haskell {haskell_dumps_base}/cardano-<env_name>/snap-dumps \
   2>&1 | tee /tmp/comparison-result.txt
 ```
 

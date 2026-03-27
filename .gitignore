@@ -5,6 +5,7 @@
 # Database
 /hayate-db/
 *.db
+data*
 
 # Nix
 result
