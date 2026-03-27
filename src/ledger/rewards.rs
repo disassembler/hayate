@@ -17,10 +17,15 @@ impl LedgerState {
     /// deferred application pattern.
     pub fn apply_pending_reward_update(&mut self) {
         if let Some(rupd) = self.pending_reward_update.take() {
-            // Apply reserves decrease (monetary expansion)
-            self.reserves.0 = self.reserves.0.saturating_sub(rupd.delta_reserves);
+            // Net reserves decrease = deltaR1 - deltaR2
+            //   deltaR1 = expansion (monetary expansion drawn from reserves)
+            //   deltaR2 = undistributed (reward_pot - total_distributed, returned to reserves)
+            // Only the net amount leaves reserves permanently.
+            let net_reserves_decrease = rupd.delta_reserves.saturating_sub(rupd.undistributed);
+            self.reserves.0 = self.reserves.0.saturating_sub(net_reserves_decrease);
 
-            // Apply treasury increase (tau cut + undistributed)
+            // Treasury receives only the tau cut (deltaT1). Undistributed goes back to reserves,
+            // not to treasury.
             self.treasury.0 = self.treasury.0.saturating_add(rupd.delta_treasury);
 
             // Apply per-account rewards
@@ -56,11 +61,11 @@ impl LedgerState {
     ///
     /// Returns a `PendingRewardUpdate` that should be stored and applied at the
     /// NEXT epoch boundary, matching Haskell's RUPD timing.
-    pub fn calculate_rewards(&self, go_snapshot: &StakeSnapshot, fees: Lovelace) -> PendingRewardUpdate {
-        let rho_num = self.protocol_params.rho.numerator as i128;
-        let rho_den = self.protocol_params.rho.denominator.max(1) as i128;
-        let tau_num = self.protocol_params.tau.numerator as i128;
-        let tau_den = self.protocol_params.tau.denominator.max(1) as i128;
+    pub fn calculate_rewards(&self, go_snapshot: &StakeSnapshot, fees: Lovelace, prev_pp: &ProtocolParameters) -> PendingRewardUpdate {
+        let rho_num = prev_pp.rho.numerator as i128;
+        let rho_den = prev_pp.rho.denominator.max(1) as i128;
+        let tau_num = prev_pp.tau.numerator as i128;
+        let tau_den = prev_pp.tau.denominator.max(1) as i128;
 
         // CRITICAL: Use fees from current_epoch_fees (set by SNAP at previous epoch boundary)
         // This matches the RUPD timing where rewards use fees from the PREVIOUS epoch
@@ -85,8 +90,13 @@ impl LedgerState {
             go_snapshot.epoch.0
         );
 
-        let d_num = self.protocol_params.decentralization.numerator as i128;
-        let d_den = self.protocol_params.decentralization.denominator.max(1) as i128;
+        // CRITICAL: Use prev_epoch_decentralization for the eta d-threshold.
+        // Haskell's RUPD uses `d` from the epoch whose blocks are being measured (nesBprev's
+        // epoch), not the current epoch's `d`. When d transitions (e.g. epoch 1 d=1 → epoch 2
+        // d=0), the blocks being rewarded at epoch 2→3 come from epoch 1 (mark snapshot = epoch
+        // 1 blocks), so we must use d=1 to correctly apply eta=1 (federated phase).
+        let d_num = self.prev_epoch_decentralization.numerator as i128;
+        let d_den = self.prev_epoch_decentralization.denominator.max(1) as i128;
         let d_value = d_num as f64 / d_den as f64;
 
         // CRITICAL: Use blocks from go snapshot, not current epoch's blocks
@@ -94,7 +104,7 @@ impl LedgerState {
         let total_stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
 
         tracing::debug!(
-            "Reward calculation for epoch {}: d = {}/{} = {:.2}, stake_pool_blocks = {} (from snapshot epoch {})",
+            "Reward calculation for epoch {}: prev_epoch_d = {}/{} = {:.2}, stake_pool_blocks = {} (from snapshot epoch {})",
             self.epoch.0,
             d_num,
             d_den,
@@ -108,79 +118,38 @@ impl LedgerState {
         // When d < 0.8 (decentralized), more blocks expected from stake pools
         let d_value_f64 = d_num as f64 / d_den as f64;
         let raw_expected_blocks =
-            ((1.0 - d_value_f64) * self.protocol_params.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
+            ((1.0 - d_value_f64) * prev_pp.active_slot_coeff() * self.epoch_length as f64).floor() as u64;
         if raw_expected_blocks == 0 {
             tracing::warn!(
                 "expected_blocks rounded to 0 (active_slot_coeff={}, epoch_length={}), clamping to 1",
-                self.protocol_params.active_slot_coeff(),
+                prev_pp.active_slot_coeff(),
                 self.epoch_length
             );
         }
         let expected_blocks = raw_expected_blocks.max(1);
 
-        // Calculate eta based on decentralization parameter
+        // ∆r1 = ⌊min(1, η) · ρ · reserves⌋   (spec: Shelley RUPD)
+        // η = 1                                 when d ≥ 0.8 (federated)
+        // η = blocksMade / expected_blocks      when d < 0.8 (decentralised)
+        // min(1, η) applied via effective_blocks = min(actual, expected).
         let rho = Rat::from_i128(rho_num, rho_den);
-        let eta: f64 = if d_value >= 0.8 {
-            // Federated phase: eta = 1.0
-            1.0
+        let (eta, eta_rat) = if d_value >= 0.8 {
+            (1.0f64, Rat::from_i128(1, 1))
         } else {
-            // Decentralized phase: check if there's active stake first
-            let total_active_stake_check: u64 = go_snapshot
-                .pool_stake
-                .values()
-                .fold(0u64, |acc, s| acc.saturating_add(s.0));
-
-            if total_active_stake_check == 0 {
-                // No active stake: no expansion regardless of blocks → eta = 0
-                0.0
-            } else {
-                // Decentralized phase with active stake: eta = min(1, actual/expected)
-                let stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
-                let actual_blocks = stake_pool_blocks;
-                let effective_blocks = actual_blocks.min(expected_blocks);
-                (effective_blocks as f64) / (expected_blocks as f64)
-            }
-        };
-
-        let expansion_rat = if d_value >= 0.8 {
-            // Federated phase: eta = 1.0
+            let effective_blocks = total_stake_pool_blocks.min(expected_blocks);
             tracing::debug!(
-                "Federated phase (d={:.2}): using eta=1.0 for reward expansion",
-                d_value
+                "Decentralized phase (d={:.2}): eta={}/{} (stake_pool_blocks={}, expected={})",
+                d_value, effective_blocks, expected_blocks, total_stake_pool_blocks, expected_blocks
             );
-            rho.mul(&Rat::from_i128(self.reserves.0 as i128, 1))
-        } else {
-            // Decentralized phase
-            let total_active_stake_check: u64 = go_snapshot
-                .pool_stake
-                .values()
-                .fold(0u64, |acc, s| acc.saturating_add(s.0));
-
-            if total_active_stake_check == 0 {
-                // No active stake: no expansion regardless of blocks
-                tracing::debug!("Decentralized phase with no active stake: setting expansion=0");
-                Rat::from_i128(0, 1)
-            } else {
-                // Decentralized phase with active stake: eta = min(1, actual/expected)
-                let stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
-                let actual_blocks = stake_pool_blocks;
-                let effective_blocks = actual_blocks.min(expected_blocks);
-                tracing::debug!(
-                    "Decentralized phase (d={:.2}): using eta={}/{} for reward expansion (stake_pool_blocks={} from snapshot epoch {})",
-                    d_value,
-                    effective_blocks,
-                    expected_blocks,
-                    stake_pool_blocks,
-                    go_snapshot.epoch.0
-                );
-                rho.mul(&Rat::from_i128(self.reserves.0 as i128, 1))
-                    .mul(&Rat::from_i128(
-                        effective_blocks as i128,
-                        expected_blocks as i128,
-                    ))
-            }
+            let eta_f64 = if expected_blocks == 0 { 1.0 } else { effective_blocks as f64 / expected_blocks as f64 };
+            let eta_rat = Rat::from_i128(effective_blocks as i128, expected_blocks.max(1) as i128);
+            (eta_f64, eta_rat)
         };
-        let expansion = expansion_rat.floor_u64();
+        let expansion = eta_rat.mul(&rho).mul(&Rat::from_i128(self.reserves.0 as i128, 1)).floor_u64();
+        tracing::debug!(
+            "RUPD epoch {}: d={:.4} eta={:.6} expansion={} reserves={}",
+            self.epoch.0, d_value, eta, expansion, self.reserves.0
+        );
         let total_rewards_available = expansion + fees_for_rewards;
 
         tracing::debug!(
@@ -304,7 +273,7 @@ impl LedgerState {
         let total_blocks_for_performance = total_stake_pool_blocks.max(1);
 
         // Saturation point: z0 = 1/nOpt
-        let n_opt = self.protocol_params.n_opt.max(1);
+        let n_opt = prev_pp.n_opt.max(1);
 
         let mut total_distributed: u64 = 0;
         let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::new();
@@ -359,8 +328,8 @@ impl LedgerState {
             //   sigma' = min(sigma, z0), p' = min(p, z0)
             //   maxPool = floor(R/(1+a0) * (sigma' + p' * a0 * (sigma' - p'*(z0-sigma')/z0) / z0))
             let a0_r = Rat::from_i128(
-                self.protocol_params.a0.numerator as i128,
-                self.protocol_params.a0.denominator.max(1) as i128,
+                prev_pp.a0.numerator as i128,
+                prev_pp.a0.denominator.max(1) as i128,
             );
             let z0 = Rat::from_i128(1, n_opt as i128);
             let sigma_raw = Rat::from_i128(pool_active_stake.0 as i128, total_stake as i128);
@@ -469,7 +438,10 @@ impl LedgerState {
                             .floor_u64()
                     };
 
-                    if member_share > 0 {
+                    // Only pay members whose stake credential is registered.
+                    // Haskell's filterRewards removes unregistered credentials; unpaid
+                    // member rewards fall into undistributed and return to reserves.
+                    if member_share > 0 && self.reward_accounts.contains_key(cred_hash) {
                         *reward_map.entry(*cred_hash).or_insert(Lovelace(0)) +=
                             Lovelace(member_share);
                         total_distributed += member_share;
@@ -477,11 +449,16 @@ impl LedgerState {
                 }
             }
 
-            // Operator reward goes to pool's registered reward account
+            // Operator reward goes to pool's registered reward account.
+            // Only pay if the credential is registered (present in reward_accounts).
+            // Haskell's filterRewards step removes payouts for unregistered credentials;
+            // the unpaid amount falls into undistributed (deltaR2) and returns to reserves.
             if operator_reward > 0 {
                 let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
-                *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
-                total_distributed += operator_reward;
+                if self.reward_accounts.contains_key(&op_key) {
+                    *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
+                    total_distributed += operator_reward;
+                }
             }
         }
 
@@ -665,13 +642,21 @@ mod tests {
         // Epoch 12 reserves (from hayate 12-hayate.json)
         state.reserves = Lovelace(14_901_365_998_049_648);
 
-        let go_snapshot = make_epoch12_reward_snapshot();
-        let rupd = state.calculate_rewards(&go_snapshot, Lovelace(0));
-
-        // Per-pool reward account keys (from make_reward_acct tags)
+        // Register the pool reward account credentials so they can receive rewards.
+        // calculate_rewards filters out rewards for unregistered credentials (matching
+        // Haskell's filterRewards step), so we must register them here.
         let key_8fc7: Hash32 = { let mut k = [0xAAu8; 32]; k[28..].fill(0); k };
         let key_bf94: Hash32 = { let mut k = [0xBBu8; 32]; k[28..].fill(0); k };
         let key_d9ea: Hash32 = { let mut k = [0xCCu8; 32]; k[28..].fill(0); k };
+        {
+            let ra = std::sync::Arc::make_mut(&mut state.reward_accounts);
+            ra.insert(key_8fc7, Lovelace(0));
+            ra.insert(key_bf94, Lovelace(0));
+            ra.insert(key_d9ea, Lovelace(0));
+        }
+
+        let go_snapshot = make_epoch12_reward_snapshot();
+        let rupd = state.calculate_rewards(&go_snapshot, Lovelace(0), &state.protocol_params.clone());
 
         let r_8fc7 = rupd.rewards.get(&key_8fc7).map(|l| l.0).unwrap_or(0);
         let r_bf94 = rupd.rewards.get(&key_bf94).map(|l| l.0).unwrap_or(0);

@@ -452,6 +452,71 @@ pub struct ProtocolParamUpdate {
     pub pvt_pp_security_group: Option<Rational>,
 }
 
+impl ProtocolParamUpdate {
+    /// Format all set fields as `param: old->new` for logging.
+    /// Covers all parameters except cost models.
+    pub fn format_changes(&self, cur: &ProtocolParameters) -> String {
+        fn fmt_r(r: &Rational) -> String {
+            if r.denominator == 1 { r.numerator.to_string() }
+            else { format!("{}/{}", r.numerator, r.denominator) }
+        }
+        fn diff_u(name: &str, old: u64, new: u64, parts: &mut Vec<String>) {
+            if old != new { parts.push(format!("{}: {}→{}", name, old, new)); }
+        }
+        fn diff_r(name: &str, old: &Rational, new: &Rational, parts: &mut Vec<String>) {
+            if old != new { parts.push(format!("{}: {}→{}", name, fmt_r(old), fmt_r(new))); }
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(v) = self.min_fee_a               { diff_u("minFeeA", cur.min_fee_a, v, &mut parts); }
+        if let Some(v) = self.min_fee_b               { diff_u("minFeeB", cur.min_fee_b, v, &mut parts); }
+        if let Some(v) = self.max_block_body_size      { diff_u("maxBlockBodySize", cur.max_block_body_size, v, &mut parts); }
+        if let Some(v) = self.max_transaction_size     { diff_u("maxTxSize", cur.max_transaction_size, v, &mut parts); }
+        if let Some(v) = self.max_block_header_size    { diff_u("maxBlockHeaderSize", cur.max_block_header_size, v, &mut parts); }
+        if let Some((maj, min)) = self.protocol_version {
+            let old = format!("{}.{}", cur.protocol_version_major, cur.protocol_version_minor);
+            let new = format!("{}.{}", maj, min);
+            if old != new { parts.push(format!("protocolVersion: {}→{}", old, new)); }
+        }
+        if let Some(v) = self.key_deposit              { diff_u("keyDeposit", cur.key_deposit, v, &mut parts); }
+        if let Some(v) = self.pool_deposit             { diff_u("poolDeposit", cur.pool_deposit, v, &mut parts); }
+        if let Some(v) = self.min_pool_cost            { diff_u("minPoolCost", cur.min_pool_cost, v, &mut parts); }
+        if let Some(ref v) = self.rho                  { diff_r("rho", &cur.rho, v, &mut parts); }
+        if let Some(ref v) = self.tau                  { diff_r("tau", &cur.tau, v, &mut parts); }
+        if let Some(ref v) = self.a0                   { diff_r("a0", &cur.a0, v, &mut parts); }
+        if let Some(v) = self.n_opt                    { diff_u("nOpt", cur.n_opt, v, &mut parts); }
+        if let Some(v) = self.e_max                    { diff_u("eMax", cur.e_max, v, &mut parts); }
+        if let Some(ref v) = self.decentralization     { diff_r("d", &cur.decentralization, v, &mut parts); }
+        if let Some(v) = self.drep_deposit             { diff_u("drepDeposit", cur.drep_deposit, v, &mut parts); }
+        if let Some(v) = self.drep_activity            { diff_u("drepActivity", cur.drep_activity_period, v, &mut parts); }
+        if let Some(v) = self.gov_action_lifetime      { diff_u("govActionLifetime", cur.gov_action_lifetime, v, &mut parts); }
+        if let Some(v) = self.gov_action_deposit       { diff_u("govActionDeposit", cur.gov_action_deposit, v, &mut parts); }
+        if let Some(v) = self.committee_min_size       { diff_u("committeeMinSize", cur.committee_min_size, v, &mut parts); }
+        if let Some(v) = self.committee_max_term_length { diff_u("committeeMaxTermLength", cur.committee_max_term_length, v, &mut parts); }
+        // Conway voting thresholds — no current value available without a richer ProtocolParameters;
+        // show new value only for these since they're infrequent
+        fn show_r(name: &str, v: &Rational, parts: &mut Vec<String>) {
+            parts.push(format!("{}: ->{}",  name, fmt_r(v)));
+        }
+        if let Some(ref v) = self.min_fee_ref_script_cost_per_byte { show_r("minFeeRefScriptCostPerByte", v, &mut parts); }
+        if let Some(ref v) = self.dvt_motion_no_confidence      { show_r("dvtMotionNoConfidence", v, &mut parts); }
+        if let Some(ref v) = self.dvt_committee_normal          { show_r("dvtCommitteeNormal", v, &mut parts); }
+        if let Some(ref v) = self.dvt_committee_no_confidence   { show_r("dvtCommitteeNoConfidence", v, &mut parts); }
+        if let Some(ref v) = self.dvt_update_to_constitution    { show_r("dvtUpdateToConstitution", v, &mut parts); }
+        if let Some(ref v) = self.dvt_hard_fork_initiation      { show_r("dvtHardForkInitiation", v, &mut parts); }
+        if let Some(ref v) = self.dvt_pp_network_group          { show_r("dvtPPNetworkGroup", v, &mut parts); }
+        if let Some(ref v) = self.dvt_pp_economic_group         { show_r("dvtPPEconomicGroup", v, &mut parts); }
+        if let Some(ref v) = self.dvt_pp_technical_group        { show_r("dvtPPTechnicalGroup", v, &mut parts); }
+        if let Some(ref v) = self.dvt_pp_gov_group              { show_r("dvtPPGovGroup", v, &mut parts); }
+        if let Some(ref v) = self.dvt_treasury_withdrawal       { show_r("dvtTreasuryWithdrawal", v, &mut parts); }
+        if let Some(ref v) = self.pvt_motion_no_confidence      { show_r("pvtMotionNoConfidence", v, &mut parts); }
+        if let Some(ref v) = self.pvt_committee_normal          { show_r("pvtCommitteeNormal", v, &mut parts); }
+        if let Some(ref v) = self.pvt_committee_no_confidence   { show_r("pvtCommitteeNoConfidence", v, &mut parts); }
+        if let Some(ref v) = self.pvt_hard_fork_initiation      { show_r("pvtHardForkInitiation", v, &mut parts); }
+        if let Some(ref v) = self.pvt_pp_security_group         { show_r("pvtPPSecurityGroup", v, &mut parts); }
+        if parts.is_empty() { "(no changes)".to_string() } else { parts.join(", ") }
+    }
+}
+
 /// Constitution
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Constitution {

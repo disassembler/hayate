@@ -14,19 +14,28 @@ impl LedgerState {
     /// Process an epoch transition
     ///
     /// Follows Haskell's NEWEPOCH STS rule ordering:
-    /// 1. Apply pending reward update from the PREVIOUS epoch transition (RUPD)
-    /// 2. Compute new reward update using go snapshot -> store as pending
-    /// 3. Rotate snapshots: go = set, set = mark, mark = new
-    /// 4. Rebuild stake distribution from UTxO set
-    /// 5. Build new mark snapshot (with deposit accounting)
-    /// 6. Process retirements
-    /// 7. Expire governance proposals
-    /// 8. Mark inactive DReps
-    /// 9. Expire committee members
-    /// 10. Compute epoch nonce (TICKN rule)
-    /// 11. Reset per-epoch accumulators
+    ///  1. Apply pending reward update (applyRUpd — computed at PREVIOUS boundary)
+    ///  2. SNAP: rotate snapshots (go=set, set=mark), build new mark
+    ///  3. POOLREAP: process pool retirements
+    ///  4. ENACT: apply previously ratified governance proposals
+    ///  5. Apply queued pool re-registrations
+    ///  6. PPUP: apply pre-Conway protocol parameter updates
+    ///  7. RATIFY: ratify governance proposals
+    ///  8. Expire governance proposals
+    ///  9. Mark inactive DReps
+    /// 10. Expire committee members
+    /// 11. Snapshot DRep power distribution
+    /// 12. Compute epoch nonce (TICKN rule)
+    /// 13. createRUpd: compute new reward update -> store in pending_reward_update
+    /// 14. Reset per-epoch accumulators, advance epoch number
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
         tracing::debug!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
+
+        // Capture prevPp BEFORE propagating new epoch's params.
+        // This is the protocol parameters in effect during the epoch that just ended (epoch N
+        // at the N→N+1 transition). Used by createRUpd as the `prevPp` argument: the params
+        // under which the blocks in `self.epoch_blocks_by_pool` were produced.
+        let prev_pp = self.protocol_params.clone();
 
         // Propagate Conway curPParams → protocol_params starting from the SECOND Conway epoch.
         // At the Conway genesis epoch (e.g. 492), protocol_params stays as Babbage params so
@@ -44,137 +53,61 @@ impl LedgerState {
             }
         }
 
-        // Step 1: Calculate rewards FIRST using existing snapshots
-        // CRITICAL: Haskell's RUPD runs BEFORE SNAP, so we calculate rewards using:
-        // - Stake distribution from ssStakeGo (existing go snapshot)
-        // - Fees from current_epoch_fees (fees from the PREVIOUS epoch, set by SNAP)
-        // This matches the Haskell order: RUPD then SNAP
+        // ===================================================================
+        // Step 1: Apply the PREVIOUSLY computed reward update (deferred RUPD)
+        // ===================================================================
+        // Haskell's NEWEPOCH STS order:
+        //   1. applyRUpd (apply rewards computed at the PREVIOUS epoch boundary)
+        //   2. EPOCH sub-rule (SNAP, POOLREAP, ENACT, PPUP, RATIFY, ...)
+        //   3. createRUpd (compute new rewards for deferred application at NEXT boundary)
         //
-        // Timing of fees:
-        // - At epoch 0→1: current_epoch_fees=0 (initial), fees from epoch 0 NOT used yet
-        // - SNAP updates current_epoch_fees = fees from epoch 0
-        // - At epoch 1→2: current_epoch_fees=fees from epoch 0, used by RUPD
-        // - So fees from epoch N are used at epoch N+1→N+2
-        // CRITICAL: Use blocks from the MARK snapshot
-        // At epoch N→N+1 transition (BEFORE rotation):
-        // - Epoch N just ended, we payout rewards for blocks made in epoch N-1
-        // - The mark snapshot contains epoch N-1 data (created at end of epoch N-1)
-        // - After payout, we rotate: go←set, set←mark, create new mark
-        //
-        // The d parameter from the protocol params will handle federated vs decentralized:
-        // - d >= 0.8: eta = 1 (full expansion regardless of blocks)
-        // - d < 0.8: eta = min(1, actual_blocks / expected_blocks)
-        let blocks_for_rewards = if let Some(ref mark_snapshot) = self.snapshots.mark {
-            let mark_total_blocks: u64 = mark_snapshot.epoch_blocks_by_pool.values().sum();
-            tracing::debug!(
-                "Using blocks from mark snapshot: epoch={}, blocks={}",
-                mark_snapshot.epoch.0,
-                mark_total_blocks
-            );
-            Arc::clone(&mark_snapshot.epoch_blocks_by_pool)
-        } else {
-            tracing::debug!("No mark snapshot available, using empty blocks");
-            Arc::new(HashMap::new())
-        };
+        // The pending_reward_update was computed at the PREVIOUS epoch boundary using
+        // state from that point (correct reserves, correct reward_accounts registration).
+        // Applying it here — before SNAP and before the new RUPD computation — matches
+        // Haskell's timing exactly.
+        if let Some(rupd) = self.pending_reward_update.take() {
+            // Reserves: subtract expansion, add back undistributed rewards
+            // net = deltaR1 - deltaR2
+            self.reserves.0 = self.reserves.0.saturating_sub(rupd.delta_reserves);
+            self.reserves.0 = self.reserves.0.saturating_add(rupd.undistributed);
 
-        let fees_for_rewards = self.snapshots.current_epoch_fees;
-        let rupd = if let (Some(ref go_snapshot), Some(ref mark_snapshot)) =
-            (&self.snapshots.go, &self.snapshots.mark)
-        {
-            // Use GO snapshot for stake distribution (standard Cardano model)
-            // but MARK snapshot blocks (epoch N-1 at transition N→N+1)
-            let mut reward_snapshot = (*go_snapshot).clone();
-            reward_snapshot.epoch_blocks_by_pool = blocks_for_rewards;
-            self.calculate_rewards(&reward_snapshot, fees_for_rewards)
-        } else if let Some(ref mark_snapshot) = self.snapshots.mark {
-            // Fallback: use mark for both if go doesn't exist yet
-            let mut reward_snapshot = (*mark_snapshot).clone();
-            reward_snapshot.epoch_blocks_by_pool = blocks_for_rewards;
-            self.calculate_rewards(&reward_snapshot, fees_for_rewards)
-        } else {
-            // Early epochs before set snapshot exists: create empty snapshot with appropriate blocks
-            let empty_snapshot = super::state::StakeSnapshot {
-                epoch: self.epoch,
-                delegations: Arc::new(HashMap::new()),
-                pool_stake: HashMap::new(),
-                pool_params: Arc::clone(&self.pool_params),
-                stake_distribution: Arc::new(HashMap::new()),
-                epoch_blocks_by_pool: blocks_for_rewards,
-            };
-            self.calculate_rewards(&empty_snapshot, fees_for_rewards)
-        };
+            // Treasury: add tau cut
+            self.treasury.0 = self.treasury.0.saturating_add(rupd.delta_treasury);
 
-        // Store for debugging/comparison
-        self.last_applied_rupd = Some(rupd.clone());
-        tracing::debug!(
-            "Stored last_applied_rupd with eta={}, deltaR1={}",
-            rupd.eta,
-            rupd.delta_r1
-        );
-
-        // Apply the RUPD immediately (not deferred)
-        // Reserves: subtract expansion, add back undistributed rewards
-        self.reserves.0 = self.reserves.0.saturating_sub(rupd.delta_reserves);
-        self.reserves.0 = self.reserves.0.saturating_add(rupd.undistributed);
-
-        // Treasury: add tau cut
-        self.treasury.0 = self.treasury.0.saturating_add(rupd.delta_treasury);
-
-        // Apply per-account rewards
-        // CRITICAL: Only pay rewards to REGISTERED accounts (that already exist in reward_accounts)
-        // Rewards to unregistered accounts should go to treasury (tracked separately)
-        let mut unregistered_rewards = Lovelace(0);
-        for (cred_hash, reward) in &rupd.rewards {
-            if reward.0 > 0 {
-                // Check if account is registered
-                if Arc::make_mut(&mut self.reward_accounts).contains_key(cred_hash) {
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .get_mut(cred_hash)
-                        .unwrap() += *reward;
-                } else {
-                    // Account not registered - reward goes to treasury
-                    unregistered_rewards.0 += reward.0;
+            // Apply per-account rewards.
+            // The rewards map was already filtered at computation time (calculate_rewards
+            // only includes registered accounts).  Use unionWith(+) semantics: only credit
+            // accounts that still exist in reward_accounts (matching Haskell's applyRUpd).
+            for (cred_hash, reward) in &rupd.rewards {
+                if reward.0 > 0 {
+                    if let Some(balance) = Arc::make_mut(&mut self.reward_accounts).get_mut(cred_hash) {
+                        *balance += *reward;
+                    }
+                    // If the account was deregistered between computation and application,
+                    // the reward is silently lost (same as Haskell's Map.unionWith).
                 }
             }
-        }
 
-        // Add unregistered account rewards to treasury
-        // NOTE: Do NOT adjust reserves here. rupd.undistributed already accounts for all
-        // computed rewards (including unregistered ones), so reserves were correctly adjusted
-        // via the existing +rupd.undistributed above. Subtracting again would double-deduct.
-        if unregistered_rewards.0 > 0 {
             tracing::debug!(
-                "Unregistered account rewards going to treasury: {} lovelace",
-                unregistered_rewards.0
+                "Applied deferred RUPD (computed at previous boundary): treasury +{}, reserves -({}−{})",
+                rupd.delta_treasury,
+                rupd.delta_reserves,
+                rupd.undistributed,
             );
-            self.treasury.0 = self.treasury.0.saturating_add(unregistered_rewards.0);
+
+            // Store for debugging/comparison — this is what hayate[N].rupd shows in dumps
+            self.last_applied_rupd = Some(rupd);
+        } else {
+            // No pending RUPD (first epoch or fresh start)
+            self.last_applied_rupd = None;
         }
 
-        tracing::debug!(
-            "Applied epoch {} rewards: treasury +{}, reserves -{}",
-            self.epoch.0,
-            rupd.delta_treasury,
-            rupd.delta_reserves
-        );
-
-        // CRITICAL: Update protocol parameters for new epoch AFTER rewards are calculated
-        // Babbage era (epoch 2+) removes the decentralization parameter (d=0)
-        // This must happen AFTER reward calculation because epoch N→N+1 transition
-        // uses epoch N's parameters, not epoch N+1's parameters
-        if new_epoch.0 >= 2 && self.protocol_params.decentralization.numerator != 0 {
-            tracing::debug!(
-                "Babbage era: setting decentralization parameter d=0 (was {}/{})",
-                self.protocol_params.decentralization.numerator,
-                self.protocol_params.decentralization.denominator
-            );
-            self.protocol_params.decentralization = Rational {
-                numerator: 0,
-                denominator: 1,
-            };
-        }
-
-        // Step 2: NOW rotate snapshots (AFTER reward calculation, matching Haskell SNAP rule)
-        // This happens AFTER RUPD in Haskell's NEWEPOCH rule
+        // ===================================================================
+        // Step 2: SNAP — rotate snapshots (AFTER RUPD application)
+        // ===================================================================
+        // After applying rewards, reward_accounts reflects the new balances.
+        // The mark snapshot built below includes these updated reward balances,
+        // matching Haskell's SNAP which runs after applyRUpd.
         self.snapshots.go = self.snapshots.set.take();
         self.snapshots.set = self.snapshots.mark.take();
 
@@ -374,14 +307,13 @@ impl LedgerState {
 
         // Step 6: Apply pre-Conway protocol parameter updates (PPUP rule)
         //
-        // Proposals submitted in epoch N carry CBOR epoch=N in their Update field.
-        // Haskell applies them two transitions later: the proposals from epoch N are
-        // enacted at (N+1)→(N+2), producing epoch N+2 state.
+        // Proposals submitted in epoch N carry CBOR target_epoch=N in their Update field.
+        // They take effect at the N→(N+1) boundary, producing epoch N+1 state.
         //
         // Concretely: at transition old→new (self.epoch=old, new_epoch=new),
-        // we apply proposals with key = old - 1.  Example: at 2→3, apply epoch-1
-        // proposals → epoch 3 gets nOpt=500.
-        let ppup_key = EpochNo(self.epoch.0.saturating_sub(1));
+        // apply proposals with key = old.  Example: at 1→2, apply epoch-1
+        // proposals (target_epoch=1) → epoch 2 gets d=0.
+        let ppup_key = self.epoch;
         if let Some(proposals) = self.pending_pp_updates.remove(&ppup_key) {
             let quorum = self.update_quorum;
             let n_proposals = proposals.len() as u64;
@@ -414,23 +346,21 @@ impl LedgerState {
                     if merged.e_max.is_none() { merged.e_max = update.e_max; }
                     if merged.decentralization.is_none() { merged.decentralization = update.decentralization; }
                 }
+                let changes = merged.format_changes(&self.protocol_params);
                 if let Err(e) = self.apply_protocol_param_update(&merged) {
-                    tracing::warn!(epoch = new_epoch.0, error = %e, "Failed to apply protocol parameter update");
+                    tracing::warn!(epoch = new_epoch.0, error = %e, "PPUP: failed to apply protocol parameter update");
                 } else {
-                    tracing::debug!(
-                        epoch = new_epoch.0,
-                        n_opt = ?merged.n_opt,
-                        rho = ?merged.rho,
-                        tau = ?merged.tau,
-                        "Applied pre-Conway protocol parameter update"
-                    );
+                    self.ppup_enacted_log = Some(format!(
+                        "PPUP: enacted protocol parameter update epoch={} changes=\"{}\"",
+                        new_epoch.0, changes
+                    ));
                 }
             } else {
-                tracing::debug!(
+                tracing::info!(
                     epoch = new_epoch.0,
                     n_proposals,
                     quorum,
-                    "Not enough proposals for quorum, skipping protocol parameter update"
+                    "PPUP: not enough proposals for quorum, discarding"
                 );
             }
         }
@@ -439,6 +369,12 @@ impl LedgerState {
         // (they will be applied at (self.epoch+1) → (self.epoch+2)).
         self.pending_pp_updates
             .retain(|epoch, _| epoch.0 >= self.epoch.0);
+
+        // Record the current epoch's d for use in this epoch's createRUpd (step 13).
+        // The RUPD uses blocks from self.epoch_blocks_by_pool (epoch N blocks), so eta's
+        // d-threshold must use epoch N's d.  prev_pp.decentralization = epoch N's d (captured
+        // before PPUP changed it to epoch N+1's d).
+        self.prev_epoch_decentralization = prev_pp.decentralization;
 
         // Step 8: Ratify governance proposals per CIP-1694.
         // Only active in Conway era (protocol_version_major >= 9).
@@ -570,7 +506,65 @@ impl LedgerState {
         // Step 12: Compute new epoch nonce per Haskell TICKN rule
         self.compute_epoch_nonce();
 
-        // Step 13: Reset per-epoch accumulators
+        // ===================================================================
+        // Step 13: createRUpd — compute new reward update for DEFERRED application
+        // ===================================================================
+        // Matches Haskell's createRUpd / setFreshDRepPulsingState timing.
+        // This RUPD will be stored in pending_reward_update and applied at the
+        // NEXT epoch boundary (step 1 of the next process_epoch_transition call).
+        //
+        // Inputs:
+        //   blocks     = self.epoch_blocks_by_pool (epoch N blocks, the epoch that just ended)
+        //   go_snapshot = self.snapshots.go (post-SNAP rotation; = old set)
+        //   reserves   = self.reserves (after applying previous RUPD and POOLREAP)
+        //   reward_accounts = current registration state at this boundary
+        //   prevPp     = prev_pp (epoch N's params, captured before Conway propagation + PPUP)
+        //   feeSS      = self.snapshots.current_epoch_fees (set during SNAP above)
+        //
+        // Using self.epoch_blocks_by_pool matches Haskell's nesBprev assignment:
+        //   nesBprev := nesBcur  (blocks from the epoch that just completed)
+        let blocks_for_rewards = Arc::clone(&self.epoch_blocks_by_pool);
+        let fees_for_rewards = self.snapshots.current_epoch_fees;
+
+        tracing::debug!(
+            "createRUpd: epoch={}, blocks={}, fees={}, reserves={}, go_snapshot={}",
+            self.epoch.0,
+            blocks_for_rewards.values().sum::<u64>(),
+            fees_for_rewards.0,
+            self.reserves.0,
+            self.snapshots.go.as_ref().map(|g| g.epoch.0.to_string()).unwrap_or_else(|| "none".to_string()),
+        );
+
+        let new_rupd = if let Some(ref go_snapshot) = self.snapshots.go {
+            // Standard case: use go snapshot for stake distribution, current epoch's blocks
+            let mut reward_snapshot = (*go_snapshot).clone();
+            reward_snapshot.epoch_blocks_by_pool = blocks_for_rewards;
+            self.calculate_rewards(&reward_snapshot, fees_for_rewards, &prev_pp)
+        } else {
+            // Early epochs before go snapshot exists: create empty snapshot
+            let empty_snapshot = super::state::StakeSnapshot {
+                epoch: self.epoch,
+                delegations: Arc::new(HashMap::new()),
+                pool_stake: HashMap::new(),
+                pool_params: Arc::clone(&self.pool_params),
+                stake_distribution: Arc::new(HashMap::new()),
+                epoch_blocks_by_pool: blocks_for_rewards,
+            };
+            self.calculate_rewards(&empty_snapshot, fees_for_rewards, &prev_pp)
+        };
+
+        tracing::debug!(
+            "createRUpd result: deltaR1={}, deltaT1={}, totalDistributed={}, deltaR2={}, rewards={}",
+            new_rupd.delta_r1,
+            new_rupd.delta_t1,
+            new_rupd.total_distributed,
+            new_rupd.undistributed,
+            new_rupd.rewards.len(),
+        );
+
+        self.pending_reward_update = Some(new_rupd);
+
+        // Step 14: Reset per-epoch accumulators
         self.epoch_fees = Lovelace(0);
         Arc::make_mut(&mut self.epoch_blocks_by_pool).clear();
         self.epoch_block_count = 0;
@@ -870,7 +864,11 @@ impl LedgerState {
         let total_deposits =
             total_pool_deposits + total_stake_deposits + total_governance_deposits + total_drep_deposits;
 
-        // Include RUPD intermediate values for comparison with Haskell
+        // Include RUPD intermediate values for comparison with Haskell.
+        // `rupd` = the RUPD that was applied at this epoch boundary (computed at the previous
+        //          epoch boundary).  Comparison: haskell[N-1].rupdNext == hayate[N].rupd
+        // `rupdNext` = the RUPD computed at this epoch boundary, to be applied at the next.
+        //              Comparison: haskell[N].rupdNext == hayate[N].rupdNext
         let rupd_values = if let Some(rupd) = &self.last_applied_rupd {
             tracing::debug!("Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
             json!({
@@ -887,6 +885,20 @@ impl LedgerState {
                 "last_applied_rupd is None when dumping epoch {}",
                 self.epoch.0
             );
+            json!(null)
+        };
+
+        let rupd_next_values = if let Some(rupd) = &self.pending_reward_update {
+            json!({
+                "eta": rupd.eta,
+                "deltaR1": rupd.delta_r1,
+                "rPot": rupd.r_pot,
+                "deltaT1": rupd.delta_t1,
+                "rewardPot": rupd.reward_pot_after_treasury,
+                "totalDistributed": rupd.total_distributed,
+                "deltaR2": rupd.undistributed,
+            })
+        } else {
             json!(null)
         };
 
@@ -1153,6 +1165,7 @@ impl LedgerState {
                 "total": total_deposits,
             },
             "rupd": rupd_values,
+            "rupdNext": rupd_next_values,
             "snapshots": {
                 "mark": format_snapshot("mark", &self.snapshots.mark),
                 "set": format_snapshot("set", &self.snapshots.set),

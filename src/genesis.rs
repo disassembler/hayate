@@ -67,9 +67,15 @@ pub struct ByronProtocolConsts {
     pub protocol_magic: u64,
 }
 
-/// A genesis UTxO entry (address bytes + lovelace amount)
+/// A genesis UTxO entry with a computed TxId for LSM insertion.
+///
+/// The TxId follows the Haskell `fromTxOut` formula:
+///   `TxId = Blake2b-256(CBOR(ByronAddress))`
+/// Output index is always 0.
 #[derive(Debug, Clone)]
 pub struct GenesisUtxoEntry {
+    /// 32-byte Blake2b-256 hash used as the transaction ID for this genesis UTxO.
+    pub txid: [u8; 32],
     pub address: Vec<u8>,
     pub lovelace: u64,
 }
@@ -124,47 +130,38 @@ impl ByronGenesis {
 
     /// Extract the initial UTxO set from both nonAvvmBalances and avvmDistr.
     ///
-    /// Returns decoded address bytes and lovelace amounts for all non-zero balances.
-    pub fn initial_utxos(&self) -> Vec<GenesisUtxoEntry> {
-        let mut entries = Vec::new();
-
-        // Process nonAvvmBalances (base58 Byron addresses)
-        for (addr_str, lovelace_str) in &self.non_avvm_balances {
-            let lovelace: u64 = match lovelace_str.parse() {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if lovelace == 0 {
-                continue;
+    /// Delegates to `pallas_configs::byron::genesis_utxos` which correctly
+    /// computes each entry's TxId as `Blake2b-256(CBOR(ByronAddress))` — the
+    /// same formula used by Byron transactions that spend a genesis output.
+    /// Output index is always 0.
+    ///
+    /// Requires the raw genesis JSON path so pallas can load its own GenesisFile.
+    pub fn initial_utxos_from_path(path: &std::path::Path) -> Vec<GenesisUtxoEntry> {
+        let config = match pallas_configs::byron::from_file(path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!("pallas could not load Byron genesis for UTxO seeding: {}", e);
+                return Vec::new();
             }
+        };
 
-            // Decode base58 Byron address
-            match bs58::decode(addr_str).into_vec() {
-                Ok(addr_bytes) => {
-                    entries.push(GenesisUtxoEntry {
-                        address: addr_bytes,
-                        lovelace,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to decode Byron genesis address {}: {}",
-                        &addr_str[..40.min(addr_str.len())],
-                        e
-                    );
-                }
-            }
-        }
+        let utxos = pallas_configs::byron::genesis_utxos(&config);
+        let n_avvm = config.avvm_distr.len();
+        let n_non_avvm = config.non_avvm_balances.len();
 
-        // Process AVVM distribution (base64 Ed25519 public keys)
-        // For simplicity, we'll skip AVVM entries as SanchoNet doesn't use them
-        // Production implementation would convert these to Byron redeem addresses
+        let entries: Vec<GenesisUtxoEntry> = utxos
+            .into_iter()
+            .map(|(txid, addr, lovelace)| {
+                let txid: [u8; 32] = *txid;
+                let address = addr.to_vec();
+                GenesisUtxoEntry { txid, address, lovelace }
+            })
+            .collect();
 
         tracing::info!(
-            "Extracted {} genesis UTxO entries from Byron genesis",
-            entries.len()
+            "Extracted {} genesis UTxO entries ({} non-AVVM, {} AVVM) from Byron genesis",
+            entries.len(), n_non_avvm, n_avvm
         );
-
         entries
     }
 

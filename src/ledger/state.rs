@@ -45,12 +45,18 @@ pub struct LedgerState {
     pub epoch: EpochNo,
     /// Shelley epoch length in slots
     pub epoch_length: u64,
-    /// Number of Byron epochs before Shelley hard fork
+    /// Number of Byron epochs before Shelley hard fork.
+    /// `u64::MAX` is the sentinel meaning "Byron ongoing, HF proposal not yet seen".
     #[serde(default)]
     pub shelley_transition_epoch: u64,
     /// Byron epoch length in slots (10 * k)
     #[serde(default)]
     pub byron_epoch_length: u64,
+    /// True when this chain has a Byron era (mainnet, preprod).
+    /// Old snapshots lacking this field deserialise to `false`, preserving
+    /// existing sanchonet / preview behaviour unchanged.
+    #[serde(default)]
+    pub has_byron: bool,
 
     /// Current protocol parameters
     pub protocol_params: ProtocolParameters,
@@ -161,6 +167,10 @@ pub struct LedgerState {
     #[serde(default)]
     pub last_applied_rupd: Option<PendingRewardUpdate>,
 
+    /// PPUP enacted message to emit after epoch summary lines (set by epoch.rs, consumed by main.rs)
+    #[serde(skip)]
+    pub ppup_enacted_log: Option<String>,
+
     // ===== Script credentials =====
 
     /// Script-type stake credentials (for N2C queries)
@@ -184,19 +194,35 @@ pub struct LedgerState {
     /// - ENACT at epoch N+1 (after the mark snapshot) applies actions and returns deposits
     #[serde(default)]
     pub pending_enactments: Vec<PendingEnactment>,
+
+    /// The decentralization parameter (d) from the PREVIOUS epoch.
+    ///
+    /// Haskell's RUPD computes eta using `d` from the epoch whose blocks are being measured
+    /// (`nesBprev`'s epoch), not the current epoch's `d`. When d changes (e.g. epoch 1 d=1
+    /// → epoch 2 d=0), the eta d-threshold must use the OLD value (d=1) to correctly classify
+    /// federated blocks as eta=1, not d=0 which would give eta=0.
+    ///
+    /// Default is 1/1 (fully federated), appropriate for chain start.
+    #[serde(default = "default_prev_epoch_decentralization")]
+    pub prev_epoch_decentralization: Rational,
 }
 
 fn default_update_quorum() -> u64 {
     5 // Mainnet default: 5 out of 7 genesis delegates
 }
 
+fn default_prev_epoch_decentralization() -> Rational {
+    Rational { numerator: 1, denominator: 1 }
+}
+
 impl LedgerState {
     pub fn new(params: ProtocolParameters) -> Self {
         LedgerState {
             epoch: EpochNo(0),
-            epoch_length: 432000,          // mainnet default
-            shelley_transition_epoch: 208, // mainnet default
-            byron_epoch_length: 21600,     // mainnet default (10 * 2160)
+            epoch_length: 432000,
+            shelley_transition_epoch: 0,
+            byron_epoch_length: 0,
+            has_byron: false,
             protocol_params: params,
             stake_distribution: StakeDistributionState::default(),
             treasury: Lovelace(0),
@@ -228,6 +254,8 @@ impl LedgerState {
             prev_protocol_params: None,
             conway_genesis_epoch: None,
             pending_enactments: Vec::new(),
+            ppup_enacted_log: None,
+            prev_epoch_decentralization: default_prev_epoch_decentralization(),
         }
     }
 
@@ -269,6 +297,71 @@ impl LedgerState {
     pub fn set_shelley_transition(&mut self, epoch: u64, byron_epoch_length: u64) {
         self.shelley_transition_epoch = epoch;
         self.byron_epoch_length = byron_epoch_length;
+    }
+
+    /// Convert an absolute slot to its epoch number, honouring the Byron/Shelley
+    /// hard-fork boundary.
+    ///
+    /// | `has_byron` | `shelley_transition_epoch` | behaviour |
+    /// |-------------|---------------------------|-----------|
+    /// | `false`     | (any)                     | pure Shelley: `slot / epoch_length` |
+    /// | `true`      | `u64::MAX` (sentinel)     | still in Byron: `slot / byron_epoch_length` |
+    /// | `true`      | `n`                       | HFC: Byron for slots < n*byron_epoch_length, Shelley after |
+    pub fn epoch_of_slot(&self, slot: u64) -> u64 {
+        match (self.has_byron, self.shelley_transition_epoch) {
+            (false, _) => slot / self.epoch_length.max(1),
+            (true, u64::MAX) => slot / self.byron_epoch_length.max(1),
+            (true, n) => {
+                let byron_slots = self.byron_epoch_length.saturating_mul(n);
+                if slot < byron_slots {
+                    slot / self.byron_epoch_length.max(1)
+                } else {
+                    n.saturating_add((slot - byron_slots) / self.epoch_length.max(1))
+                }
+            }
+        }
+    }
+
+    /// Returns `(slot_offset_within_epoch, epoch_length)` for display purposes.
+    pub fn slot_within_epoch(&self, slot: u64) -> (u64, u64) {
+        match (self.has_byron, self.shelley_transition_epoch) {
+            (false, _) => {
+                let len = self.epoch_length.max(1);
+                (slot % len, len)
+            }
+            (true, u64::MAX) => {
+                let len = self.byron_epoch_length.max(1);
+                (slot % len, len)
+            }
+            (true, n) => {
+                let byron_slots = self.byron_epoch_length.saturating_mul(n);
+                if slot < byron_slots {
+                    let len = self.byron_epoch_length.max(1);
+                    (slot % len, len)
+                } else {
+                    let len = self.epoch_length.max(1);
+                    ((slot - byron_slots) % len, len)
+                }
+            }
+        }
+    }
+
+    /// Returns `true` when the given epoch is Shelley or later (i.e. the Shelley
+    /// hard fork has occurred and `process_epoch_transition` should run).
+    pub fn is_shelley_plus_epoch(&self, epoch: u64) -> bool {
+        match (self.has_byron, self.shelley_transition_epoch) {
+            (false, _) => true,
+            (true, u64::MAX) => false,
+            (true, n) => epoch >= n,
+        }
+    }
+
+    /// Record that a Shelley hard-fork update proposal (version 2.0.0) was seen
+    /// on-chain.  Only acts when the transition epoch is still the sentinel.
+    pub fn record_shelley_hf_proposal(&mut self, proposal_epoch: u64) {
+        if self.has_byron && self.shelley_transition_epoch == u64::MAX {
+            self.shelley_transition_epoch = proposal_epoch + 1;
+        }
     }
 
     /// Set update quorum from Shelley genesis

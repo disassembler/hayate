@@ -718,6 +718,7 @@ impl LedgerState {
     /// (same snapshot used for individual pool voting power) to keep the
     /// ratio consistent. Haskell uses `ssStakeMarkPoolDistr` for both the
     /// numerator (per-pool power) and this denominator.
+    #[allow(dead_code)]
     fn compute_total_spo_stake(&self) -> u64 {
         // Use "mark" snapshot if available (current epoch), else fall back.
         if let Some(ref snapshot) = self.snapshots.mark {
@@ -905,6 +906,17 @@ impl LedgerState {
         if let Some((major, minor)) = update.protocol_version {
             self.protocol_params.protocol_version_major = major;
             self.protocol_params.protocol_version_minor = minor;
+            // Babbage hard fork (6→7): d is removed from the protocol parameter type.
+            // If d is still non-zero when Babbage takes effect, force it to 0.
+            if major >= 7 && self.protocol_params.decentralization.numerator != 0 {
+                tracing::info!(
+                    "Babbage HF (protocol version {}→{}.{}): forcing d=0 (was {}/{})",
+                    major - 1, major, minor,
+                    self.protocol_params.decentralization.numerator,
+                    self.protocol_params.decentralization.denominator
+                );
+                self.protocol_params.decentralization = Rational { numerator: 0, denominator: 1 };
+            }
         }
         // Economic group
         if let Some(v) = update.key_deposit { self.protocol_params.key_deposit = v; }

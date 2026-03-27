@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use anyhow::{Result, Context};
 
 // Import from lib
-use hayate::node::storage::{NodeStorage, UtxoEntry, slot_to_epoch};
+use hayate::node::storage::{NodeStorage, UtxoEntry};
 use hayate::indexer::Network;
 use hayate::chain_sync::HayateSync;
 use hayate::ledger::{
@@ -91,13 +91,13 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("hayate_node=info".parse()?)
-                .add_directive("hayate=info".parse()?)
-        )
-        .init();
+    // RUST_LOG overrides the defaults; if unset, fall back to info for both crates.
+    let env_filter = std::env::var("RUST_LOG")
+        .map(|_| tracing_subscriber::EnvFilter::from_default_env())
+        .unwrap_or_else(|_| {
+            tracing_subscriber::EnvFilter::new("hayate_node=info,hayate=info")
+        });
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
 
@@ -168,6 +168,9 @@ async fn main() -> Result<()> {
                 None => {
                     info!("🆕 No epoch snapshot found, initializing from genesis");
                     let result = load_genesis_and_init_ledger(args.config.as_ref(), &network)?;
+                    // Seed genesis UTxOs into the LSM tree (fresh run only).
+                    // This must happen after storage is open but before any blocks are processed.
+                    seed_genesis_utxos_into_storage(args.config.as_ref(), &mut storage)?;
                     (result, Point::Origin, None)
                 }
             }
@@ -177,6 +180,7 @@ async fn main() -> Result<()> {
     let mut blocks_processed = 0u64;
     let mut current_epoch = ledger_state.epoch.0;
     let mut epoch_tx_count: u64 = 0;
+    let mut epoch_update_proposals: Vec<(u16, u16, u8)> = Vec::new();
 
     // Track the last block processed. At epoch transitions, last_slot/last_hash hold
     // the slot and hash of the final block of the ending epoch — these are the correct
@@ -218,12 +222,12 @@ async fn main() -> Result<()> {
                 &mut storage,
                 &mut ledger_state,
                 &conway_genesis,
-                &network,
                 args.dump_epoch_dir.as_deref(),
                 args.haskell_epoch_dir.as_deref(),
                 &mut rolling_nonce,
                 &mut current_epoch,
                 &mut epoch_tx_count,
+                &mut epoch_update_proposals,
                 &mut last_slot,
                 &mut last_hash,
                 &mut blocks_processed,
@@ -292,12 +296,12 @@ async fn main() -> Result<()> {
                     &mut storage,
                     &mut ledger_state,
                     &conway_genesis,
-                    &network,
                     args.dump_epoch_dir.as_deref(),
                     args.haskell_epoch_dir.as_deref(),
                     &mut rolling_nonce,
                     &mut current_epoch,
                     &mut epoch_tx_count,
+                    &mut epoch_update_proposals,
                     &mut last_slot,
                     &mut last_hash,
                     &mut blocks_processed,
@@ -326,20 +330,30 @@ async fn process_block_bytes(
     storage: &mut NodeStorage,
     ledger_state: &mut LedgerState,
     conway_genesis: &Option<ConwayGenesis>,
-    network: &Network,
     dump_epoch_dir: Option<&std::path::Path>,
     haskell_epoch_dir: Option<&std::path::Path>,
     rolling_nonce: &mut Option<Hash<32>>,
     current_epoch: &mut u64,
     epoch_tx_count: &mut u64,
+    epoch_update_proposals: &mut Vec<(u16, u16, u8)>,
     last_slot: &mut u64,
     last_hash: &mut [u8; 32],
     blocks_processed: &mut u64,
 ) {
     match parse_block_with_nonce(block_bytes) {
-        Ok((slot, block_hash, tx_count, vrf_output_opt, is_conway_block)) => {
+        Ok(parsed) => {
+            // EBBs carry no transactions, no VRF, and are not chain-sync resume
+            // points — skip all ledger work.
+            if parsed.is_ebb {
+                return;
+            }
+
+            let slot = parsed.slot;
+            let block_hash = parsed.hash;
+            let tx_count = parsed.tx_count;
+
             // Update rolling nonce if VRF is present
-            if let Some(vrf_output) = vrf_output_opt {
+            if let Some(vrf_output) = parsed.vrf_output {
                 if vrf_output.len() >= 32 {
                     match rolling_nonce {
                         Some(prev_nonce) => {
@@ -356,15 +370,25 @@ async fn process_block_bytes(
                 }
             }
 
+            // Accumulate Byron update proposals and detect the Shelley HF proposal.
+            if let Some(bv) = parsed.byron_update {
+                epoch_update_proposals.push(bv);
+                if bv == (2, 0, 0) {
+                    ledger_state.record_shelley_hf_proposal(*current_epoch);
+                    info!("🔀 Shelley HF update proposal seen in epoch {} — \
+                           transition at epoch {}", *current_epoch, *current_epoch + 1);
+                }
+            }
+
             // Check for epoch transition BEFORE processing the block.
             // This ensures the mark snapshot captures only the previous epoch's
             // blocks. If the block were counted first, the snapshot would include
             // the first block of the new epoch — causing a 1-block misattribution.
-            let epoch = slot_to_epoch(slot, network);
+            let epoch = ledger_state.epoch_of_slot(slot);
 
             // Detect first Conway block and apply Conway genesis BEFORE the epoch
             // transition. This ensures the epoch dump shows Conway state.
-            if is_conway_block && ledger_state.conway_genesis_epoch.is_none() {
+            if parsed.is_conway && ledger_state.conway_genesis_epoch.is_none() {
                 if let Some(ref cg) = conway_genesis {
                     ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
                     info!("🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
@@ -375,67 +399,121 @@ async fn process_block_bytes(
 
             // When we transition to a new epoch, snapshot the previous epoch
             if epoch > *current_epoch {
-                let era = era_name(ledger_state.protocol_params.protocol_version_major);
-                let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
+                if ledger_state.is_shelley_plus_epoch(epoch) {
+                    let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
+                    let old_era = era_name(ledger_state.protocol_params.protocol_version_major);
 
-                // Capture enactments before process_epoch_transition consumes them
-                let pending_enactments: Vec<_> = ledger_state.pending_enactments
-                    .iter()
-                    .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
-                    .collect();
+                    // Capture enactments before process_epoch_transition consumes them
+                    let pending_enactments: Vec<_> = ledger_state.pending_enactments
+                        .iter()
+                        .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
+                        .collect();
 
-                // 1. Rebuild stake distribution from UTxO set
-                if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
-                    error!("Failed to rebuild stake distribution: {}", e);
-                }
-
-                // 2. Process epoch transition in ledger state
-                ledger_state.process_epoch_transition(EpochNo(epoch));
-
-                // 2a. Dump epoch state to JSON for comparison with Haskell
-                if let Some(dump_dir) = dump_epoch_dir {
-                    if let Err(e) = ledger_state.dump_epoch_state(dump_dir, slot) {
-                        error!("Failed to dump epoch state: {}", e);
+                    // 1. Rebuild stake distribution from UTxO set
+                    if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
+                        error!("Failed to rebuild stake distribution: {}", e);
                     }
 
-                    // Mismatch detection: compare against Haskell reference if provided
-                    if let Some(haskell_dir) = haskell_epoch_dir {
-                        let epoch_num = ledger_state.epoch.0;
-                        let hayate_dump = dump_dir.join(format!("{}-hayate.json", epoch_num));
-                        if let Some(haskell_dump) = find_haskell_dump(haskell_dir, epoch_num) {
-                            match compare_epoch_dumps(&hayate_dump, &haskell_dump, haskell_dir, epoch_num) {
-                                Ok(true) => debug!("Epoch {} matches Haskell reference", epoch_num),
-                                Ok(false) => {
-                                    error!("EPOCH {} DIVERGED", epoch_num);
-                                    std::process::exit(1);
+                    // 1a. At the Byron→Shelley boundary, recalibrate reserves from the
+                    // actual UTxO total.  Our genesis seed used the initial lovelace
+                    // allocation; Byron fees reduce the UTxO set, so reserves must be
+                    // recomputed as (maxLovelaceSupply - totalUTxOValue).
+                    if !ledger_state.is_shelley_plus_epoch(*current_epoch) {
+                        if let Err(e) = ledger_state.recalibrate_reserves_from_utxo_tree(&storage.utxo_tree) {
+                            error!("Failed to recalibrate reserves at Shelley HF: {}", e);
+                        }
+                    }
+
+                    // 2. Process epoch transition in ledger state
+                    ledger_state.process_epoch_transition(EpochNo(epoch));
+
+                    // 2a. Dump epoch state to JSON for comparison with Haskell
+                    if let Some(dump_dir) = dump_epoch_dir {
+                        if let Err(e) = ledger_state.dump_epoch_state(dump_dir, slot) {
+                            error!("Failed to dump epoch state: {}", e);
+                        }
+
+                        // Mismatch detection: compare against Haskell reference if provided
+                        if let Some(haskell_dir) = haskell_epoch_dir {
+                            let epoch_num = ledger_state.epoch.0;
+                            let hayate_dump = dump_dir.join(format!("{}-hayate.json", epoch_num));
+                            if let Some(haskell_dump) = find_haskell_dump(haskell_dir, epoch_num) {
+                                match compare_epoch_dumps(&hayate_dump, &haskell_dump, haskell_dir, epoch_num) {
+                                    Ok(true) => debug!("Epoch {} matches Haskell reference", epoch_num),
+                                    Ok(false) => {
+                                        error!("EPOCH {} DIVERGED", epoch_num);
+                                        std::process::exit(1);
+                                    }
+                                    Err(e) => warn!("Could not compare epoch {} dumps: {}", epoch_num, e),
                                 }
-                                Err(e) => warn!("Could not compare epoch {} dumps: {}", epoch_num, e),
                             }
                         }
                     }
+
+                    // Two-line epoch boundary log:
+                    //   Line 1: summary of the epoch that just ended (fees, txs)
+                    //   Line 2: opening state of the new epoch (treasury, reserves, rewards)
+                    let new_era = era_name(ledger_state.protocol_params.protocol_version_major);
+                    let treasury_ada = ledger_state.treasury.0 / 1_000_000;
+                    let reserves_ada = ledger_state.reserves.0 / 1_000_000;
+                    let rewards_ada = ledger_state.last_applied_rupd
+                        .as_ref()
+                        .map(|r| r.total_distributed / 1_000_000)
+                        .unwrap_or(0);
+                    if ledger_state.is_shelley_plus_epoch(*current_epoch) {
+                        info!(
+                            "Epoch {} ({}) ended  txs: {}  fees: {} ADA",
+                            current_epoch, old_era, epoch_tx_count, epoch_fees_ada
+                        );
+                    } else {
+                        info!(
+                            "Epoch {} (Byron) ended  txs: {}",
+                            current_epoch, epoch_tx_count
+                        );
+                    }
+                    for desc in &pending_enactments {
+                        info!("  enacted: {desc}");
+                    }
+                    info!(
+                        "Epoch {} ({}) treasury={} ADA  reserves={} ADA  rewards={} ADA",
+                        epoch, new_era, treasury_ada, reserves_ada, rewards_ada
+                    );
+                    if let Some(msg) = ledger_state.ppup_enacted_log.take() {
+                        info!("{}", msg);
+                    }
+                } else {
+                    // Byron epoch summary — no ledger transition, just log.
+                    // Use `epoch - 1` (the epoch that just ended) for the label,
+                    // which is correct regardless of what current_epoch holds on
+                    // resume from an old Byron snapshot.
+                    info!("Epoch {} (Byron) slot={}  txs: {}", epoch.saturating_sub(1), slot, epoch_tx_count);
+                    for &(mj, mn, pat) in epoch_update_proposals.iter() {
+                        if (mj, mn, pat) == (2, 0, 0) {
+                            info!("  Update proposal: Shelley HF ({}.{}.{})", mj, mn, pat);
+                        } else {
+                            info!("  Update proposal: noop ({}.{}.{})", mj, mn, pat);
+                        }
+                    }
+                    // Keep ledger_state.epoch in sync so that restore gives the
+                    // right current_epoch without needing process_epoch_transition.
+                    ledger_state.epoch = EpochNo(epoch);
                 }
 
-                // 3. Save epoch snapshot (UTxO hard-links + bincode file).
+                // Save epoch snapshot (UTxO hard-links + bincode file).
                 // last_slot/last_hash = final block of the ending epoch
                 // (the current block hasn't been processed yet at this point).
                 if let Err(e) = storage.save_epoch_snapshot(epoch, *last_slot, *last_hash, ledger_state) {
                     error!("Failed to save epoch {} snapshot: {}", epoch, e);
                 }
 
-                info!(
-                    "Epoch {} ({}) slot={}  txs: {}  fees: {} ADA",
-                    current_epoch, era, slot, epoch_tx_count, epoch_fees_ada
-                );
-                for desc in &pending_enactments {
-                    info!("  enacted: {desc}");
-                }
-
                 *epoch_tx_count = 0;
+                epoch_update_proposals.clear();
                 *current_epoch = epoch;
             }
 
             // Process block AFTER epoch transition so the first block of a new
             // epoch is counted towards the new epoch, not the previous one.
+            // Byron regular blocks are also processed here to track UTxOs.
             if let Err(e) = process_block_simple(storage, ledger_state, slot, &block_hash, block_bytes).await {
                 error!("Error processing block at slot {}: {}", slot, e);
                 return;
@@ -444,16 +522,14 @@ async fn process_block_bytes(
             *blocks_processed += 1;
             *epoch_tx_count += tx_count as u64;
 
+            let (slot_off, epoch_len) = ledger_state.slot_within_epoch(slot);
+            debug!("block slot={} ({}/{}) epoch={} txs={}", slot, slot_off, epoch_len, epoch, tx_count);
+
             // Track last processed block for epoch snapshot resume point.
             *last_slot = slot;
             let n = block_hash.len().min(32);
             last_hash[..n].copy_from_slice(&block_hash[..n]);
 
-            // Log progress
-            if *blocks_processed % 1000 == 0 {
-                debug!("Processed {} blocks, slot: {}, epoch: {}",
-                    blocks_processed, slot, epoch);
-            }
         }
         Err(e) => {
             error!("Failed to parse block: {}", e);
@@ -733,20 +809,43 @@ fn compare_epoch_dumps(
     Ok(criticals.is_empty())
 }
 
-/// Parse block and extract VRF nonce for epoch nonce calculation.
-/// Returns (slot, hash, tx_count, vrf_output, is_conway).
-fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Option<Vec<u8>>, bool)> {
+struct ParsedBlock {
+    slot:         u64,
+    hash:         Vec<u8>,
+    tx_count:     usize,
+    vrf_output:   Option<Vec<u8>>,
+    is_conway:    bool,
+    /// True for Byron Epoch Boundary Blocks (EBBs) — no txs, no VRF, skip ledger work.
+    is_ebb:       bool,
+    /// Proposed block version from a Byron update proposal, if present.
+    byron_update: Option<(u16, u16, u8)>,
+}
+
+/// Parse a raw block and extract fields needed by the processing pipeline.
+fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<ParsedBlock> {
     use pallas_traverse::MultiEraBlock;
 
     let block = MultiEraBlock::decode(block_bytes)
         .map_err(|e| anyhow::anyhow!("Failed to decode block: {}", e))?;
 
+    // Epoch Boundary Blocks carry no transactions, no VRF, and are not
+    // meaningful resume points — return early with a sentinel.
+    if matches!(block, MultiEraBlock::EpochBoundary(_)) {
+        return Ok(ParsedBlock {
+            slot: block.slot(),
+            hash: block.hash().to_vec(),
+            tx_count: 0,
+            vrf_output: None,
+            is_conway: false,
+            is_ebb: true,
+            byron_update: None,
+        });
+    }
+
     let slot = block.slot();
     let hash = block.hash().to_vec();
-
     let tx_count = block.txs().len();
 
-    // ALWAYS log any block with transactions
     if tx_count > 0 {
         tracing::debug!("Found block with {} transactions at slot {} (block_size={} bytes)",
             tx_count, slot, block_bytes.len());
@@ -754,26 +853,26 @@ fn parse_block_with_nonce(block_bytes: &[u8]) -> Result<(u64, Vec<u8>, usize, Op
 
     let is_conway = block.as_conway().is_some();
 
+    // Extract proposed block version from a Byron update proposal, if present.
+    let byron_update = block.update()
+        .and_then(|u| u.byron_proposed_block_version());
+
     // Extract VRF output from block header
     let vrf_output: Option<Vec<u8>> = if let Some(conway_block) = block.as_conway() {
-        // Conway era blocks use the same vrf_result as Babbage
         let vrf_cert = &conway_block.header.header_body.vrf_result;
         Some(vrf_cert.0.to_vec())
     } else if let Some(babbage_block) = block.as_babbage() {
-        // Babbage era blocks have vrf_result in header_body
         let vrf_cert = &babbage_block.header.header_body.vrf_result;
-        // VrfCert is (output, proof) - we need the output (field .0)
         Some(vrf_cert.0.to_vec())
     } else if let Some(alonzo_block) = block.as_alonzo() {
-        // Alonzo era blocks have nonce_vrf field
         let vrf_cert = &alonzo_block.header.header_body.nonce_vrf;
         Some(vrf_cert.0.to_vec())
     } else {
-        // Byron and epoch boundary blocks don't have VRF
+        // Byron regular blocks don't have VRF
         None
     };
 
-    Ok((slot, hash, tx_count, vrf_output, is_conway))
+    Ok(ParsedBlock { slot, hash, tx_count, vrf_output, is_conway, is_ebb: false, byron_update })
 }
 
 async fn process_block_simple(
@@ -784,13 +883,41 @@ async fn process_block_simple(
     block_bytes: &[u8],
 ) -> Result<()> {
     use pallas_traverse::MultiEraBlock;
-    use hayate::ledger::primitives::{Lovelace, Hash32, Hash28};
+    
     use std::sync::Arc;
 
     let block = MultiEraBlock::decode(block_bytes)?;
 
     // Track total block count for epoch (needed for monetary expansion calculation)
     ledger_state.epoch_block_count += 1;
+
+    // ── Byron fast-path ───────────────────────────────────────────────────────
+    // Byron blocks have no pools, no certificates, no multi-assets, no datums,
+    // and no stake credentials — only plain ADA UTxOs.  Skip all Shelley+ work.
+    if block.as_byron().is_some() {
+        for tx in block.txs() {
+            let tx_hash = tx.hash();
+            for input in tx.inputs() {
+                storage.remove_utxo_blind(input.hash().as_ref(), input.index() as u32)?;
+            }
+            for (idx, output) in tx.outputs().into_iter().enumerate() {
+                let address_bytes = output.address()?.to_vec();
+                let amount = output.value().coin();
+                let utxo_entry = UtxoEntry {
+                    address: address_bytes,
+                    amount,
+                    assets: std::collections::HashMap::new(),
+                    datum_hash: None,
+                    datum: None,
+                    script_ref: None,
+                    stake_credential: None,
+                };
+                storage.insert_utxo(tx_hash.as_ref(), idx as u32, &utxo_entry)?;
+            }
+            ledger_state.epoch_fees.0 += tx.fee().unwrap_or(0);
+        }
+        return Ok(());
+    }
 
     // Track block for leader schedule (pool that produced this block)
     if let Some(pool_id) = extract_pool_id_from_block(&block) {
@@ -901,7 +1028,7 @@ async fn process_block_simple(
 
         // Extract pre-Conway protocol parameter update proposals (Shelley through Babbage)
         if let Some(update) = tx.update() {
-            process_ppup_proposal(update, ledger_state);
+            process_ppup_proposal(update, ledger_state, slot);
         }
 
         // Process Conway governance proposals (proposal_procedures in tx body)
@@ -1285,6 +1412,7 @@ fn extract_pool_id_from_block(block: &pallas_traverse::MultiEraBlock) -> Option<
 fn process_ppup_proposal(
     update: pallas_traverse::MultiEraUpdate<'_>,
     ledger_state: &mut LedgerState,
+    slot: u64,
 ) {
     use hayate::ledger::primitives::{EpochNo, Rational, ProtocolParamUpdate};
 
@@ -1347,10 +1475,15 @@ fn process_ppup_proposal(
         return;
     }
 
-    tracing::debug!(
-        target_epoch = target_epoch.0,
-        n_proposals = proposals.len(),
-        "Recording pre-Conway protocol parameter update proposals"
+    // Log at info level so param updates are visible in normal operation.
+    // Use the first proposal's changes against current params (delegates propose identical values).
+    let changes = proposals.first()
+        .map(|(_, ppu)| ppu.format_changes(&ledger_state.protocol_params))
+        .unwrap_or_default();
+    let slot_in_epoch = slot % ledger_state.epoch_length as u64;
+    info!(
+        "PPUP: received protocol parameter update proposal votes={} epoch={} slot_in_epoch={} changes=\"{}\"",
+        proposals.len(), target_epoch.0, slot_in_epoch, changes
     );
 
     let entry = ledger_state.pending_pp_updates
@@ -1365,10 +1498,10 @@ fn process_certificate(
     cert: pallas_traverse::MultiEraCert,
     ledger_state: &mut LedgerState,
 ) -> Result<()> {
-    use hayate::ledger::primitives::{Hash32, Hash28, Lovelace, EpochNo};
-    use hayate::ledger::state::PoolRegistration;
-    use std::sync::Arc;
-    use pallas_primitives::{alonzo, conway};
+    
+    
+    
+    
 
     // MultiEraCert is an enum with AlonzoCompatible and Conway variants
     // Each contains the era-specific Certificate enum
@@ -1419,7 +1552,7 @@ fn process_alonzo_certificate(
     cert: &pallas_primitives::alonzo::Certificate,
     ledger_state: &mut LedgerState,
 ) -> Result<()> {
-    use hayate::ledger::primitives::{Hash32, Lovelace, EpochNo};
+    use hayate::ledger::primitives::{Lovelace, EpochNo};
     use hayate::ledger::state::{PoolRegistration, DepositType};
     use std::sync::Arc;
     use pallas_primitives::alonzo::Certificate;
@@ -1667,7 +1800,7 @@ fn process_conway_certificate(
     cert: &pallas_primitives::conway::Certificate,
     ledger_state: &mut LedgerState,
 ) -> Result<()> {
-    use hayate::ledger::primitives::{Hash32, Lovelace, EpochNo};
+    use hayate::ledger::primitives::{Lovelace, EpochNo};
     use hayate::ledger::state::{PoolRegistration, DepositType};
     use std::sync::Arc;
     use pallas_primitives::conway::Certificate;
@@ -2050,8 +2183,6 @@ fn process_conway_certificate(
                 tracing::debug!("DRep updated: {}", hex::encode(&cred_hash[..8]));
             }
         }
-
-        _ => {}
     }
 
     Ok(())
@@ -2080,7 +2211,7 @@ fn load_conway_genesis(config_path: Option<&PathBuf>) -> Option<ConwayGenesis> {
 /// Load genesis files and initialize ledger state with correct reserves
 fn load_genesis_and_init_ledger(
     config_path: Option<&PathBuf>,
-    network: &Network,
+    _network: &Network,
 ) -> Result<(LedgerState, Option<ConwayGenesis>)> {
     let mut ledger_state = LedgerState::new(ProtocolParameters::default());
 
@@ -2165,6 +2296,65 @@ fn load_genesis_and_init_ledger(
             }
         }
 
+        // Determine how the Shelley hard fork is triggered.
+        let test_shelley_epoch = config
+            .get("TestShelleyHardForkAtEpoch")
+            .and_then(|v| v.as_u64());
+
+        match test_shelley_epoch {
+            Some(0) => {
+                // Chain starts in Shelley — no Byron era (e.g. sanchonet, preview).
+                // has_byron stays false, shelley_transition_epoch stays 0.
+                info!("TestShelleyHardForkAtEpoch = 0 — no Byron era, starting in Shelley");
+            }
+            Some(n) => {
+                // Forced transition at a fixed epoch (custom testnet with Byron prefix).
+                ledger_state.has_byron = true;
+                ledger_state.shelley_transition_epoch = n;
+                info!("TestShelleyHardForkAtEpoch = {} — forced Shelley transition", n);
+            }
+            None => {
+                // No forced fork — transition via on-chain update proposal (mainnet, preprod).
+                if ledger_state.byron_epoch_length > 0 {
+                    ledger_state.has_byron = true;
+                    ledger_state.shelley_transition_epoch = u64::MAX; // sentinel: pending
+                    info!("No TestShelleyHardForkAtEpoch — will transition to Shelley via \
+                           on-chain update proposal (2.0.0)");
+                }
+            }
+        }
+
+        // Seed initial RUPD (reward update) for Shelley-from-genesis chains.
+        //
+        // Haskell's `mkShelleyNewEpochState` calls `createRUpd` at genesis to seed
+        // `nesRu`, which is then applied at the very first epoch transition (0→1).
+        // Without this, the 0→1 boundary has no RUPD to apply, leaving treasury=0
+        // and reserves=15T instead of the correct treasury=9T.
+        //
+        // Only relevant when the chain starts in Shelley (no Byron era).  For
+        // Byron-first chains, the initial RUPD is seeded at the Shelley HF.
+        if !ledger_state.has_byron {
+            let prev_pp = ledger_state.protocol_params.clone();
+            let empty_snapshot = hayate::ledger::state::StakeSnapshot {
+                epoch: EpochNo(0),
+                delegations: std::sync::Arc::new(std::collections::HashMap::new()),
+                pool_stake: std::collections::HashMap::new(),
+                pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
+                stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
+                epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+            };
+            let initial_rupd = ledger_state.calculate_rewards(
+                &empty_snapshot,
+                hayate::ledger::primitives::Lovelace(0),
+                &prev_pp,
+            );
+            info!(
+                "Seeded initial RUPD: deltaR1={}, deltaT1={}, to be applied at 0→1",
+                initial_rupd.delta_r1, initial_rupd.delta_t1
+            );
+            ledger_state.pending_reward_update = Some(initial_rupd);
+        }
+
         // Load Conway genesis for governance parameters (applied at era transition)
         let conway_genesis = load_conway_genesis(config_path);
 
@@ -2177,6 +2367,73 @@ fn load_genesis_and_init_ledger(
     warn!("⚠️  Provide --config <path> to load proper genesis values");
 
     Ok((ledger_state, None))
+}
+
+/// Insert all Byron genesis UTxOs into the LSM tree.
+///
+/// Called once on a fresh run (before any blocks are processed).  This ensures
+/// that when Byron transactions spend genesis outputs the tombstones hit real
+/// LSM entries, and that `recalibrate_reserves_from_utxo_tree` at the
+/// Byron→Shelley hard fork sees the correct total UTxO value.
+///
+/// Genesis UTxOs have no stake credential (Byron addresses carry none).
+fn seed_genesis_utxos_into_storage(
+    config_path: Option<&PathBuf>,
+    storage: &mut NodeStorage,
+) -> Result<()> {
+    let config_file = match config_path {
+        Some(p) => p,
+        None => {
+            warn!("No config file — skipping genesis UTxO seeding");
+            return Ok(());
+        }
+    };
+
+    let config_dir = config_file.parent().unwrap_or(std::path::Path::new("./"));
+    let config_content = std::fs::read_to_string(config_file)
+        .with_context(|| format!("Failed to read config: {}", config_file.display()))?;
+    let config: serde_json::Value = serde_json::from_str(&config_content)
+        .context("Failed to parse config JSON")?;
+
+    let byron_path = match config.get("ByronGenesisFile").and_then(|v| v.as_str()) {
+        Some(p) => config_dir.join(p),
+        None => {
+            warn!("ByronGenesisFile not in config — skipping genesis UTxO seeding");
+            return Ok(());
+        }
+    };
+
+    let entries = hayate::genesis::ByronGenesis::initial_utxos_from_path(&byron_path);
+    if entries.is_empty() {
+        warn!("No genesis UTxOs loaded — storage will be seeded empty");
+        return Ok(());
+    }
+
+    info!("Seeding {} genesis UTxOs into LSM tree...", entries.len());
+    let mut count = 0u64;
+    let mut total_lovelace = 0u64;
+
+    for entry in &entries {
+        let utxo = UtxoEntry {
+            address: entry.address.clone(),
+            amount: entry.lovelace,
+            assets: std::collections::HashMap::new(),
+            datum_hash: None,
+            datum: None,
+            script_ref: None,
+            stake_credential: None, // Byron addresses have no stake credential
+        };
+        storage.insert_utxo(&entry.txid, 0, &utxo)?;
+        count += 1;
+        total_lovelace = total_lovelace.saturating_add(entry.lovelace);
+    }
+
+    info!(
+        "✅ Seeded {} genesis UTxOs ({} ADA) into LSM tree",
+        count,
+        total_lovelace / 1_000_000,
+    );
+    Ok(())
 }
 
 

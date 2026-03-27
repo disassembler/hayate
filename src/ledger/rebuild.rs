@@ -161,6 +161,41 @@ impl LedgerState {
 
         Ok(())
     }
+
+    /// Compute the total lovelace value of all live UTxOs in the tree.
+    ///
+    /// Used at the Byron→Shelley transition to reset reserves to the correct
+    /// value: `reserves = maxLovelaceSupply - total_utxo_value`.  This accounts
+    /// for Byron transaction fees which reduce the UTxO set (and therefore
+    /// increase reserves relative to the genesis seed value).
+    pub fn recalibrate_reserves_from_utxo_tree(
+        &mut self,
+        utxo_tree: &cardano_lsm::LsmTree,
+    ) -> anyhow::Result<()> {
+        use crate::node::storage::UtxoEntry;
+
+        let mut total: u64 = 0;
+        for (_key, value) in utxo_tree.iter() {
+            let value_bytes: &[u8] = value.as_ref();
+            if value_bytes.is_empty() {
+                continue; // tombstone
+            }
+            match bincode::deserialize::<UtxoEntry>(value_bytes) {
+                Ok(entry) => total = total.saturating_add(entry.amount),
+                Err(e) => tracing::warn!("Failed to decode UTxO during reserve recalibration: {}", e),
+            }
+        }
+
+        const MAX_LOVELACE: u64 = 45_000_000_000_000_000;
+        let new_reserves = MAX_LOVELACE.saturating_sub(total);
+        tracing::info!(
+            "🔄 Byron→Shelley reserve recalibration: total_utxo={} lovelace, \
+             old_reserves={} → new_reserves={}",
+            total, self.reserves.0, new_reserves
+        );
+        self.reserves.0 = new_reserves;
+        Ok(())
+    }
 }
 
 /// Extract stake credential hash from a Cardano address.

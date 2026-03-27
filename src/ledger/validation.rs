@@ -4,7 +4,6 @@
 // Initially stubbed to allow hayate to operate in trust mode
 // Can be enabled later via feature flags for full node capability
 
-use super::primitives::ProtocolParameters;
 use super::state::LedgerState;
 
 /// Validation mode controls whether transactions are validated or trusted
@@ -198,6 +197,7 @@ mod scripts {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::primitives::ProtocolParameters;
 
     #[test]
     fn test_disabled_mode_always_valid() {

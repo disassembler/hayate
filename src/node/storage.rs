@@ -140,6 +140,16 @@ impl NodeStorage {
         Ok(utxo)
     }
 
+    /// Remove a UTxO without reading its current value first.
+    /// Only safe when the caller knows there is no stake credential to untrack
+    /// (e.g. Byron-era UTxOs which never have stake credentials).
+    pub fn remove_utxo_blind(&mut self, tx_hash: &[u8], output_index: u32) -> Result<()> {
+        let key = format!("{}:{}", hex::encode(tx_hash), output_index);
+        let key_bytes = Key::from(key.as_bytes());
+        self.utxo_tree.insert(&key_bytes, &Value::from(b"".as_ref()))?;
+        Ok(())
+    }
+
     pub fn get_utxo(&self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
         let key = format!("{}:{}", hex::encode(tx_hash), output_index);
         if let Some(value) = self.utxo_tree.get(&Key::from(key.as_bytes()))? {
