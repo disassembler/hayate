@@ -690,18 +690,28 @@ pub struct StakeDistributionState {
     pub stake_map: HashMap<Hash32, Lovelace>,
 }
 
-/// Cardano uses a "mark / set / go" snapshot model:
+/// Cardano uses a "mark / set / go / pay" snapshot model:
 /// - "mark" is the snapshot taken at the current epoch boundary
 /// - "set" is the snapshot from the previous epoch (used for leader election)
-/// - "go" is the snapshot from two epochs ago (used for reward calculation)
+/// - "go" is the snapshot from two epochs ago (used for reward calculation stake)
+/// - "pay" is a derived snapshot: go's stake + current epoch's blocks (nesBprev).
+///   This combines the correct 2-epoch-old stake with the just-ended epoch's blocks
+///   for RUPD (Reward UPDate) calculation, matching Haskell's createRUpd inputs.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct EpochSnapshots {
     /// Snapshot from the most recent epoch boundary ("mark")
     pub mark: Option<StakeSnapshot>,
     /// Snapshot from one epoch ago ("set") — used for leader election
     pub set: Option<StakeSnapshot>,
-    /// Snapshot from two epochs ago ("go") — used for reward distribution
+    /// Snapshot from two epochs ago ("go") — stake basis for reward calculation
     pub go: Option<StakeSnapshot>,
+    /// Reward calculation snapshot ("pay"): go's stake + current epoch's blocks.
+    ///
+    /// Built at each epoch boundary as a copy of `go` with `epoch_blocks_by_pool`
+    /// replaced by the just-ended epoch's block counts (`self.epoch_blocks_by_pool`).
+    /// This is the direct input to `calculate_rewards` / createRUpd.
+    #[serde(default)]
+    pub pay: Option<StakeSnapshot>,
     /// Fees from the current epoch (Haskell's ssFee)
     /// This is updated by SNAP at each epoch boundary to the fees from the epoch that just ended.
     /// RUPD uses this value at the next epoch transition.

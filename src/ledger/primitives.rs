@@ -190,7 +190,7 @@ pub enum Vote {
 }
 
 /// Rational number (for protocol parameters)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct Rational {
     pub numerator: u64,
     pub denominator: u64,

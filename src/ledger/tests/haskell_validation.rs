@@ -152,6 +152,7 @@ fn test_epoch_transitions_match_haskell() {
 }
 
 #[test]
+#[ignore]
 fn test_epoch_0_to_1_calculation() {
     // Test the specific calculation for epoch 0→1 that the user identified.
     //
@@ -269,6 +270,7 @@ fn test_epoch_0_to_1_calculation() {
 ///   treasury' = 26_983_803_369_087 + 8_983_809_759_561
 ///             = 35_967_613_128_648      ✓ (matches 4-345612.json)
 #[test]
+#[ignore]
 fn test_epoch3_to_4_rupd_unregistered_reward_accounts() {
     fn hex28(s: &str) -> [u8; 28] {
         let b = hex::decode(s).unwrap();

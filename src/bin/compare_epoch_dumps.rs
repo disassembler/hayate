@@ -154,9 +154,17 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
     println!("  total (n) = {}\n", fmt_u64(total_blocks));
 
     // ── η ──
-    let (eta_n, eta_d) = if let Some(eb) = expected_blocks {
+    // Prefer --expected-blocks arg; fall back to dump's expectedBlocks field.
+    let expected_blocks_resolved = expected_blocks
+        .or_else(|| n.get("expectedBlocks").and_then(|v| v.as_u64()));
+    let d_ge_08 = d_param.as_ref().map_or(false, |&(n, d)| n * 5 >= d * 4);
+    let (eta_n, eta_d) = if d_ge_08 {
+        println!("d ≥ 0.8 → η = 1  [spec: fully decentralised]");
+        (1u64, 1u64)
+    } else if let Some(eb) = expected_blocks_resolved {
         let (en, ed) = if total_blocks >= eb { (eb, eb) } else { (total_blocks, eb) };
-        println!("expectedBlocks = {} (--expected-blocks)", fmt_u64(eb));
+        let src = if expected_blocks.is_some() { "--expected-blocks" } else { "dump" };
+        println!("expectedBlocks = {} ({})", fmt_u64(eb), src);
         println!("η = {}/{} = {:.6}", total_blocks, eb, total_blocks as f64 / eb as f64);
         if total_blocks >= eb {
             println!("min(1,η) = 1  [capped]");
@@ -165,14 +173,24 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
         }
         (en, ed)
     } else {
-        println!("expectedBlocks = ? (pass --expected-blocks to verify η independently)");
+        println!("expectedBlocks = ? (pass --expected-blocks or ensure dump contains expectedBlocks)");
         println!("actual blocks (n) = {}", fmt_u64(total_blocks));
         (0u64, 1u64) // sentinel — skip independent Δr₁ verification
     };
     println!();
 
+    // ── Starting balances ──
+    let fee_ss = n.get("epochFees").and_then(|v| v.as_u64());
+    println!("reserves_N = {}", fmt_u64(reserves_n));
+    println!("treasury_N = {}", fmt_u64(treasury_n));
+    match fee_ss {
+        Some(f) => println!("feeSS      = {} (epochFees)", fmt_u64(f)),
+        None    => println!("feeSS      = ? (epochFees not in dump)"),
+    }
+    println!();
+
     // ── Step 1: Δr₁ ──
-    println!("Step 1: Δr₁ = floor(min(1,η) · ρ · reserves_N)");
+    println!("Step 1: Δr₁ = floor(η · ρ · reserves_N)");
     if let (Some((rn, rd)), Some(eb)) = (&rho, expected_blocks) {
         let computed = floor_mul3(eta_n, eta_d, *rn, *rd, reserves_n as u128);
         let ok = dump_delta_r1.map_or(false, |d| d == computed);
@@ -186,27 +204,21 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
     let delta_r1 = dump_delta_r1.unwrap_or(0);
     println!();
 
-    // ── Step 2: feeSS ──
-    println!("Step 2: feeSS = rPot - Δr₁");
-    let fee_ss = dump_rpot.map(|rp| rp.saturating_sub(delta_r1));
-    if let (Some(fee), Some(rp)) = (fee_ss, dump_rpot) {
-        println!("  rPot  = {} (from dump)", fmt_u64(rp));
-        println!("  Δr₁   = {}", fmt_u64(delta_r1));
-        println!("  feeSS = {}", fmt_u64(fee));
-    }
-    println!();
-
-    // ── Step 3: rPot ──
-    println!("Step 3: rPot = feeSS + Δr₁");
+    // ── Step 2: rPot ──
+    println!("Step 2: rPot = feeSS + Δr₁");
     let r_pot = dump_rpot.unwrap_or(delta_r1 + fee_ss.unwrap_or(0));
     if let Some(fee) = fee_ss {
         let computed = fee + delta_r1;
-        println!("  = {} + {} = {}  {}", fmt_u64(fee), fmt_u64(delta_r1), fmt_u64(computed), chk(computed == r_pot));
+        let ok = computed == r_pot;
+        println!("  = {} + {} = {}  {}", fmt_u64(fee), fmt_u64(delta_r1), fmt_u64(computed), chk(ok));
+        if let Some(rp) = dump_rpot { if !ok { println!("  dump rPot: {}", fmt_u64(rp)); } }
+    } else if let Some(rp) = dump_rpot {
+        println!("  = {} (from dump)", fmt_u64(rp));
     }
     println!();
 
-    // ── Step 4: Δt₁ ──
-    println!("Step 4: Δt₁ = floor(τ · rPot)");
+    // ── Step 3: Δt₁ ──
+    println!("Step 3: Δt₁ = floor(τ · rPot)");
     if let Some((tn, td)) = &tau {
         let computed = ((r_pot as u128 * *tn as u128) / *td as u128) as u64;
         let ok = dump_delta_t1.map_or(false, |d| d == computed);
@@ -219,17 +231,17 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
     let delta_t1 = dump_delta_t1.unwrap_or(0);
     println!();
 
-    // ── Step 5: R ──
-    println!("Step 5: R = rPot - Δt₁  (available for pools + delegators)");
+    // ── Step 4: R ──
+    println!("Step 4: R = rPot - Δt₁  (available for pools + delegators)");
     let r_computed = r_pot.saturating_sub(delta_t1);
-    let ok5 = dump_reward_pot.map_or(true, |rp| rp == r_computed);
-    println!("  = {} - {} = {}  {}", fmt_u64(r_pot), fmt_u64(delta_t1), fmt_u64(r_computed), chk(ok5));
-    if let Some(rp) = dump_reward_pot { if !ok5 { println!("  dump rewardPot: {}", fmt_u64(rp)); } }
+    let ok4 = dump_reward_pot.map_or(true, |rp| rp == r_computed);
+    println!("  = {} - {} = {}  {}", fmt_u64(r_pot), fmt_u64(delta_t1), fmt_u64(r_computed), chk(ok4));
+    if let Some(rp) = dump_reward_pot { if !ok4 { println!("  dump rewardPot: {}", fmt_u64(rp)); } }
     let reward_pot = dump_reward_pot.unwrap_or(r_computed);
     println!();
 
-    // ── Step 6: rs ──
-    println!("Step 6: rs (rewardPayouts — computed at RUPD creation)");
+    // ── Step 5: rs ──
+    println!("Step 5: rs (rewardPayouts — computed at RUPD creation)");
     let sigma_rs: u64 = dump_reward_payouts
         .map(|m| m.values().filter_map(|v| v.as_u64()).sum())
         .unwrap_or(0);
@@ -278,8 +290,8 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
         println!();
     }
 
-    // ── Step 7: Δr₂ ──
-    println!("Step 7: Δr₂ = R - Σrs  (unspent pool rewards → reserves)");
+    // ── Step 6: Δr₂ ──
+    println!("Step 6: Δr₂ = R - Σrs  (unspent pool rewards → reserves)");
     let delta_r2_computed = reward_pot.saturating_sub(sigma_rs);
     let ok7 = dump_delta_r2.map_or(true, |d| d == delta_r2_computed);
     println!("  = {} - {} = {}  {}",
@@ -301,23 +313,40 @@ fn run_rupd_trace(epoch_n: &PathBuf, epoch_n1: &PathBuf, expected_blocks: Option
         fmt_u64(reserves_expected), chk_with_actual(res_ok, reserves_n1));
     println!();
 
-    // Treasury — back-derive unregRU'
-    let unreg_ru: i128 = treasury_n1 as i128 - treasury_n as i128 - delta_t1 as i128;
-    let treas_ok = (treasury_n as i128 + delta_t1 as i128 + unreg_ru) as u64 == treasury_n1;
+    // Treasury — forward-compute unregRU' from N+1 registeredStakeAddresses
+    let registered_n1: std::collections::HashSet<String> = n1
+        .get("registeredStakeAddresses")
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|v| v.as_str()).map(|s| normalize_cred(s)).collect())
+        .unwrap_or_default();
+    let have_registered = n1.get("registeredStakeAddresses").is_some();
+    let unreg_ru: u64 = dump_reward_payouts
+        .map(|m| m.iter()
+            .filter(|(cred, _)| !registered_n1.contains(&normalize_cred(cred)))
+            .filter_map(|(_, v)| v.as_u64())
+            .sum())
+        .unwrap_or(0);
+    let treasury_expected = treasury_n + delta_t1 + unreg_ru;
+    let treas_ok = treasury_expected == treasury_n1;
     println!("treasury_{e1} = treasury_{e0} + Δt₁ + unregRU'",
         e0 = epoch_num, e1 = epoch_num + 1);
-    println!("  unregRU' = treasury_{e1} - treasury_{e0} - Δt₁ = {fmt}",
-        e0 = epoch_num, e1 = epoch_num + 1,
-        fmt = fmt_i128(unreg_ru));
-    println!("  = {} + {} + {} = {}  {}",
-        fmt_u64(treasury_n), fmt_u64(delta_t1), fmt_i128(unreg_ru),
-        fmt_u64(treasury_n1), chk(treas_ok));
-    if unreg_ru > 0 {
-        println!("  (unregRU' > 0: reward accounts deregistered between RUPD creation and application)");
-        if unreg_ru as u64 == sigma_rs {
-            println!("  Note: unregRU' == Σrs — all computed rewards went to treasury");
+    println!("  unregRU' = Σ rs[cred] for cred ∉ registeredStakeAddresses_{e1} = {}", fmt_u64(unreg_ru), e1 = epoch_num + 1);
+    if have_registered {
+        let unregistered: Vec<_> = dump_reward_payouts
+            .map(|m| m.iter()
+                .filter(|(cred, _)| !registered_n1.contains(&normalize_cred(cred)))
+                .map(|(cred, v)| (cred.clone(), v.as_u64().unwrap_or(0)))
+                .collect())
+            .unwrap_or_default();
+        for (cred, amt) in &unregistered {
+            println!("    {} : {}", abbrev(cred, 24), fmt_u64(*amt));
         }
+    } else if dump_reward_payouts.is_some() {
+        println!("  (registeredStakeAddresses not in N+1 dump — cannot identify unregistered credentials)");
     }
+    println!("  = {} + {} + {} = {}  {}",
+        fmt_u64(treasury_n), fmt_u64(delta_t1), fmt_u64(unreg_ru),
+        fmt_u64(treasury_expected), chk_with_actual(treas_ok, treasury_n1));
     println!();
 
     // rupdNext == rupdApplied
