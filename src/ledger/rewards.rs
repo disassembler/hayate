@@ -60,25 +60,31 @@ impl LedgerState {
         &self,
         go_snapshot: &StakeSnapshot,
         fees: Lovelace,
-        prev_pp: &ProtocolParameters,
+        pp: &ProtocolParameters,
     ) -> PendingRewardUpdate {
-        let rho_num = prev_pp.rho.numerator as i128;
-        let rho_den = prev_pp.rho.denominator.max(1) as i128;
-        let tau_num = prev_pp.tau.numerator as i128;
-        let tau_den = prev_pp.tau.denominator.max(1) as i128;
+        let rho_num = pp.rho.numerator as i128;
+        let rho_den = pp.rho.denominator.max(1) as i128;
+        let tau_num = pp.tau.numerator as i128;
+        let tau_den = pp.tau.denominator.max(1) as i128;
 
         let fees_for_rewards = fees.0;
 
-        // Use `d` from prevPp per the Shelley spec.
-        let d_num = prev_pp.decentralization.numerator as i128;
-        let d_den = prev_pp.decentralization.denominator.max(1) as i128;
+        // hardforkBabbageForgoRewardPrefilter: pvMajor > 6
+        // Pre-Babbage (pv <= 6): filter rewards at createRUpd time — unregistered accounts
+        //   are excluded from `rs`; their share stays in deltaR2 → returns to reserves.
+        // Post-Babbage (pv >= 7): skip pre-filter — all rewards go into `rs`; unregistered
+        //   accounts are caught at applyRUpd time as unregRU' → treasury.
+        let babbage_forgo_prefilter = pp.protocol_version_major > 6;
+
+        let d_num = pp.decentralization.numerator as i128;
+        let d_den = pp.decentralization.denominator.max(1) as i128;
         let d_value = d_num as f64 / d_den as f64;
 
         let total_stake_pool_blocks: u64 = go_snapshot.epoch_blocks_by_pool.values().sum();
 
         // Expected blocks: floor((1 - d) * activeSlotCoeff * epochLength)
         let raw_expected_blocks =
-            ((1.0 - d_value) * prev_pp.active_slot_coeff() * self.epoch_length as f64).floor()
+            ((1.0 - d_value) * pp.active_slot_coeff() * self.epoch_length as f64).floor()
                 as u64;
         let expected_blocks = raw_expected_blocks.max(1);
 
@@ -185,7 +191,7 @@ impl LedgerState {
         }
 
         let total_blocks_for_performance = total_stake_pool_blocks.max(1);
-        let n_opt = prev_pp.n_opt.max(1);
+        let n_opt = pp.n_opt.max(1);
 
         let mut total_distributed: u64 = 0;
         let mut reward_map: HashMap<Hash32, Lovelace> = HashMap::new();
@@ -231,8 +237,8 @@ impl LedgerState {
 
             // maxPool'(a0, nOpt, R, sigma, p)
             let a0_r = Rat::from_i128(
-                prev_pp.a0.numerator as i128,
-                prev_pp.a0.denominator.max(1) as i128,
+                pp.a0.numerator as i128,
+                pp.a0.denominator.max(1) as i128,
             );
             let z0 = Rat::from_i128(1, n_opt as i128);
             let sigma_raw = Rat::from_i128(pool_active_stake.0 as i128, total_stake as i128);
@@ -326,14 +332,14 @@ impl LedgerState {
                 }
             }
 
-            // Operator reward: only for registered reward accounts (matches Haskell's rewardOnePool
-            // which takes `addrs_rew` and only computes rewards for registered credentials).
-            // Unregistered pool reward accounts get 0 at createRUpd time (this is different from
-            // unregRU', which handles accounts that WERE registered at createRUpd but deregistered
-            // by applyRUpd time — those go to treasury).
+            // Operator reward: gated by hardforkBabbageForgoRewardPrefilter (pvMajor > 6).
+            // Pre-Babbage (pv <= 6): only add to rs if the reward account is registered.
+            //   Unregistered operator rewards stay in deltaR2 → reserves.
+            // Post-Babbage (pv >= 7): always add to rs regardless of registration.
+            //   At applyRUpd time, unregistered accounts become unregRU' → treasury.
             if operator_reward > 0 {
                 let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
-                if self.reward_accounts.contains_key(&op_key) {
+                if babbage_forgo_prefilter || self.reward_accounts.contains_key(&op_key) {
                     *reward_map.entry(op_key).or_insert(Lovelace(0)) += Lovelace(operator_reward);
                     total_distributed += operator_reward;
                 }

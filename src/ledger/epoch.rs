@@ -563,14 +563,15 @@ impl LedgerState {
         // Inputs (built into the "pay" snapshot):
         //   pay_snapshot = go's stake/delegations/pool_params (from 2 epochs ago)
         //                + self.epoch_blocks_by_pool (just-ended epoch N's blocks = nesBprev)
-        //   prevPp = prev_pp (epoch N's params, captured before PPUP)
+        //   curPp  = self.protocol_params (epoch N+1's params, after PPUP)
         //   feeSS  = self.snapshots.current_epoch_fees
         //
         // Why this is correct:
         //   - Haskell's createRUpd uses: go.stake (2 epochs ago) + nesBprev (epoch N blocks)
         //   - After 3-snapshot rotation: self.snapshots.go = old set = 2-epoch-old stake ✓
         //   - self.epoch_blocks_by_pool = blocks from epoch N (before clearing in step 14) ✓
-        //   - prev_pp = epoch N's params (captured before PPUP) ✓
+        //   - Haskell's startStep uses the CURRENT (post-PPUP) PParams for hardforkBabbageForgoRewardPrefilter
+        //     and η calculation (confirmed: epoch 3→4 uses d=0/pv=7, not prev_pp d=1/pv=6) ✓
         let fees_for_rewards = self.snapshots.current_epoch_fees;
 
         // Build "pay" snapshot: go's stake + current epoch's blocks (nesBprev equivalent).
@@ -594,8 +595,9 @@ impl LedgerState {
             self.reserves.0, self.treasury.0,
         );
 
+        let cur_pp = self.protocol_params.clone();
         let new_rupd = if let Some(ref pay_snapshot) = self.snapshots.pay {
-            self.calculate_rewards(pay_snapshot, fees_for_rewards, &prev_pp)
+            self.calculate_rewards(pay_snapshot, fees_for_rewards, &cur_pp)
         } else {
             // Early epochs before go snapshot exists: no pools, no rewards
             let empty_snapshot = super::state::StakeSnapshot {
@@ -606,7 +608,7 @@ impl LedgerState {
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
             };
-            self.calculate_rewards(&empty_snapshot, fees_for_rewards, &prev_pp)
+            self.calculate_rewards(&empty_snapshot, fees_for_rewards, &cur_pp)
         };
 
         self.pending_reward_update = Some(new_rupd);
