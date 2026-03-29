@@ -1782,6 +1782,11 @@ fn process_alonzo_certificate(
                         .add_deposit(hash, DepositType::Stake, key_deposit);
                 }
 
+                // Track script credentials for correct type tag in dumps
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
+                }
+
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
         }
@@ -1802,6 +1807,8 @@ fn process_alonzo_certificate(
                 ledger_state
                     .deposit_tracker
                     .refund_deposit(&hash, DepositType::Stake);
+
+                ledger_state.script_stake_credentials.remove(&hash);
 
                 tracing::debug!("e={} s={} off={} | Stake deregistered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
@@ -2107,6 +2114,11 @@ fn process_conway_certificate(
                         .add_deposit(hash, DepositType::Stake, key_deposit);
                 }
 
+                // Track script credentials for correct type tag in dumps
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
+                }
+
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
         }
@@ -2127,6 +2139,8 @@ fn process_conway_certificate(
                 ledger_state
                     .deposit_tracker
                     .refund_deposit(&hash, DepositType::Stake);
+
+                ledger_state.script_stake_credentials.remove(&hash);
 
                 tracing::debug!("e={} s={} off={} | Stake deregistered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
@@ -2284,6 +2298,12 @@ fn process_conway_certificate(
                         Lovelace(*deposit),
                     );
                 }
+
+                // Track script credentials for correct type tag in dumps
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
+                }
+
                 tracing::debug!("Conway stake registered: {}", hex::encode(&cred_hash[..8]));
             }
         }
@@ -2303,6 +2323,8 @@ fn process_conway_certificate(
                 ledger_state
                     .deposit_tracker
                     .refund_deposit(&hash, DepositType::Stake);
+
+                ledger_state.script_stake_credentials.remove(&hash);
 
                 tracing::debug!(
                     "Conway stake deregistered: {}",
@@ -2355,6 +2377,9 @@ fn process_conway_certificate(
                         Lovelace(*deposit),
                     );
                 }
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
+                }
                 let pool_bytes = pool_keyhash.as_ref();
                 if pool_bytes.len() >= 28 {
                     let mut pool_id = [0u8; 28];
@@ -2379,6 +2404,9 @@ fn process_conway_certificate(
                         Lovelace(*deposit),
                     );
                 }
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
+                }
                 let hayate_drep = pallas_drep_to_hayate(drep);
                 Arc::make_mut(&mut ledger_state.governance)
                     .vote_delegations
@@ -2400,6 +2428,9 @@ fn process_conway_certificate(
                         DepositType::Stake,
                         Lovelace(*deposit),
                     );
+                }
+                if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
+                    ledger_state.script_stake_credentials.insert(hash);
                 }
                 let pool_bytes = pool_keyhash.as_ref();
                 if pool_bytes.len() >= 28 {

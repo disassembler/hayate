@@ -224,11 +224,13 @@ fn extract_stake_credential(address: &[u8]) -> Option<Hash32> {
     let addr_type = address[0] >> 4;
 
     match addr_type {
-        // Base address: payment (28/32 bytes) + stake (28 bytes)
-        // Type 0-3 encode whether payment/stake are key hash (28) or script hash (32)
-        0x0 => {
-            // Type 0: payment key hash (28) + stake key hash (28)
-            // Address = [header(1)] [payment(28)] [stake(28)] = 57 bytes
+        // Base address types 0-3 (CIP-19):
+        // ALL credential hashes (key and script) are blake2b-224 = 28 bytes.
+        // ALL base addresses are: [header(1)] [payment(28)] [stake(28)] = 57 bytes.
+        // The type nibble encodes whether each credential is key or script, but
+        // the on-chain representation is always 28 bytes regardless.
+        0x0 | 0x1 | 0x2 | 0x3 => {
+            // Base address: header(1) + payment(28) + stake(28) = 57 bytes
             if address.len() >= 57 {
                 let stake_bytes = &address[29..57]; // Skip header(1) + payment(28)
                 let mut hash = [0u8; 32];
@@ -238,61 +240,13 @@ fn extract_stake_credential(address: &[u8]) -> Option<Hash32> {
                 None
             }
         }
-        0x1 => {
-            // Type 1: payment script hash (32) + stake key hash (28)
-            // Address = [header(1)] [payment(32)] [stake(28)] = 61 bytes
-            if address.len() >= 61 {
-                let stake_bytes = &address[33..61]; // Skip header(1) + payment(32)
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(stake_bytes);
-                Some(hash)
-            } else {
-                None
-            }
-        }
-        0x2 => {
-            // Type 2: payment key hash (28) + stake script hash (32)
-            // Address = [header(1)] [payment(28)] [stake(32)] = 61 bytes
-            if address.len() >= 61 {
-                let stake_bytes = &address[29..61]; // Skip header(1) + payment(28)
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(stake_bytes);
-                Some(hash)
-            } else {
-                None
-            }
-        }
-        0x3 => {
-            // Type 3: payment script hash (32) + stake script hash (32)
-            // Address = [header(1)] [payment(32)] [stake(32)] = 65 bytes
-            if address.len() >= 65 {
-                let stake_bytes = &address[33..65]; // Skip header(1) + payment(32)
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(stake_bytes);
-                Some(hash)
-            } else {
-                None
-            }
-        }
-        0xe => {
-            // Type 14: Reward address with key hash (28 bytes)
-            // Address = [header(1)] [stake(28)] = 29 bytes
+        // Reward address types 14-15 (CIP-19):
+        // [header(1)] [stake(28)] = 29 bytes. Both key and script hashes are 28 bytes.
+        0xe | 0xf => {
             if address.len() >= 29 {
                 let stake_bytes = &address[1..29];
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(stake_bytes);
-                Some(hash)
-            } else {
-                None
-            }
-        }
-        0xf => {
-            // Type 15: Reward address with script hash (32 bytes)
-            // Address = [header(1)] [stake(32)] = 33 bytes
-            if address.len() >= 33 {
-                let stake_bytes = &address[1..33];
-                let mut hash = [0u8; 32];
-                hash.copy_from_slice(stake_bytes);
                 Some(hash)
             } else {
                 None
@@ -321,6 +275,44 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_stake_credential_base_address_type1() {
+        // Base address type 1: payment script (28) + stake key (28)
+        // Per CIP-19, script hashes are blake2b-224 = 28 bytes
+        let mut addr = vec![0x11]; // type 1, testnet
+        addr.extend_from_slice(&[0xaa; 28]); // payment script hash (28 bytes)
+        addr.extend_from_slice(&[0xbb; 28]); // stake key hash (28 bytes)
+
+        let cred = extract_stake_credential(&addr).unwrap();
+        assert_eq!(&cred[..28], &[0xbb; 28]);
+        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_extract_stake_credential_base_address_type2() {
+        // Base address type 2: payment key (28) + stake script (28)
+        // This is the address type for script-based stake credentials
+        let mut addr = vec![0x21]; // type 2, testnet
+        addr.extend_from_slice(&[0xaa; 28]); // payment key hash (28 bytes)
+        addr.extend_from_slice(&[0xcc; 28]); // stake script hash (28 bytes)
+
+        let cred = extract_stake_credential(&addr).unwrap();
+        assert_eq!(&cred[..28], &[0xcc; 28]);
+        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_extract_stake_credential_base_address_type3() {
+        // Base address type 3: payment script (28) + stake script (28)
+        let mut addr = vec![0x31]; // type 3, testnet
+        addr.extend_from_slice(&[0xaa; 28]); // payment script hash (28 bytes)
+        addr.extend_from_slice(&[0xdd; 28]); // stake script hash (28 bytes)
+
+        let cred = extract_stake_credential(&addr).unwrap();
+        assert_eq!(&cred[..28], &[0xdd; 28]);
+        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn test_extract_stake_credential_reward_address() {
         // Reward address type 14: stake key only
         // Header 0xe1 (testnet, type 14), stake (28 bytes)
@@ -333,6 +325,17 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_stake_credential_reward_address_script() {
+        // Reward address type 15: stake script only (28 bytes per CIP-19)
+        let mut addr = vec![0xf1]; // type 15, testnet
+        addr.extend_from_slice(&[0xee; 28]);
+
+        let cred = extract_stake_credential(&addr).unwrap();
+        assert_eq!(&cred[..28], &[0xee; 28]);
+        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+    }
+
+    #[test]
     fn test_extract_stake_credential_enterprise() {
         // Enterprise address type 6: no stake credential
         let mut addr = vec![0x61];
@@ -340,6 +343,22 @@ mod tests {
 
         let cred = extract_stake_credential(&addr);
         assert!(cred.is_none());
+    }
+
+    #[test]
+    fn test_all_base_address_types_are_57_bytes() {
+        // Per CIP-19, ALL base addresses are 1 + 28 + 28 = 57 bytes
+        for addr_type in [0x00u8, 0x10, 0x20, 0x30] {
+            let mut addr = vec![addr_type | 0x01]; // testnet
+            addr.extend_from_slice(&[0xaa; 28]); // payment
+            addr.extend_from_slice(&[0xbb; 28]); // stake
+            assert_eq!(addr.len(), 57, "type {:#04x} address should be 57 bytes", addr_type);
+            assert!(
+                extract_stake_credential(&addr).is_some(),
+                "type {:#04x} should extract stake credential",
+                addr_type
+            );
+        }
     }
 
     #[test]

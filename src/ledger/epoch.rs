@@ -826,11 +826,22 @@ impl LedgerState {
         let filename = format!("{}-hayate.json", self.epoch.0);
         let filepath = dump_dir.join(filename);
 
+        // Credential type tag: script credentials get "scriptHash-" prefix, key credentials get "keyHash-"
+        let script_creds = &self.script_stake_credentials;
+        let cred_tag = |k: &Hash32| -> String {
+            let hex = hex::encode(&k[..28]);
+            if script_creds.contains(k) {
+                format!("scriptHash-{}", hex)
+            } else {
+                format!("keyHash-{}", hex)
+            }
+        };
+
         // Helper to format stake map to match Haskell format
         let format_stake = |stake: &HashMap<Hash32, Lovelace>| {
             stake
                 .iter()
-                .map(|(k, v)| (format!("keyHash-{}", hex::encode(&k[..28])), json!(v.0)))
+                .map(|(k, v)| (cred_tag(k), json!(v.0)))
                 .collect::<serde_json::Map<String, serde_json::Value>>()
         };
 
@@ -840,7 +851,7 @@ impl LedgerState {
                 .iter()
                 .map(|(k, v)| {
                     (
-                        format!("keyHash-{}", hex::encode(&k[..28])),
+                        cred_tag(k),
                         json!(hex::encode(v)),
                     )
                 })
