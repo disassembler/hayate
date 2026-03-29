@@ -119,7 +119,12 @@ impl NodeStorage {
         let key_bytes = Key::from(key.as_bytes());
 
         let utxo: Option<UtxoEntry> = if let Some(value) = self.utxo_tree.get(&key_bytes)? {
-            Some(bincode::deserialize(value.as_ref())?)
+            if value.as_ref().is_empty() {
+                // Tombstone — UTxO was already consumed
+                None
+            } else {
+                Some(bincode::deserialize(value.as_ref())?)
+            }
         } else {
             None
         };
@@ -153,7 +158,12 @@ impl NodeStorage {
     pub fn get_utxo(&self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
         let key = format!("{}:{}", hex::encode(tx_hash), output_index);
         if let Some(value) = self.utxo_tree.get(&Key::from(key.as_bytes()))? {
-            Ok(Some(bincode::deserialize(value.as_ref())?))
+            if value.as_ref().is_empty() {
+                // Tombstone — UTxO was already consumed
+                Ok(None)
+            } else {
+                Ok(Some(bincode::deserialize(value.as_ref())?))
+            }
         } else {
             Ok(None)
         }
