@@ -1491,8 +1491,13 @@ async fn process_block_simple(
                     }
                     let mut cred_hash = [0u8; 32];
                     cred_hash[..28].copy_from_slice(&reward_addr_bytes[1..29]);
-                    // Cardano requires withdrawing the full balance; set to 0 by removing.
-                    reward_accounts.remove(&cred_hash);
+                    // Zero the balance; do NOT remove the entry. Removing would make the
+                    // credential appear "unregistered" to the next RUPD application, causing
+                    // its rewards to be redirected to treasury (unregRU'). In Haskell,
+                    // withdrawal sets balance=0 but keeps the credential registered.
+                    if let Some(balance) = reward_accounts.get_mut(&cred_hash) {
+                        *balance = hayate::ledger::primitives::Lovelace(0);
+                    }
                 }
             }
         }
