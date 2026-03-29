@@ -226,6 +226,19 @@ impl LedgerState {
         // Haskell's POOLREAP retires pools where retire_epoch <= new_epoch (current epoch number).
         // The mark snapshot above includes pools that are being retired in this same transition.
         {
+            // Haskell POOLREAP step 1: activate future pool params BEFORE retirement.
+            // This ensures re-registered pools get their updated params before we check for
+            // retirement. Matches Haskell:
+            //   psStakePools = Map.union psFutureStakePoolsL psStakePoolsL
+            let future_params =
+                std::mem::replace(Arc::make_mut(&mut self.future_pool_params), HashMap::new());
+            if !future_params.is_empty() {
+                let pool_map = Arc::make_mut(&mut self.pool_params);
+                for (pool_id, reg) in future_params {
+                    pool_map.insert(pool_id, reg);
+                }
+            }
+
             let pool_deposit = Lovelace(self.protocol_params.pool_deposit);
             let retiring: Vec<Hash28> = self
                 .pending_retirements
@@ -234,8 +247,14 @@ impl LedgerState {
                 .collect();
             self.pending_retirements
                 .retain(|epoch, _| *epoch > new_epoch);
-            for pool_id in retiring {
-                if let Some(pool_reg) = Arc::make_mut(&mut self.pool_params).remove(&pool_id) {
+
+            // Collect the set of retired pool IDs for delegation removal
+            let mut retired_set: std::collections::HashSet<Hash28> =
+                std::collections::HashSet::with_capacity(retiring.len());
+
+            for pool_id in &retiring {
+                if let Some(pool_reg) = Arc::make_mut(&mut self.pool_params).remove(pool_id) {
+                    retired_set.insert(*pool_id);
                     let op_key = Self::reward_account_to_hash(&pool_reg.reward_account);
                     let is_registered = self.reward_accounts.contains_key(&op_key)
                         || self.delegations.contains_key(&op_key);
@@ -252,7 +271,7 @@ impl LedgerState {
                     // Must refund with the same key, NOT op_key.
                     let pool_dep_key = {
                         let mut k = [0u8; 32];
-                        k[..28].copy_from_slice(&pool_id);
+                        k[..28].copy_from_slice(pool_id);
                         k
                     };
                     self.deposit_tracker
@@ -263,6 +282,24 @@ impl LedgerState {
                         hex::encode(&pool_id[..8]),
                         pool_deposit.0,
                         is_registered,
+                    );
+                }
+            }
+
+            // Haskell POOLREAP: removeStakePoolDelegations
+            // Remove pool delegations from all accounts delegating to retired pools.
+            // Matches Haskell: certDStateL.accountsL %~ removeStakePoolDelegations retired
+            if !retired_set.is_empty() {
+                let delegations = Arc::make_mut(&mut self.delegations);
+                let before = delegations.len();
+                delegations.retain(|_, pool_id| !retired_set.contains(pool_id));
+                let removed = before - delegations.len();
+                if removed > 0 {
+                    tracing::info!(
+                        "POOLREAP: removed {} delegations to {} retired pool(s) at epoch→{}",
+                        removed,
+                        retired_set.len(),
+                        new_epoch.0,
                     );
                 }
             }
@@ -305,17 +342,8 @@ impl LedgerState {
             }
         }
 
-        // Apply queued pool re-registrations AFTER taking the mark snapshot.
-        // Matches Haskell's EPOCH STS ordering: SNAP runs before POOL.
-        // The re-registered params will appear in the mark snapshot at the NEXT epoch boundary.
-        let future_params =
-            std::mem::replace(Arc::make_mut(&mut self.future_pool_params), HashMap::new());
-        if !future_params.is_empty() {
-            let pool_map = Arc::make_mut(&mut self.pool_params);
-            for (pool_id, reg) in future_params {
-                pool_map.insert(pool_id, reg);
-            }
-        }
+        // NOTE: Future pool re-registrations are now activated inside POOLREAP above,
+        // matching Haskell where psStakePools merges psFutureStakePools before retirement.
 
         // Update current_epoch_fees (Haskell's ssFee) to fees from the epoch that just ended
         // This will be used by RUPD at the NEXT epoch boundary
