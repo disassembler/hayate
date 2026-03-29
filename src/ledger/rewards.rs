@@ -74,6 +74,9 @@ impl LedgerState {
         //   are excluded from `rs`; their share stays in deltaR2 → returns to reserves.
         // Post-Babbage (pv >= 7): skip pre-filter — all rewards go into `rs`; unregistered
         //   accounts are caught at applyRUpd time as unregRU' → treasury.
+        // Haskell's hardforkBabbageForgoRewardPrefilter uses prevPParamsEpochStateL.pv,
+        // i.e. the PRE-PPUP protocol version (pp = prev_pp passed by caller).
+        // At epoch N→N+1: prev_pp.pv=6 → prefilter enabled; prev_pp.pv≥7 → prefilter disabled.
         let babbage_forgo_prefilter = pp.protocol_version_major > 6;
 
         let d_num = pp.decentralization.numerator as i128;

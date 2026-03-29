@@ -595,9 +595,13 @@ impl LedgerState {
             self.reserves.0, self.treasury.0,
         );
 
-        let cur_pp = self.protocol_params.clone();
+        // Haskell's startStep uses `prevPParamsEpochStateL` for ALL formula params including
+        // the protocol version for hardforkBabbageForgoRewardPrefilter. prev_pp is captured
+        // before PPUP fires, so prev_pp.pv = epoch N-1's protocol version.
+        // E.g. epoch 3→4: prev_pp.pv=6 → prefilter=true → unregistered accounts excluded;
+        //      epoch 4→5: prev_pp.pv=7 → prefilter=false → unregistered accounts included in rs.
         let new_rupd = if let Some(ref pay_snapshot) = self.snapshots.pay {
-            self.calculate_rewards(pay_snapshot, fees_for_rewards, &cur_pp)
+            self.calculate_rewards(pay_snapshot, fees_for_rewards, &prev_pp)
         } else {
             // Early epochs before go snapshot exists: no pools, no rewards
             let empty_snapshot = super::state::StakeSnapshot {
@@ -608,7 +612,7 @@ impl LedgerState {
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
             };
-            self.calculate_rewards(&empty_snapshot, fees_for_rewards, &cur_pp)
+            self.calculate_rewards(&empty_snapshot, fees_for_rewards, &prev_pp)
         };
 
         self.pending_reward_update = Some(new_rupd);
