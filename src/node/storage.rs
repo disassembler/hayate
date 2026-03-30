@@ -155,6 +155,13 @@ impl NodeStorage {
         Ok(())
     }
 
+    /// Returns the incrementally-maintained UTxO stake map (credential bytes → lovelace).
+    /// Updated on every insert_utxo / remove_utxo; use this instead of a full UTxO tree scan
+    /// at epoch boundaries.
+    pub fn current_stake(&self) -> &HashMap<Vec<u8>, u64> {
+        &self.current_stake
+    }
+
     pub fn get_utxo(&self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
         let key = format!("{}:{}", hex::encode(tx_hash), output_index);
         if let Some(value) = self.utxo_tree.get(&Key::from(key.as_bytes()))? {

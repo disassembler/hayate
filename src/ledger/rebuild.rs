@@ -72,6 +72,34 @@ impl LedgerState {
         );
     }
 
+    /// Rebuild stake distribution from the incrementally-maintained `current_stake` map
+    /// in `NodeStorage`. This is O(registered_credentials) rather than O(all_utxos),
+    /// and should be used at every epoch boundary during normal sync.
+    ///
+    /// `utxo_stake`: the `NodeStorage::current_stake()` map — credential bytes → lovelace.
+    pub fn rebuild_stake_from_current_stake(&mut self, utxo_stake: &HashMap<Vec<u8>, u64>) {
+        let mut new_map: HashMap<Hash32, Lovelace> =
+            HashMap::with_capacity(utxo_stake.len().max(self.stake_distribution.stake_map.len()));
+
+        for (cred_bytes, &amount) in utxo_stake {
+            if cred_bytes.len() >= 28 {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_bytes[..28]);
+                *new_map.entry(hash).or_insert(Lovelace(0)) += Lovelace(amount);
+            }
+        }
+
+        // Ensure all registered delegators/reward accounts have entries
+        for cred_hash in self.delegations.keys() {
+            new_map.entry(*cred_hash).or_insert(Lovelace(0));
+        }
+        for cred_hash in self.reward_accounts.keys() {
+            new_map.entry(*cred_hash).or_insert(Lovelace(0));
+        }
+
+        self.stake_distribution.stake_map = new_map;
+    }
+
     /// Rebuild stake distribution from hayate's UTxO LSM tree.
     ///
     /// This is a convenience wrapper that queries the NetworkStorage's utxo_tree

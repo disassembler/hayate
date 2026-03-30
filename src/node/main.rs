@@ -443,10 +443,11 @@ async fn process_block_bytes(
                         .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
                         .collect();
 
-                    // 1. Rebuild stake distribution from UTxO set
-                    if let Err(e) = ledger_state.rebuild_from_utxo_tree(&storage.utxo_tree) {
-                        error!("Failed to rebuild stake distribution: {}", e);
-                    }
+                    // 1. Rebuild stake distribution from the incrementally-maintained stake map.
+                    // NodeStorage::current_stake is updated on every insert/remove, so this is
+                    // O(credentials) rather than O(all_utxos). The full UTxO scan is only needed
+                    // once after snapshot restoration (where current_stake is cleared).
+                    ledger_state.rebuild_stake_from_current_stake(storage.current_stake());
 
                     // 1a. At the Byron→Shelley boundary, recalibrate reserves from the
                     // actual UTxO total.  Our genesis seed used the initial lovelace
