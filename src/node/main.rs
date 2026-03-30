@@ -1084,25 +1084,15 @@ async fn process_block_simple(
         return Ok(());
     }
 
-    // Track block for leader schedule (pool that produced this block)
+    // Track block for leader schedule (pool that produced this block).
+    // In Haskell, nesBlocksCur accumulates ALL blocks from ANY stake pool, including recently
+    // retired ones. The registration check is done only during reward distribution, not here.
+    // Counting only registered pools would miss blocks from pools that retired mid-epoch,
+    // causing the eta (active slot coefficient) to be under-counted.
     if let Some(pool_id) = extract_pool_id_from_block(&block) {
-        // Only count blocks from REGISTERED stake pools when d < 0.8 (decentralized)
-        // When d >= 0.8 (federated), don't count blocks at all - the epoch is federated
-        // and the reward formula uses eta = 1 regardless of block count
-        let d_value = ledger_state.protocol_params.decentralization.numerator as f64
-            / ledger_state
-                .protocol_params
-                .decentralization
-                .denominator
-                .max(1) as f64;
-        let is_decentralized = d_value < 0.8;
-        let is_registered = ledger_state.pool_params.contains_key(&pool_id);
-
-        if is_decentralized && is_registered {
-            let mut epoch_blocks = (*ledger_state.epoch_blocks_by_pool).clone();
-            *epoch_blocks.entry(pool_id).or_insert(0) += 1;
-            ledger_state.epoch_blocks_by_pool = Arc::new(epoch_blocks);
-        }
+        let mut epoch_blocks = (*ledger_state.epoch_blocks_by_pool).clone();
+        *epoch_blocks.entry(pool_id).or_insert(0) += 1;
+        ledger_state.epoch_blocks_by_pool = Arc::new(epoch_blocks);
     }
 
     // Process each transaction
@@ -1116,17 +1106,29 @@ async fn process_block_simple(
     }
     for tx in txs {
         let tx_hash = tx.hash();
+        let tx_valid = tx.is_valid();
 
-        // Process inputs (remove UTxOs)
-        for input in tx.inputs() {
+        if !tx_valid {
+            tracing::info!(
+                "Phase-2 script failure: tx {} at slot {} (is_valid=false), using collateral",
+                hex::encode(tx_hash.as_ref()),
+                slot
+            );
+        }
+
+        // Process consumed UTxOs.
+        // For valid txs, consumes() returns inputs(); for invalid txs, it returns collateral().
+        for input in tx.consumes() {
             let input_hash = input.hash();
             let input_index = input.index();
 
             storage.remove_utxo(input_hash.as_ref(), input_index as u32)?;
         }
 
-        // Process outputs (add UTxOs)
-        for (output_index, output) in tx.outputs().into_iter().enumerate() {
+        // Process produced UTxOs.
+        // For valid txs, produces() returns enumerate(outputs()); for invalid txs,
+        // it returns collateral_return (at index = outputs().len()) or empty.
+        for (output_index, output) in tx.produces() {
             let address_bytes = output.address()?.to_vec();
             let amount = output.value().coin();
 
@@ -1192,325 +1194,345 @@ async fn process_block_simple(
             storage.insert_utxo(tx_hash.as_ref(), output_index as u32, &utxo_entry)?;
         }
 
-        // Process certificates (delegations, pool registrations, etc.)
-        for cert in tx.certs() {
-            process_certificate(cert, ledger_state, slot)?;
-        }
+        // For valid transactions, process certificates, governance, withdrawals.
+        // For invalid transactions (phase-2 script failure), these are all skipped —
+        // only UTxO changes (collateral consumed, collateral return produced) and
+        // the collateral fee are applied.
+        if tx_valid {
+            // Process certificates (delegations, pool registrations, etc.)
+            for cert in tx.certs() {
+                process_certificate(cert, ledger_state, slot)?;
+            }
 
-        // Extract pre-Conway protocol parameter update proposals (Shelley through Babbage)
-        if let Some(update) = tx.update() {
-            process_ppup_proposal(update, ledger_state, slot);
-        }
+            // Extract pre-Conway protocol parameter update proposals (Shelley through Babbage)
+            if let Some(update) = tx.update() {
+                process_ppup_proposal(update, ledger_state, slot);
+            }
 
-        // Process Conway governance proposals (proposal_procedures in tx body)
-        // Each submitted proposal pays a deposit; the deposit is refunded when the proposal
-        // expires (epoch.rs) to the return_addr's reward account.
-        for (proposal_index, proposal) in tx.gov_proposals().into_iter().enumerate() {
-            if let Some(conway_proposal) = proposal.as_conway() {
-                let tx_hash_bytes = tx_hash.as_ref();
-                let mut tx_hash_arr = [0u8; 32];
-                let len = tx_hash_bytes.len().min(32);
-                tx_hash_arr[..len].copy_from_slice(&tx_hash_bytes[..len]);
+            // Process Conway governance proposals (proposal_procedures in tx body)
+            // Each submitted proposal pays a deposit; the deposit is refunded when the proposal
+            // expires (epoch.rs) to the return_addr's reward account.
+            for (proposal_index, proposal) in tx.gov_proposals().into_iter().enumerate() {
+                if let Some(conway_proposal) = proposal.as_conway() {
+                    let tx_hash_bytes = tx_hash.as_ref();
+                    let mut tx_hash_arr = [0u8; 32];
+                    let len = tx_hash_bytes.len().min(32);
+                    tx_hash_arr[..len].copy_from_slice(&tx_hash_bytes[..len]);
 
-                let action_id = hayate::ledger::primitives::GovActionId {
-                    tx_hash: tx_hash_arr,
-                    index: proposal_index as u32,
-                };
+                    let action_id = hayate::ledger::primitives::GovActionId {
+                        tx_hash: tx_hash_arr,
+                        index: proposal_index as u32,
+                    };
 
-                // Parse return_addr from RewardAccount bytes (header + 28-byte cred hash)
-                let reward_account_bytes: &[u8] = conway_proposal.reward_account.as_ref();
-                let return_addr = if reward_account_bytes.len() >= 29 {
-                    let header = reward_account_bytes[0];
-                    let is_script = (header & 0x10) != 0;
-                    let mut hash = [0u8; 32];
-                    hash[..28].copy_from_slice(&reward_account_bytes[1..29]);
-                    if is_script {
-                        hayate::ledger::primitives::Credential::Script(hash)
+                    // Parse return_addr from RewardAccount bytes (header + 28-byte cred hash)
+                    let reward_account_bytes: &[u8] = conway_proposal.reward_account.as_ref();
+                    let return_addr = if reward_account_bytes.len() >= 29 {
+                        let header = reward_account_bytes[0];
+                        let is_script = (header & 0x10) != 0;
+                        let mut hash = [0u8; 32];
+                        hash[..28].copy_from_slice(&reward_account_bytes[1..29]);
+                        if is_script {
+                            hayate::ledger::primitives::Credential::Script(hash)
+                        } else {
+                            hayate::ledger::primitives::Credential::Key(hash)
+                        }
                     } else {
-                        hayate::ledger::primitives::Credential::Key(hash)
-                    }
-                } else {
-                    continue;
-                };
+                        continue;
+                    };
 
-                let deposit = hayate::ledger::primitives::Lovelace(conway_proposal.deposit);
+                    let deposit = hayate::ledger::primitives::Lovelace(conway_proposal.deposit);
 
-                // Track deposit for accounting
-                let return_hash = match &return_addr {
-                    hayate::ledger::primitives::Credential::Key(h) => *h,
-                    hayate::ledger::primitives::Credential::Script(h) => *h,
-                };
-                ledger_state.deposit_tracker.add_deposit(
-                    return_hash,
-                    hayate::ledger::state::DepositType::Governance(action_id),
-                    deposit,
-                );
+                    // Track deposit for accounting
+                    let return_hash = match &return_addr {
+                        hayate::ledger::primitives::Credential::Key(h) => *h,
+                        hayate::ledger::primitives::Credential::Script(h) => *h,
+                    };
+                    ledger_state.deposit_tracker.add_deposit(
+                        return_hash,
+                        hayate::ledger::state::DepositType::Governance(action_id),
+                        deposit,
+                    );
 
-                // Map pallas GovAction to hayate GovernanceAction (full parse).
-                let gov_action = {
-                    use pallas_primitives::conway::GovAction as PGA;
-                    // Convert Option<pallas GovActionId> → Option<hayate GovActionId>
-                    let convert_action_id =
-                        |opt: &Option<pallas_primitives::conway::GovActionId>| {
-                            opt.as_ref().map(|id| {
-                                let mut arr = [0u8; 32];
-                                let b = id.transaction_id.as_ref();
-                                arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
-                                hayate::ledger::primitives::GovActionId {
-                                    tx_hash: arr,
-                                    index: id.action_index,
-                                }
-                            })
-                        };
-                    match &conway_proposal.gov_action {
-                        PGA::ParameterChange(prev_id, update, _guardrail) => {
-                            let hayate_update = pallas_ppu_to_hayate(update.as_ref());
-                            hayate::ledger::primitives::GovernanceAction::ParameterChange {
-                                prev_action_id: convert_action_id(prev_id),
-                                update: hayate_update,
-                                guardrails_hash: None,
-                            }
-                        }
-                        PGA::HardForkInitiation(prev_id, version) => {
-                            hayate::ledger::primitives::GovernanceAction::HardForkInitiation {
-                                prev_action_id: convert_action_id(prev_id),
-                                protocol_version: (version.0, version.1),
-                            }
-                        }
-                        PGA::TreasuryWithdrawals(withdrawals, _guardrail) => {
-                            let converted = withdrawals
-                                .iter()
-                                .filter_map(|(acct, amount)| {
-                                    let bytes: &[u8] = acct.as_ref();
-                                    if bytes.len() >= 29 {
-                                        let is_script = (bytes[0] & 0x10) != 0;
-                                        let mut hash = [0u8; 32];
-                                        hash[..28].copy_from_slice(&bytes[1..29]);
-                                        let cred = if is_script {
-                                            hayate::ledger::primitives::Credential::Script(hash)
-                                        } else {
-                                            hayate::ledger::primitives::Credential::Key(hash)
-                                        };
-                                        Some((cred, hayate::ledger::primitives::Lovelace(*amount)))
-                                    } else {
-                                        None
+                    // Map pallas GovAction to hayate GovernanceAction (full parse).
+                    let gov_action = {
+                        use pallas_primitives::conway::GovAction as PGA;
+                        // Convert Option<pallas GovActionId> → Option<hayate GovActionId>
+                        let convert_action_id =
+                            |opt: &Option<pallas_primitives::conway::GovActionId>| {
+                                opt.as_ref().map(|id| {
+                                    let mut arr = [0u8; 32];
+                                    let b = id.transaction_id.as_ref();
+                                    arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                                    hayate::ledger::primitives::GovActionId {
+                                        tx_hash: arr,
+                                        index: id.action_index,
                                     }
                                 })
-                                .collect();
-                            hayate::ledger::primitives::GovernanceAction::TreasuryWithdrawals {
-                                withdrawals: converted,
-                                guardrails_hash: None,
+                            };
+                        match &conway_proposal.gov_action {
+                            PGA::ParameterChange(prev_id, update, _guardrail) => {
+                                let hayate_update = pallas_ppu_to_hayate(update.as_ref());
+                                hayate::ledger::primitives::GovernanceAction::ParameterChange {
+                                    prev_action_id: convert_action_id(prev_id),
+                                    update: hayate_update,
+                                    guardrails_hash: None,
+                                }
                             }
-                        }
-                        PGA::NoConfidence(prev_id) => {
-                            hayate::ledger::primitives::GovernanceAction::NoConfidence {
-                                prev_action_id: convert_action_id(prev_id),
+                            PGA::HardForkInitiation(prev_id, version) => {
+                                hayate::ledger::primitives::GovernanceAction::HardForkInitiation {
+                                    prev_action_id: convert_action_id(prev_id),
+                                    protocol_version: (version.0, version.1),
+                                }
                             }
-                        }
-                        PGA::UpdateCommittee(prev_id, remove, add, threshold) => {
-                            let members_to_remove = remove
-                                .iter()
-                                .filter_map(|cred| {
-                                    stake_credential_to_hash28(cred).map(|h28| {
-                                        let mut hash = [0u8; 32];
-                                        hash[..28].copy_from_slice(&h28);
-                                        if matches!(
-                                            cred,
-                                            pallas_primitives::StakeCredential::ScriptHash(_)
-                                        ) {
-                                            hayate::ledger::primitives::Credential::Script(hash)
+                            PGA::TreasuryWithdrawals(withdrawals, _guardrail) => {
+                                let converted = withdrawals
+                                    .iter()
+                                    .filter_map(|(acct, amount)| {
+                                        let bytes: &[u8] = acct.as_ref();
+                                        if bytes.len() >= 29 {
+                                            let is_script = (bytes[0] & 0x10) != 0;
+                                            let mut hash = [0u8; 32];
+                                            hash[..28].copy_from_slice(&bytes[1..29]);
+                                            let cred = if is_script {
+                                                hayate::ledger::primitives::Credential::Script(hash)
+                                            } else {
+                                                hayate::ledger::primitives::Credential::Key(hash)
+                                            };
+                                            Some((cred, hayate::ledger::primitives::Lovelace(*amount)))
                                         } else {
-                                            hayate::ledger::primitives::Credential::Key(hash)
+                                            None
                                         }
                                     })
-                                })
-                                .collect();
-                            let members_to_add = add
-                                .iter()
-                                .filter_map(|(cred, epoch)| {
-                                    stake_credential_to_hash28(cred).map(|h28| {
-                                        let mut hash = [0u8; 32];
-                                        hash[..28].copy_from_slice(&h28);
-                                        let credential = if matches!(
-                                            cred,
-                                            pallas_primitives::StakeCredential::ScriptHash(_)
-                                        ) {
-                                            hayate::ledger::primitives::Credential::Script(hash)
-                                        } else {
-                                            hayate::ledger::primitives::Credential::Key(hash)
-                                        };
-                                        (credential, hayate::ledger::primitives::EpochNo(*epoch))
+                                    .collect();
+                                hayate::ledger::primitives::GovernanceAction::TreasuryWithdrawals {
+                                    withdrawals: converted,
+                                    guardrails_hash: None,
+                                }
+                            }
+                            PGA::NoConfidence(prev_id) => {
+                                hayate::ledger::primitives::GovernanceAction::NoConfidence {
+                                    prev_action_id: convert_action_id(prev_id),
+                                }
+                            }
+                            PGA::UpdateCommittee(prev_id, remove, add, threshold) => {
+                                let members_to_remove = remove
+                                    .iter()
+                                    .filter_map(|cred| {
+                                        stake_credential_to_hash28(cred).map(|h28| {
+                                            let mut hash = [0u8; 32];
+                                            hash[..28].copy_from_slice(&h28);
+                                            if matches!(
+                                                cred,
+                                                pallas_primitives::StakeCredential::ScriptHash(_)
+                                            ) {
+                                                hayate::ledger::primitives::Credential::Script(hash)
+                                            } else {
+                                                hayate::ledger::primitives::Credential::Key(hash)
+                                            }
+                                        })
                                     })
-                                })
-                                .collect();
-                            hayate::ledger::primitives::GovernanceAction::UpdateCommittee {
-                                prev_action_id: convert_action_id(prev_id),
-                                members_to_remove,
-                                members_to_add,
-                                quorum: hayate::ledger::primitives::Rational {
-                                    numerator: threshold.numerator,
-                                    denominator: threshold.denominator,
-                                },
+                                    .collect();
+                                let members_to_add = add
+                                    .iter()
+                                    .filter_map(|(cred, epoch)| {
+                                        stake_credential_to_hash28(cred).map(|h28| {
+                                            let mut hash = [0u8; 32];
+                                            hash[..28].copy_from_slice(&h28);
+                                            let credential = if matches!(
+                                                cred,
+                                                pallas_primitives::StakeCredential::ScriptHash(_)
+                                            ) {
+                                                hayate::ledger::primitives::Credential::Script(hash)
+                                            } else {
+                                                hayate::ledger::primitives::Credential::Key(hash)
+                                            };
+                                            (credential, hayate::ledger::primitives::EpochNo(*epoch))
+                                        })
+                                    })
+                                    .collect();
+                                hayate::ledger::primitives::GovernanceAction::UpdateCommittee {
+                                    prev_action_id: convert_action_id(prev_id),
+                                    members_to_remove,
+                                    members_to_add,
+                                    quorum: hayate::ledger::primitives::Rational {
+                                        numerator: threshold.numerator,
+                                        denominator: threshold.denominator,
+                                    },
+                                }
                             }
-                        }
-                        PGA::NewConstitution(prev_id, constitution) => {
-                            let anchor = Some(hayate::ledger::primitives::Anchor {
-                                url: constitution.anchor.url.clone(),
-                                hash: {
-                                    let mut h = [0u8; 32];
-                                    let b = constitution.anchor.content_hash.as_ref();
-                                    h[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
-                                    h
-                                },
-                            });
-                            let script_hash = constitution.guardrail_script.map(|h| {
-                                let mut hash = [0u8; 32];
-                                hash[..28].copy_from_slice(h.as_ref());
-                                hash
-                            });
-                            hayate::ledger::primitives::GovernanceAction::NewConstitution {
-                                prev_action_id: convert_action_id(prev_id),
-                                constitution: hayate::ledger::primitives::Constitution {
-                                    anchor,
-                                    script_hash,
-                                },
+                            PGA::NewConstitution(prev_id, constitution) => {
+                                let anchor = Some(hayate::ledger::primitives::Anchor {
+                                    url: constitution.anchor.url.clone(),
+                                    hash: {
+                                        let mut h = [0u8; 32];
+                                        let b = constitution.anchor.content_hash.as_ref();
+                                        h[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                                        h
+                                    },
+                                });
+                                let script_hash = constitution.guardrail_script.map(|h| {
+                                    let mut hash = [0u8; 32];
+                                    hash[..28].copy_from_slice(h.as_ref());
+                                    hash
+                                });
+                                hayate::ledger::primitives::GovernanceAction::NewConstitution {
+                                    prev_action_id: convert_action_id(prev_id),
+                                    constitution: hayate::ledger::primitives::Constitution {
+                                        anchor,
+                                        script_hash,
+                                    },
+                                }
                             }
-                        }
-                        PGA::Information => {
-                            hayate::ledger::primitives::GovernanceAction::InfoAction
-                        }
-                    }
-                };
-
-                let procedure = hayate::ledger::primitives::ProposalProcedure {
-                    deposit,
-                    return_addr,
-                    gov_action,
-                    anchor: None,
-                };
-
-                if let Err(e) = ledger_state.process_proposal(&action_id, &procedure) {
-                    tracing::debug!("Governance proposal rejected: {}", e);
-                } else {
-                    tracing::debug!(
-                        "Governance proposal stored: tx={} idx={} deposit={}",
-                        hex::encode(&tx_hash_arr[..8]),
-                        proposal_index,
-                        deposit.0
-                    );
-                }
-            }
-        }
-
-        // Process Conway governance votes and treasury donations (Conway tx body only)
-        if let pallas_traverse::MultiEraTx::Conway(conway_tx) = &tx {
-            if let Some(voting_procedures) = &conway_tx.transaction_body.voting_procedures {
-                for (pallas_voter, action_votes) in voting_procedures {
-                    let hayate_voter = match pallas_voter {
-                        pallas_primitives::conway::Voter::ConstitutionalCommitteeKey(h) => {
-                            let mut hash = [0u8; 32];
-                            hash[..28].copy_from_slice(h.as_ref());
-                            hayate::ledger::primitives::Voter::ConstitutionalCommittee(
-                                hayate::ledger::primitives::Credential::Key(hash),
-                            )
-                        }
-                        pallas_primitives::conway::Voter::ConstitutionalCommitteeScript(h) => {
-                            let mut hash = [0u8; 32];
-                            hash[..28].copy_from_slice(h.as_ref());
-                            hayate::ledger::primitives::Voter::ConstitutionalCommittee(
-                                hayate::ledger::primitives::Credential::Script(hash),
-                            )
-                        }
-                        pallas_primitives::conway::Voter::DRepKey(h) => {
-                            let mut hash = [0u8; 32];
-                            hash[..28].copy_from_slice(h.as_ref());
-                            hayate::ledger::primitives::Voter::DRep(
-                                hayate::ledger::primitives::Credential::Key(hash),
-                            )
-                        }
-                        pallas_primitives::conway::Voter::DRepScript(h) => {
-                            let mut hash = [0u8; 32];
-                            hash[..28].copy_from_slice(h.as_ref());
-                            hayate::ledger::primitives::Voter::DRep(
-                                hayate::ledger::primitives::Credential::Script(hash),
-                            )
-                        }
-                        pallas_primitives::conway::Voter::StakePoolKey(h) => {
-                            let mut pool_id = [0u8; 28];
-                            pool_id.copy_from_slice(h.as_ref());
-                            hayate::ledger::primitives::Voter::StakePool(pool_id)
+                            PGA::Information => {
+                                hayate::ledger::primitives::GovernanceAction::InfoAction
+                            }
                         }
                     };
-                    for (pallas_action_id, procedure) in action_votes {
-                        let mut id_arr = [0u8; 32];
-                        let b = pallas_action_id.transaction_id.as_ref();
-                        id_arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
-                        let hayate_action_id = hayate::ledger::primitives::GovActionId {
-                            tx_hash: id_arr,
-                            index: pallas_action_id.action_index,
-                        };
-                        let vote = match procedure.vote {
-                            pallas_primitives::conway::Vote::Yes => {
-                                hayate::ledger::primitives::Vote::Yes
-                            }
-                            pallas_primitives::conway::Vote::No => {
-                                hayate::ledger::primitives::Vote::No
-                            }
-                            pallas_primitives::conway::Vote::Abstain => {
-                                hayate::ledger::primitives::Vote::Abstain
-                            }
-                        };
-                        ledger_state.process_vote(
-                            &hayate_voter,
-                            &hayate_action_id,
-                            &hayate::ledger::primitives::VotingProcedure { vote, anchor: None },
+
+                    let procedure = hayate::ledger::primitives::ProposalProcedure {
+                        deposit,
+                        return_addr,
+                        gov_action,
+                        anchor: None,
+                    };
+
+                    if let Err(e) = ledger_state.process_proposal(&action_id, &procedure) {
+                        tracing::debug!("Governance proposal rejected: {}", e);
+                    } else {
+                        tracing::debug!(
+                            "Governance proposal stored: tx={} idx={} deposit={}",
+                            hex::encode(&tx_hash_arr[..8]),
+                            proposal_index,
+                            deposit.0
                         );
                     }
                 }
             }
-            if let Some(donation) = conway_tx.transaction_body.donation {
-                ledger_state.treasury.0 =
-                    ledger_state.treasury.0.saturating_add(u64::from(donation));
-            }
-        }
 
-        // Process withdrawals (reward account withdrawals).
-        // When a TX withdraws from a reward account, the full balance moves into a UTxO
-        // output (already added to utxo_tree above). We must zero out the reward_accounts
-        // entry, otherwise snapshot_stake will double-count: UTxO stake (which now includes
-        // the withdrawn funds) + the still-non-zero reward_accounts balance.
-        {
-            // Bind to a local so the temporary outlives the borrow in collect().
-            let raw_withdrawals = tx.withdrawals();
-            let withdrawals: Vec<(&[u8], u64)> = raw_withdrawals.collect();
-            if !withdrawals.is_empty() {
-                let reward_accounts = Arc::make_mut(&mut ledger_state.reward_accounts);
-                for (reward_addr_bytes, _amount) in &withdrawals {
-                    if reward_addr_bytes.len() < 29 {
-                        continue;
+            // Process Conway governance votes and treasury donations (Conway tx body only)
+            if let pallas_traverse::MultiEraTx::Conway(conway_tx) = &tx {
+                if let Some(voting_procedures) = &conway_tx.transaction_body.voting_procedures {
+                    for (pallas_voter, action_votes) in voting_procedures {
+                        let hayate_voter = match pallas_voter {
+                            pallas_primitives::conway::Voter::ConstitutionalCommitteeKey(h) => {
+                                let mut hash = [0u8; 32];
+                                hash[..28].copy_from_slice(h.as_ref());
+                                hayate::ledger::primitives::Voter::ConstitutionalCommittee(
+                                    hayate::ledger::primitives::Credential::Key(hash),
+                                )
+                            }
+                            pallas_primitives::conway::Voter::ConstitutionalCommitteeScript(h) => {
+                                let mut hash = [0u8; 32];
+                                hash[..28].copy_from_slice(h.as_ref());
+                                hayate::ledger::primitives::Voter::ConstitutionalCommittee(
+                                    hayate::ledger::primitives::Credential::Script(hash),
+                                )
+                            }
+                            pallas_primitives::conway::Voter::DRepKey(h) => {
+                                let mut hash = [0u8; 32];
+                                hash[..28].copy_from_slice(h.as_ref());
+                                hayate::ledger::primitives::Voter::DRep(
+                                    hayate::ledger::primitives::Credential::Key(hash),
+                                )
+                            }
+                            pallas_primitives::conway::Voter::DRepScript(h) => {
+                                let mut hash = [0u8; 32];
+                                hash[..28].copy_from_slice(h.as_ref());
+                                hayate::ledger::primitives::Voter::DRep(
+                                    hayate::ledger::primitives::Credential::Script(hash),
+                                )
+                            }
+                            pallas_primitives::conway::Voter::StakePoolKey(h) => {
+                                let mut pool_id = [0u8; 28];
+                                pool_id.copy_from_slice(h.as_ref());
+                                hayate::ledger::primitives::Voter::StakePool(pool_id)
+                            }
+                        };
+                        for (pallas_action_id, procedure) in action_votes {
+                            let mut id_arr = [0u8; 32];
+                            let b = pallas_action_id.transaction_id.as_ref();
+                            id_arr[..b.len().min(32)].copy_from_slice(&b[..b.len().min(32)]);
+                            let hayate_action_id = hayate::ledger::primitives::GovActionId {
+                                tx_hash: id_arr,
+                                index: pallas_action_id.action_index,
+                            };
+                            let vote = match procedure.vote {
+                                pallas_primitives::conway::Vote::Yes => {
+                                    hayate::ledger::primitives::Vote::Yes
+                                }
+                                pallas_primitives::conway::Vote::No => {
+                                    hayate::ledger::primitives::Vote::No
+                                }
+                                pallas_primitives::conway::Vote::Abstain => {
+                                    hayate::ledger::primitives::Vote::Abstain
+                                }
+                            };
+                            ledger_state.process_vote(
+                                &hayate_voter,
+                                &hayate_action_id,
+                                &hayate::ledger::primitives::VotingProcedure { vote, anchor: None },
+                            );
+                        }
                     }
-                    let mut cred_hash = [0u8; 32];
-                    cred_hash[..28].copy_from_slice(&reward_addr_bytes[1..29]);
-                    // Zero the balance; do NOT remove the entry. Removing would make the
-                    // credential appear "unregistered" to the next RUPD application, causing
-                    // its rewards to be redirected to treasury (unregRU'). In Haskell,
-                    // withdrawal sets balance=0 but keeps the credential registered.
-                    if let Some(balance) = reward_accounts.get_mut(&cred_hash) {
-                        *balance = hayate::ledger::primitives::Lovelace(0);
+                }
+                if let Some(donation) = conway_tx.transaction_body.donation {
+                    ledger_state.treasury.0 =
+                        ledger_state.treasury.0.saturating_add(u64::from(donation));
+                }
+            }
+
+            // Process withdrawals (reward account withdrawals).
+            // When a TX withdraws from a reward account, the full balance moves into a UTxO
+            // output (already added to utxo_tree above). We must zero out the reward_accounts
+            // entry, otherwise snapshot_stake will double-count: UTxO stake (which now includes
+            // the withdrawn funds) + the still-non-zero reward_accounts balance.
+            {
+                // Bind to a local so the temporary outlives the borrow in collect().
+                let raw_withdrawals = tx.withdrawals();
+                let withdrawals: Vec<(&[u8], u64)> = raw_withdrawals.collect();
+                if !withdrawals.is_empty() {
+                    let reward_accounts = Arc::make_mut(&mut ledger_state.reward_accounts);
+                    for (reward_addr_bytes, _amount) in &withdrawals {
+                        if reward_addr_bytes.len() < 29 {
+                            continue;
+                        }
+                        let mut cred_hash = [0u8; 32];
+                        cred_hash[..28].copy_from_slice(&reward_addr_bytes[1..29]);
+                        // Zero the balance; do NOT remove the entry. Removing would make the
+                        // credential appear "unregistered" to the next RUPD application, causing
+                        // its rewards to be redirected to treasury (unregRU'). In Haskell,
+                        // withdrawal sets balance=0 but keeps the credential registered.
+                        if let Some(balance) = reward_accounts.get_mut(&cred_hash) {
+                            *balance = hayate::ledger::primitives::Lovelace(0);
+                        }
                     }
                 }
             }
-        }
+        } // end if tx_valid
 
-        // Track transaction fees
-        let tx_fee = tx.fee().unwrap_or(0);
+        // Track transaction fees.
+        // For valid txs: fee is the declared tx fee.
+        // For invalid txs (phase-2 script failure): fee is total_collateral, which is
+        // the amount actually consumed from the collateral inputs.
+        let tx_fee = if tx_valid {
+            tx.fee().unwrap_or(0)
+        } else {
+            // In Babbage+, total_collateral is explicit in the tx body.
+            // In Alonzo, it must be computed as sum(collateral inputs) - collateral_return,
+            // but Alonzo has no collateral_return so it is just sum(collateral input values).
+            // However, Alonzo collateral inputs are consumed fully (no return), and the
+            // "fee" for an invalid Alonzo tx is the sum of collateral input values.
+            // We use total_collateral if available (Babbage+), otherwise fall back to tx.fee().
+            tx.total_collateral().unwrap_or_else(|| tx.fee().unwrap_or(0))
+        };
         ledger_state.epoch_fees.0 += tx_fee;
         if tx_fee > 0 {
             tracing::debug!(
-                "fee extracted: tx_fee={}, total_epoch_fees={} lovelace (slot {})",
+                "fee extracted: tx_fee={}, total_epoch_fees={} lovelace (slot {}){}",
                 tx_fee,
                 ledger_state.epoch_fees.0,
-                slot
+                slot,
+                if tx_valid { "" } else { " [COLLATERAL]" }
             );
         }
     }
@@ -1700,9 +1722,19 @@ fn process_ppup_proposal(
     let entry = ledger_state
         .pending_pp_updates
         .entry(target_epoch)
-        .or_insert_with(Vec::new);
+        .or_insert_with(std::collections::BTreeMap::new);
     for (hash, ppu) in proposals {
-        entry.push((hash, ppu));
+        let individual_changes = ppu.format_changes(&ledger_state.protocol_params);
+        let overwritten = entry.contains_key(&hash);
+        tracing::debug!(
+            "PPUP: delegate={} overwritten={} changes=\"{}\"",
+            hex::encode(&hash[..8]),
+            overwritten,
+            individual_changes,
+        );
+        // Last-write-wins: if the same genesis delegate submits multiple
+        // proposals, only the latest one counts (matches Haskell Map semantics).
+        entry.insert(hash, ppu);
     }
 }
 
