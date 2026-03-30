@@ -133,6 +133,7 @@ prop_compose! {
             pool_params: Arc::new(pool_params),
             stake_distribution: Arc::new(stake_dist),
             epoch_blocks_by_pool: Arc::new(blocks_map),
+            script_stake_credentials: Default::default(),
         }
     }
 }
@@ -419,6 +420,7 @@ proptest! {
             pool_params: Arc::new(pool_params_map),
             stake_distribution: Arc::new(stake_dist),
             epoch_blocks_by_pool: Arc::new(HashMap::new()), // 0 blocks
+            script_stake_credentials: Default::default(),
         };
 
         let upd = state.calculate_rewards(&snapshot, Lovelace(0), &state.protocol_params.clone());
@@ -479,6 +481,7 @@ proptest! {
             pool_params: Arc::new(pool_params_map),
             stake_distribution: Arc::new(stake_dist),
             epoch_blocks_by_pool: Arc::new(blocks_map),
+            script_stake_credentials: Default::default(),
         };
 
         let upd = state.calculate_rewards(&snapshot, Lovelace(0), &state.protocol_params.clone());
@@ -524,6 +527,7 @@ proptest! {
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(blocks_map),
+                script_stake_credentials: Default::default(),
             }
         };
 
@@ -552,6 +556,7 @@ fn make_stub_snapshot(epoch: u64) -> StakeSnapshot {
         pool_params: Arc::new(HashMap::new()),
         stake_distribution: Arc::new(HashMap::new()),
         epoch_blocks_by_pool: Arc::new(HashMap::new()),
+        script_stake_credentials: Default::default(),
     }
 }
 

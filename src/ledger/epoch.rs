@@ -213,6 +213,9 @@ impl LedgerState {
             pool_params: Arc::clone(&self.pool_params),
             stake_distribution: Arc::new(snapshot_stake),
             epoch_blocks_by_pool: Arc::clone(&self.epoch_blocks_by_pool),
+            // Capture current script credentials so dumps remain correct even after
+            // credentials are later deregistered from the live ledger state.
+            script_stake_credentials: self.script_stake_credentials.clone(),
         };
 
         // Store in mark for the 3-snapshot rotation pattern.
@@ -357,6 +360,12 @@ impl LedgerState {
         // Concretely: at transition old→new (self.epoch=old, new_epoch=new),
         // apply proposals with key = old.  Example: at 1→2, apply epoch-1
         // proposals (target_epoch=1) → epoch 2 gets d=0.
+        //
+        // Haskell's `votedValue` semantics:
+        //   1. The proposals map is keyed by genesis delegate hash (last-write-wins)
+        //   2. Group the map VALUES by equality
+        //   3. If any group has count >= quorum, apply that update
+        //   4. If no group reaches quorum, discard all proposals
         let ppup_key = self.epoch;
         if let Some(proposals) = self.pending_pp_updates.remove(&ppup_key) {
             let quorum = self.update_quorum;
@@ -368,60 +377,32 @@ impl LedgerState {
                 "Evaluating pre-Conway protocol parameter update proposals"
             );
 
-            if n_proposals >= quorum {
-                // Merge all proposals: for each field, if any proposal sets it,
-                // apply the first (all agreeing delegates propose the same values).
-                // This is equivalent to Haskell's `votedValue` when quorum is met.
-                let mut merged = crate::ledger::primitives::ProtocolParamUpdate::default();
-                for (_genesis_hash, update) in &proposals {
-                    if merged.min_fee_a.is_none() {
-                        merged.min_fee_a = update.min_fee_a;
-                    }
-                    if merged.min_fee_b.is_none() {
-                        merged.min_fee_b = update.min_fee_b;
-                    }
-                    if merged.max_block_body_size.is_none() {
-                        merged.max_block_body_size = update.max_block_body_size;
-                    }
-                    if merged.max_transaction_size.is_none() {
-                        merged.max_transaction_size = update.max_transaction_size;
-                    }
-                    if merged.max_block_header_size.is_none() {
-                        merged.max_block_header_size = update.max_block_header_size;
-                    }
-                    if merged.protocol_version.is_none() {
-                        merged.protocol_version = update.protocol_version;
-                    }
-                    if merged.key_deposit.is_none() {
-                        merged.key_deposit = update.key_deposit;
-                    }
-                    if merged.pool_deposit.is_none() {
-                        merged.pool_deposit = update.pool_deposit;
-                    }
-                    if merged.min_pool_cost.is_none() {
-                        merged.min_pool_cost = update.min_pool_cost;
-                    }
-                    if merged.rho.is_none() {
-                        merged.rho = update.rho;
-                    }
-                    if merged.tau.is_none() {
-                        merged.tau = update.tau;
-                    }
-                    if merged.a0.is_none() {
-                        merged.a0 = update.a0;
-                    }
-                    if merged.n_opt.is_none() {
-                        merged.n_opt = update.n_opt;
-                    }
-                    if merged.e_max.is_none() {
-                        merged.e_max = update.e_max;
-                    }
-                    if merged.decentralization.is_none() {
-                        merged.decentralization = update.decentralization;
+            // Implement votedValue: group identical proposals, find one with >= quorum votes.
+            // Since ProtocolParamUpdate is Eq but not Ord, we count groups by linear scan.
+            let values: Vec<&crate::ledger::primitives::ProtocolParamUpdate> =
+                proposals.values().collect();
+            let mut voted: Option<&crate::ledger::primitives::ProtocolParamUpdate> = None;
+            let mut used = vec![false; values.len()];
+            for i in 0..values.len() {
+                if used[i] {
+                    continue;
+                }
+                let mut count = 1u64;
+                for j in (i + 1)..values.len() {
+                    if !used[j] && values[j] == values[i] {
+                        count += 1;
+                        used[j] = true;
                     }
                 }
-                let changes = merged.format_changes(&self.protocol_params);
-                if let Err(e) = self.apply_protocol_param_update(&merged) {
+                if count >= quorum {
+                    voted = Some(values[i]);
+                    break;
+                }
+            }
+
+            if let Some(winner) = voted {
+                let changes = winner.format_changes(&self.protocol_params);
+                if let Err(e) = self.apply_protocol_param_update(winner) {
                     tracing::warn!(epoch = new_epoch.0, error = %e, "PPUP: failed to apply protocol parameter update");
                 } else {
                     self.ppup_enacted_log = Some(format!(
@@ -434,7 +415,7 @@ impl LedgerState {
                     epoch = new_epoch.0,
                     n_proposals,
                     quorum,
-                    "PPUP: not enough proposals for quorum, discarding"
+                    "PPUP: no proposal reached quorum, discarding"
                 );
             }
         }
@@ -639,6 +620,7 @@ impl LedgerState {
                 pool_params: Arc::clone(&self.pool_params),
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
+                script_stake_credentials: std::collections::HashSet::new(),
             };
             self.calculate_rewards(&empty_snapshot, fees_for_rewards, &prev_pp)
         };
@@ -854,38 +836,6 @@ impl LedgerState {
         let filename = format!("{}-hayate.json", self.epoch.0);
         let filepath = dump_dir.join(filename);
 
-        // Credential type tag: script credentials get "scriptHash-" prefix, key credentials get "keyHash-"
-        let script_creds = &self.script_stake_credentials;
-        let cred_tag = |k: &Hash32| -> String {
-            let hex = hex::encode(&k[..28]);
-            if script_creds.contains(k) {
-                format!("scriptHash-{}", hex)
-            } else {
-                format!("keyHash-{}", hex)
-            }
-        };
-
-        // Helper to format stake map to match Haskell format
-        let format_stake = |stake: &HashMap<Hash32, Lovelace>| {
-            stake
-                .iter()
-                .map(|(k, v)| (cred_tag(k), json!(v.0)))
-                .collect::<serde_json::Map<String, serde_json::Value>>()
-        };
-
-        // Helper to format delegations to match Haskell format
-        let format_delegations = |delegations: &HashMap<Hash32, Hash28>| {
-            delegations
-                .iter()
-                .map(|(k, v)| {
-                    (
-                        cred_tag(k),
-                        json!(hex::encode(v)),
-                    )
-                })
-                .collect::<serde_json::Map<String, serde_json::Value>>()
-        };
-
         // Helper to format pool params (pledge, cost, margin for reward diagnosis)
         let format_pool_params = |pool_params: &HashMap<Hash28, PoolRegistration>| {
             pool_params
@@ -913,6 +863,27 @@ impl LedgerState {
         // Helper to create snapshot JSON (includes pool_stake and blocks for reward diagnosis)
         let format_snapshot = |name: &str, snapshot: &Option<super::state::StakeSnapshot>| {
             if let Some(snap) = snapshot {
+                // Use the snapshot's own script credentials for correct type tagging,
+                // even if credentials were later deregistered from the live ledger state.
+                let snap_script_creds = &snap.script_stake_credentials;
+                let snap_cred_tag = |k: &Hash32| -> String {
+                    let hex = hex::encode(&k[..28]);
+                    if snap_script_creds.contains(k) {
+                        format!("scriptHash-{}", hex)
+                    } else {
+                        format!("keyHash-{}", hex)
+                    }
+                };
+                let snap_stake: serde_json::Map<String, serde_json::Value> = snap
+                    .stake_distribution
+                    .iter()
+                    .map(|(k, v)| (snap_cred_tag(k), json!(v.0)))
+                    .collect();
+                let snap_delegations: serde_json::Map<String, serde_json::Value> = snap
+                    .delegations
+                    .iter()
+                    .map(|(k, v)| (snap_cred_tag(k), json!(hex::encode(v))))
+                    .collect();
                 let pool_stake: serde_json::Map<String, serde_json::Value> = snap
                     .pool_stake
                     .iter()
@@ -926,8 +897,8 @@ impl LedgerState {
                 json!({
                     "name": name,
                     "epoch": snap.epoch.0,
-                    "stake": format_stake(&snap.stake_distribution),
-                    "delegations": format_delegations(&snap.delegations),
+                    "stake": snap_stake,
+                    "delegations": snap_delegations,
                     "poolParams": format_pool_params(&snap.pool_params),
                     "poolStake": pool_stake,
                     "blocks": blocks,
@@ -1364,6 +1335,7 @@ mod tests {
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
+                script_stake_credentials: std::collections::HashSet::new(),
             }),
             set: Some(StakeSnapshot {
                 epoch: EpochNo(99),
@@ -1372,6 +1344,7 @@ mod tests {
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
+                script_stake_credentials: std::collections::HashSet::new(),
             }),
             go: Some(StakeSnapshot {
                 epoch: EpochNo(98),
@@ -1380,6 +1353,7 @@ mod tests {
                 pool_params: Arc::new(HashMap::new()),
                 stake_distribution: Arc::new(HashMap::new()),
                 epoch_blocks_by_pool: Arc::new(HashMap::new()),
+                script_stake_credentials: std::collections::HashSet::new(),
             }),
             pay: None,
             current_epoch_fees: Lovelace(0),

@@ -138,8 +138,11 @@ pub struct LedgerState {
     // ===== Protocol parameter updates (pre-Conway) =====
 
     /// Pending protocol parameter update proposals (pre-Conway):
-    /// Maps target_epoch -> [(genesis_delegate_hash, proposed_update)]
-    pub pending_pp_updates: BTreeMap<EpochNo, Vec<(Hash32, ProtocolParamUpdate)>>,
+    /// Maps target_epoch -> { genesis_delegate_hash -> proposed_update }.
+    /// Using a BTreeMap keyed by genesis hash ensures that if the same delegate
+    /// submits multiple proposals for the same epoch, only the last one counts
+    /// (matching Haskell's Map-based semantics).
+    pub pending_pp_updates: BTreeMap<EpochNo, BTreeMap<Hash32, ProtocolParamUpdate>>,
 
     /// Quorum for pre-Conway protocol parameter updates (from Shelley genesis)
     #[serde(default = "default_update_quorum")]
@@ -738,6 +741,11 @@ pub struct StakeSnapshot {
     /// CRITICAL: Must be stored in snapshot so rewards use blocks from the correct epoch
     #[serde(default)]
     pub epoch_blocks_by_pool: Arc<HashMap<Hash28, u64>>,
+    /// Script stake credentials at snapshot time.
+    /// Stored here so dumps use the correct type tag (scriptHash vs keyHash) even after
+    /// a credential is later deregistered from the live ledger state.
+    #[serde(default)]
+    pub script_stake_credentials: HashSet<Hash32>,
 }
 
 /// Pool registration information

@@ -127,6 +127,7 @@ mod snapshot_tests {
             pool_stake: Default::default(),
             delegations: state.delegations.clone(),
             epoch_blocks_by_pool: Arc::new(HashMap::new()),
+            script_stake_credentials: Default::default(),
         };
 
         // Verify snapshot captured state correctly
@@ -152,6 +153,7 @@ mod snapshot_tests {
             pool_stake: Default::default(),
             epoch_blocks_by_pool: Arc::new(HashMap::new()),
             delegations: state.delegations.clone(),
+            script_stake_credentials: Default::default(),
         };
 
         // Modify state after snapshot

@@ -364,6 +364,7 @@ fn test_epoch3_to_4_rupd_unregistered_reward_accounts() {
         pool_params: Arc::new(pool_params),
         stake_distribution: Arc::new(stake_distribution),
         epoch_blocks_by_pool: Arc::new(blocks),
+        script_stake_credentials: Default::default(),
     };
 
     // === createRUpd ===

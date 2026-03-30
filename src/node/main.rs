@@ -2793,6 +2793,7 @@ fn load_genesis_and_init_ledger(
                 pool_params: std::sync::Arc::new(std::collections::HashMap::new()),
                 stake_distribution: std::sync::Arc::new(std::collections::HashMap::new()),
                 epoch_blocks_by_pool: std::sync::Arc::new(std::collections::HashMap::new()),
+                script_stake_credentials: std::collections::HashSet::new(),
             };
             let initial_rupd = ledger_state.calculate_rewards(
                 &empty_snapshot,
