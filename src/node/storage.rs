@@ -88,7 +88,22 @@ impl NodeStorage {
         std::fs::create_dir_all(utxo_path.join("active"))?;
         std::fs::create_dir_all(&epochs_dir)?;
 
-        let utxo_tree = LsmTree::open(utxo_path, LsmConfig::default())
+        // Tune LSM for bulk-sync workload:
+        //
+        // - Large memtable (256 MB): prevents auto-flushes during block processing.
+        //   Each epoch generates ~50-100 MB of UTxO changes; keeping them in memory
+        //   avoids triggering L0 compaction mid-epoch.
+        //
+        // - High L0 trigger (32): each epoch writes one SSTable (via save_snapshot flush);
+        //   at 4 SSTables the default trigger fires a synchronous compaction that stalls
+        //   block processing for 30-60s.  With trigger=32 the first compaction runs every
+        //   32 epochs, eliminating most stalls during the sync.
+        let lsm_config = LsmConfig {
+            memtable_size: 256 * 1024 * 1024,
+            level0_compaction_trigger: 32,
+            ..LsmConfig::default()
+        };
+        let utxo_tree = LsmTree::open(utxo_path, lsm_config)
             .context("open utxo_tree")?;
 
         Ok(Self {
@@ -103,10 +118,21 @@ impl NodeStorage {
 
     // ── UTxO operations ────────────────────────────────────────────────────────
 
+    /// Encode a UTxO key as a compact 36-byte binary key: 32-byte tx hash || 4-byte big-endian index.
+    /// This is ~45% smaller than the previous hex-string format ("txhash:N"), reducing index/filter
+    /// file sizes and eliminating per-operation heap allocations for key formatting.
+    fn utxo_key(tx_hash: &[u8], output_index: u32) -> [u8; 36] {
+        let mut key = [0u8; 36];
+        let len = tx_hash.len().min(32);
+        key[..len].copy_from_slice(&tx_hash[..len]);
+        key[32..36].copy_from_slice(&output_index.to_be_bytes());
+        key
+    }
+
     pub fn insert_utxo(&mut self, tx_hash: &[u8], output_index: u32, utxo: &UtxoEntry) -> Result<()> {
-        let key = format!("{}:{}", hex::encode(tx_hash), output_index);
+        let key = Self::utxo_key(tx_hash, output_index);
         let value = bincode::serialize(utxo)?;
-        self.utxo_tree.insert(&Key::from(key.as_bytes()), &Value::from(&value))?;
+        self.utxo_tree.insert(&Key::from(key.as_ref()), &Value::from(&value))?;
 
         if let Some(stake_cred) = &utxo.stake_credential {
             *self.current_stake.entry(stake_cred.clone()).or_insert(0) += utxo.amount;
@@ -115,10 +141,10 @@ impl NodeStorage {
     }
 
     pub fn remove_utxo(&mut self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
-        let key = format!("{}:{}", hex::encode(tx_hash), output_index);
-        let key_bytes = Key::from(key.as_bytes());
+        let key = Self::utxo_key(tx_hash, output_index);
+        let key_ref = Key::from(key.as_ref());
 
-        let utxo: Option<UtxoEntry> = if let Some(value) = self.utxo_tree.get(&key_bytes)? {
+        let utxo: Option<UtxoEntry> = if let Some(value) = self.utxo_tree.get(&key_ref)? {
             if value.as_ref().is_empty() {
                 // Tombstone — UTxO was already consumed
                 None
@@ -141,7 +167,7 @@ impl NodeStorage {
         }
 
         // Tombstone
-        self.utxo_tree.insert(&key_bytes, &Value::from(b"".as_ref()))?;
+        self.utxo_tree.insert(&key_ref, &Value::from(b"".as_ref()))?;
         Ok(utxo)
     }
 
@@ -149,9 +175,8 @@ impl NodeStorage {
     /// Only safe when the caller knows there is no stake credential to untrack
     /// (e.g. Byron-era UTxOs which never have stake credentials).
     pub fn remove_utxo_blind(&mut self, tx_hash: &[u8], output_index: u32) -> Result<()> {
-        let key = format!("{}:{}", hex::encode(tx_hash), output_index);
-        let key_bytes = Key::from(key.as_bytes());
-        self.utxo_tree.insert(&key_bytes, &Value::from(b"".as_ref()))?;
+        let key = Self::utxo_key(tx_hash, output_index);
+        self.utxo_tree.insert(&Key::from(key.as_ref()), &Value::from(b"".as_ref()))?;
         Ok(())
     }
 
@@ -163,8 +188,8 @@ impl NodeStorage {
     }
 
     pub fn get_utxo(&self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
-        let key = format!("{}:{}", hex::encode(tx_hash), output_index);
-        if let Some(value) = self.utxo_tree.get(&Key::from(key.as_bytes()))? {
+        let key = Self::utxo_key(tx_hash, output_index);
+        if let Some(value) = self.utxo_tree.get(&Key::from(key.as_ref()))? {
             if value.as_ref().is_empty() {
                 // Tombstone — UTxO was already consumed
                 Ok(None)
