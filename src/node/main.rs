@@ -1090,9 +1090,7 @@ async fn process_block_simple(
     // Counting only registered pools would miss blocks from pools that retired mid-epoch,
     // causing the eta (active slot coefficient) to be under-counted.
     if let Some(pool_id) = extract_pool_id_from_block(&block) {
-        let mut epoch_blocks = (*ledger_state.epoch_blocks_by_pool).clone();
-        *epoch_blocks.entry(pool_id).or_insert(0) += 1;
-        ledger_state.epoch_blocks_by_pool = Arc::new(epoch_blocks);
+        *Arc::make_mut(&mut ledger_state.epoch_blocks_by_pool).entry(pool_id).or_insert(0) += 1;
     }
 
     // Process each transaction
@@ -1807,9 +1805,7 @@ fn process_alonzo_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 // Track deposit only on new registrations (not re-registrations)
                 if is_new {
@@ -1833,13 +1829,8 @@ fn process_alonzo_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut delegations = (*ledger_state.delegations).clone();
-                delegations.remove(&hash);
-                ledger_state.delegations = Arc::new(delegations);
-
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                reward_accounts.remove(&hash);
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
+                Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
                 ledger_state
                     .deposit_tracker
@@ -1862,9 +1853,7 @@ fn process_alonzo_certificate(
                     let mut pool_id = [0u8; 28];
                     pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                    let mut delegations = (*ledger_state.delegations).clone();
-                    delegations.insert(stake_hash, pool_id);
-                    ledger_state.delegations = Arc::new(delegations);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(stake_hash, pool_id);
 
                     tracing::debug!(
                         "e={} s={} off={} | Delegation: {} -> {}",
@@ -2139,9 +2128,7 @@ fn process_conway_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 // Track deposit only on new registrations (not re-registrations)
                 if is_new {
@@ -2165,13 +2152,8 @@ fn process_conway_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut delegations = (*ledger_state.delegations).clone();
-                delegations.remove(&hash);
-                ledger_state.delegations = Arc::new(delegations);
-
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                reward_accounts.remove(&hash);
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
+                Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
                 ledger_state
                     .deposit_tracker
@@ -2194,9 +2176,7 @@ fn process_conway_certificate(
                     let mut pool_id = [0u8; 28];
                     pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                    let mut delegations = (*ledger_state.delegations).clone();
-                    delegations.insert(stake_hash, pool_id);
-                    ledger_state.delegations = Arc::new(delegations);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(stake_hash, pool_id);
 
                     tracing::debug!(
                         "e={} s={} off={} | Delegation: {} -> {}",
@@ -2323,9 +2303,7 @@ fn process_conway_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 if is_new {
                     // Use the explicit deposit amount from the certificate
@@ -2349,13 +2327,8 @@ fn process_conway_certificate(
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
 
-                let mut delegations = (*ledger_state.delegations).clone();
-                delegations.remove(&hash);
-                ledger_state.delegations = Arc::new(delegations);
-
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                reward_accounts.remove(&hash);
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
+                Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
                 ledger_state
                     .deposit_tracker
@@ -2404,9 +2377,7 @@ fn process_conway_certificate(
             if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
                         hash,
@@ -2431,9 +2402,7 @@ fn process_conway_certificate(
             if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
                         hash,
@@ -2456,9 +2425,7 @@ fn process_conway_certificate(
             if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_hash);
-                let mut reward_accounts = (*ledger_state.reward_accounts).clone();
-                let is_new = reward_accounts.insert(hash, Lovelace(0)).is_none();
-                ledger_state.reward_accounts = Arc::new(reward_accounts);
+                let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
                         hash,
