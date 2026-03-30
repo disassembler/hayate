@@ -266,9 +266,9 @@ impl LedgerState {
                             .entry(op_key)
                             .or_insert(Lovelace(0)) += pool_deposit;
                     } else {
-                        // Operator reward account is unregistered: deposit goes to reserves
-                        // (Haskell POOLREAP: unclaimed deposits → reserves)
-                        self.reserves += pool_deposit;
+                        // Operator reward account is unregistered: deposit goes to treasury
+                        // (Haskell POOLREAP: unclaimed deposits → treasury)
+                        self.treasury += pool_deposit;
                     }
                     // Deposit was stored under pool_id (28 bytes, zero-padded to 32).
                     // Must refund with the same key, NOT op_key.
