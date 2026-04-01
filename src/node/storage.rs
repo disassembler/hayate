@@ -267,9 +267,34 @@ impl NodeStorage {
             .with_context(|| format!("open_snapshot epoch-{:010}", epoch))?;
         let _ = std::fs::remove_dir_all(&ph_path);
 
-        self.current_stake.clear(); // rebuilt by caller via rebuild_from_utxo_tree
+        // Rebuild current_stake by scanning the restored UTxO tree.
+        // current_stake is an incremental index (credential → lovelace) maintained by
+        // insert_utxo/remove_utxo. After an open_snapshot the in-memory index is stale,
+        // so we must reconstruct it from the on-disk UTxO set before processing any blocks.
+        self.current_stake.clear();
+        let mut staked_credentials: usize = 0;
+        for (_key, value) in self.utxo_tree.iter() {
+            let value_bytes: &[u8] = value.as_ref();
+            if value_bytes.is_empty() {
+                continue; // tombstone
+            }
+            match bincode::deserialize::<UtxoEntry>(value_bytes) {
+                Ok(entry) => {
+                    if let Some(stake_cred) = entry.stake_credential {
+                        *self.current_stake.entry(stake_cred).or_insert(0) += entry.amount;
+                        staked_credentials += 1;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to decode UTxO during current_stake rebuild: {}", e);
+                }
+            }
+        }
         self.utxo_epoch = Some(epoch);
-        tracing::info!("🔄 UTxO tree restored to epoch {}", epoch);
+        tracing::info!(
+            "🔄 UTxO tree restored to epoch {} ({} staked UTxOs, {} credentials)",
+            epoch, staked_credentials, self.current_stake.len()
+        );
         Ok(())
     }
 
