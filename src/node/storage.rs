@@ -94,13 +94,11 @@ impl NodeStorage {
         //   Each epoch generates ~50-100 MB of UTxO changes; keeping them in memory
         //   avoids triggering L0 compaction mid-epoch.
         //
-        // - High L0 trigger (32): each epoch writes one SSTable (via save_snapshot flush);
-        //   at 4 SSTables the default trigger fires a synchronous compaction that stalls
-        //   block processing for 30-60s.  With trigger=32 the first compaction runs every
-        //   32 epochs, eliminating most stalls during the sync.
+        // Compaction runs on a background thread (credit-based), so the default
+        // level0_compaction_trigger (4) is used only as the emergency back-pressure
+        // threshold and never causes write-path stalls.
         let lsm_config = LsmConfig {
             memtable_size: 256 * 1024 * 1024,
-            level0_compaction_trigger: 32,
             ..LsmConfig::default()
         };
         let utxo_tree = LsmTree::open(utxo_path, lsm_config)
@@ -227,17 +225,21 @@ impl NodeStorage {
         }
 
         // Hard-link active/ → snapshots/epoch-N/  (safe: snapshot dir is never read by lsm)
+        let t_lsm = std::time::Instant::now();
         self.utxo_tree.save_snapshot(&snap_name, &format!("UTxO epoch {} slot {}", epoch, slot))?;
+        let lsm_ms = t_lsm.elapsed().as_millis() as u64;
 
         // Write bincode epoch file atomically: tmp → rename
+        let t_bin = std::time::Instant::now();
         let record = EpochSnapshot { epoch, slot, block_hash, ledger_state: state.clone() };
         let bytes = bincode::serialize(&record)?;
         let tmp  = self.epochs_dir.join(format!("epoch-{:010}.bin.tmp", epoch));
         let dest = self.epochs_dir.join(format!("epoch-{:010}.bin", epoch));
         std::fs::write(&tmp, &bytes)?;
         std::fs::rename(&tmp, &dest)?;
+        let bin_ms = t_bin.elapsed().as_millis() as u64;
 
-        tracing::debug!("💾 Epoch {} snapshot saved (slot {})", epoch, slot);
+        tracing::info!(epoch, lsm_ms, bin_ms, "epoch snapshot saved");
         Ok(())
     }
 

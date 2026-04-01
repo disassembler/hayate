@@ -2,8 +2,11 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use hermod::forwarder::{ForwarderConfig, TraceForwarder};
+use hermod::tracer::TracerBuilder;
 use std::path::PathBuf;
 use tracing::{debug, error, info, trace, warn};
+use tracing_subscriber::prelude::*;
 
 // Import from lib
 use hayate::chain_sync::HayateSync;
@@ -86,18 +89,44 @@ struct Args {
     /// given, or exits otherwise.
     #[arg(long)]
     immutable_db: Option<PathBuf>,
+
+    /// Unix socket path for forwarding traces to cardano-tracer.
+    ///
+    /// When set, structured trace objects are forwarded to cardano-tracer in addition
+    /// to the normal stdout log output.  If not set, only stdout logging is active.
+    #[arg(long)]
+    tracer_socket: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let args = Args::parse();
+
     // Initialize logging
     // RUST_LOG overrides the defaults; if unset, fall back to info for both crates.
     let env_filter = std::env::var("RUST_LOG")
         .map(|_| tracing_subscriber::EnvFilter::from_default_env())
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hayate_node=info,hayate=info"));
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    let args = Args::parse();
+    // Optionally forward traces to cardano-tracer via a Unix socket.
+    // None = no-op layer (only stdout logging active).
+    let tracer_layer = args.tracer_socket.as_ref().map(|socket| {
+        let fwd_config = ForwarderConfig {
+            socket_path: socket.clone(),
+            ..Default::default()
+        };
+        let (layer, _fwd_task) = TracerBuilder::new(TraceForwarder::new(fwd_config))
+            .with_namespace_prefix(vec!["Hayate".into()])
+            .build();
+        // _fwd_task is a JoinHandle; dropping it detaches (task keeps running)
+        layer
+    });
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(tracer_layer)
+        .init();
 
     info!("疾風ノード Hayate-Node starting...");
 
@@ -375,6 +404,7 @@ async fn process_block_bytes(
             let slot = parsed.slot;
             let block_hash = parsed.hash;
             let tx_count = parsed.tx_count;
+            let t_block = std::time::Instant::now();
 
             // Update rolling nonce if VRF is present
             if let Some(vrf_output) = parsed.vrf_output {
@@ -447,7 +477,9 @@ async fn process_block_bytes(
                     // NodeStorage::current_stake is updated on every insert/remove, so this is
                     // O(credentials) rather than O(all_utxos). The full UTxO scan is only needed
                     // once after snapshot restoration (where current_stake is cleared).
+                    let t_stake = std::time::Instant::now();
                     ledger_state.rebuild_stake_from_current_stake(storage.current_stake());
+                    let stake_ms = t_stake.elapsed().as_millis() as u64;
 
                     // 1a. At the Byron→Shelley boundary, recalibrate reserves from the
                     // actual UTxO total.  Our genesis seed used the initial lovelace
@@ -462,7 +494,9 @@ async fn process_block_bytes(
                     }
 
                     // 2. Process epoch transition in ledger state
+                    let t_ledger = std::time::Instant::now();
                     ledger_state.process_epoch_transition(EpochNo(epoch));
+                    let ledger_ms = t_ledger.elapsed().as_millis() as u64;
 
                     // 2a. Dump epoch state to JSON for comparison with Haskell
                     if let Some(dump_dir) = dump_epoch_dir {
@@ -528,6 +562,12 @@ async fn process_block_bytes(
                     if let Some(msg) = ledger_state.ppup_enacted_log.take() {
                         info!("{}", msg);
                     }
+                    info!(
+                        epoch = *current_epoch,
+                        stake_ms,
+                        ledger_ms,
+                        "epoch transition timing"
+                    );
                 } else {
                     // Byron epoch summary — no ledger transition, just log.
                     // Use `epoch - 1` (the epoch that just ended) for the label,
@@ -568,17 +608,20 @@ async fn process_block_bytes(
             // Process block AFTER epoch transition so the first block of a new
             // epoch is counted towards the new epoch, not the previous one.
             // Byron regular blocks are also processed here to track UTxOs.
-            if let Err(e) =
-                process_block_simple(storage, ledger_state, slot, &block_hash, block_bytes).await
-            {
-                error!("Error processing block at slot {}: {}", slot, e);
-                return;
-            }
+            let (decode_us, remove_us, insert_us, certs_us) =
+                match process_block_simple(storage, ledger_state, slot, &block_hash, block_bytes).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        error!("Error processing block at slot {}: {}", slot, e);
+                        return;
+                    }
+                };
 
             *blocks_processed += 1;
             *epoch_tx_count += tx_count as u64;
 
             let (slot_off, epoch_len) = ledger_state.slot_within_epoch(slot);
+            debug!(slot, elapsed_us = t_block.elapsed().as_micros() as u64, decode_us, remove_us, insert_us, certs_us, "block");
             trace!(
                 "block slot={} ({}/{}) epoch={} txs={}",
                 slot,
@@ -1047,12 +1090,14 @@ async fn process_block_simple(
     slot: u64,
     _block_hash: &[u8],
     block_bytes: &[u8],
-) -> Result<()> {
+) -> Result<(u64, u64, u64, u64)> {
     use pallas_traverse::MultiEraBlock;
 
     use std::sync::Arc;
 
+    let t_decode = std::time::Instant::now();
     let block = MultiEraBlock::decode(block_bytes)?;
+    let decode_us = t_decode.elapsed().as_micros() as u64;
 
     // Track total block count for epoch (needed for monetary expansion calculation)
     ledger_state.epoch_block_count += 1;
@@ -1082,7 +1127,7 @@ async fn process_block_simple(
             }
             ledger_state.epoch_fees.0 += tx.fee().unwrap_or(0);
         }
-        return Ok(());
+        return Ok((decode_us, 0, 0, 0));
     }
 
     // Track block for leader schedule (pool that produced this block).
@@ -1103,6 +1148,9 @@ async fn process_block_simple(
             slot
         );
     }
+    let mut remove_us: u64 = 0;
+    let mut insert_us: u64 = 0;
+    let mut certs_us: u64 = 0;
     for tx in txs {
         let tx_hash = tx.hash();
         let tx_valid = tx.is_valid();
@@ -1121,7 +1169,9 @@ async fn process_block_simple(
             let input_hash = input.hash();
             let input_index = input.index();
 
+            let t = std::time::Instant::now();
             storage.remove_utxo(input_hash.as_ref(), input_index as u32)?;
+            remove_us += t.elapsed().as_micros() as u64;
         }
 
         // Process produced UTxOs.
@@ -1190,7 +1240,9 @@ async fn process_block_simple(
                 stake_credential,
             };
 
+            let t = std::time::Instant::now();
             storage.insert_utxo(tx_hash.as_ref(), output_index as u32, &utxo_entry)?;
+            insert_us += t.elapsed().as_micros() as u64;
         }
 
         // For valid transactions, process certificates, governance, withdrawals.
@@ -1199,9 +1251,11 @@ async fn process_block_simple(
         // the collateral fee are applied.
         if tx_valid {
             // Process certificates (delegations, pool registrations, etc.)
+            let t = std::time::Instant::now();
             for cert in tx.certs() {
                 process_certificate(cert, ledger_state, slot)?;
             }
+            certs_us += t.elapsed().as_micros() as u64;
 
             // Extract pre-Conway protocol parameter update proposals (Shelley through Babbage)
             if let Some(update) = tx.update() {
@@ -1536,7 +1590,7 @@ async fn process_block_simple(
         }
     }
 
-    Ok(())
+    Ok((decode_us, remove_us, insert_us, certs_us))
 }
 
 fn extract_stake_credential(address: &[u8]) -> Result<Option<Vec<u8>>> {
