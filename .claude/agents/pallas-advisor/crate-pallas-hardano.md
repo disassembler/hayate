@@ -1,9 +1,3 @@
----
-name: crate-pallas-hardano
-description: pallas-hardano ImmutableDB storage format reading; overlap with torsten's Mithril import
-type: reference
----
-
 # pallas-hardano (v1.0.0-alpha.5)
 
 ## Overview

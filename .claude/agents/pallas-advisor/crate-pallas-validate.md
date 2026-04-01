@@ -1,9 +1,3 @@
----
-name: crate-pallas-validate
-description: Detailed API and capabilities of pallas-validate — Phase-1 and Phase-2 tx validation across all eras
-type: reference
----
-
 # pallas-validate (v1.0.0-alpha.5)
 
 ## Overview

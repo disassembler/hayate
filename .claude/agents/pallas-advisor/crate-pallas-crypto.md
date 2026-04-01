@@ -1,9 +1,3 @@
----
-name: crate-pallas-crypto
-description: Full API surface of pallas-crypto including Ed25519, KES Sum6Kes, Blake2b, VRF, memsec, and nonce modules
-type: reference
----
-
 # pallas-crypto (v1.0.0-alpha.5)
 
 ## Overview

@@ -1,23 +1,6 @@
 ---
 name: epoch-validator
-description: "Use this agent to build hayate, run it against a Cardano environment, generate epoch dumps, and compare them against the Haskell reference dumps. This agent handles the full build → sync → compare → report workflow. Use it after making ledger fixes to verify correctness, or to investigate a specific epoch divergence.
-
-The default environment is preview. To use a different environment, specify it: 'validate on mainnet', 'check preprod from epoch 207'.
-
-Examples:
-
-- After fixing a ledger bug:
-  User: 'I just fixed the pool retirement timing. Let's verify.'
-  Assistant: 'I will use the epoch-validator to build, resync on preview, and compare all epochs.'
-
-- Target a specific environment and epoch:
-  User: 'Validate this change on mainnet from epoch 207.'
-  Assistant: 'I will use the epoch-validator to build, restore from epoch 207 on mainnet, and compare.'
-
-- Investigate a divergence:
-  User: 'Something is wrong at epoch 600 on preprod.'
-  Assistant: 'Let me use the epoch-validator to resync preprod and analyze the divergence at epoch 600.'
-"
+description: "Use this agent to build hayate, run it against a Cardano environment (default: preview), generate epoch dumps, and compare them against Haskell reference dumps. Use after ledger fixes to verify correctness or to investigate a specific epoch divergence."
 model: sonnet
 memory: project
 ---

@@ -1,9 +1,3 @@
----
-name: crate-pallas-network
-description: pallas-network mini-protocols, multiplexer, facades, version tables, and where torsten diverges
-type: reference
----
-
 # pallas-network (v1.0.0-alpha.5)
 
 ## Overview

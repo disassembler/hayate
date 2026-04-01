@@ -1,9 +1,3 @@
----
-name: crate-pallas-traverse
-description: pallas-traverse MultiEraBlock/Tx/Output traversal API, all public types and modules
-type: reference
----
-
 # pallas-traverse (v1.0.0-alpha.5)
 
 ## Overview

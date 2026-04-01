@@ -1,9 +1,3 @@
----
-name: pallas-ecosystem-overview
-description: All pallas crates, version status, release history, workspace layout, and what's published vs experimental
-type: reference
----
-
 # Pallas Ecosystem Overview
 
 Last researched: 2026-03-13 against v1.0.0-alpha.5

@@ -1,9 +1,3 @@
----
-name: crate-pallas-configs
-description: Genesis file parsing capabilities of pallas-configs across all eras; comparison to torsten-node genesis.rs
-type: reference
----
-
 # pallas-configs (v1.0.0-alpha.5)
 
 ## Overview

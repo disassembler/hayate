@@ -1,20 +1,6 @@
 ---
 name: ledger-spec
-description: "Use this agent when you need to understand what the Cardano protocol is *supposed* to do according to the formal specification or CIPs — as opposed to how Haskell happens to implement it. Provides answers grounded in the Agda formal-ledger-specifications and Cardano Improvement Proposals.
-
-Use this (not haskell-ledger) when the question is about intended behavior, mathematical definitions, abstract rule structure, or when you want the spec as a reference point to compare against the Haskell implementation.
-
-Examples:
-
-- User: 'What does the spec say the drepDistr formula should be?'
-  Assistant: 'Let me use ledger-spec to find the formal definition in formal-ledger-specifications.'
-
-- User: 'How does CIP-1694 define the ratification thresholds for ParameterChange?'
-  Assistant: 'I will use ledger-spec to look up the threshold definitions in CIP-1694.'
-
-- User: 'What is the abstract NEWEPOCH rule ordering according to the spec?'
-  Assistant: 'Let me use ledger-spec to trace the STS rule in the Agda specification.'
-"
+description: "Use this agent to look up what the Cardano protocol is supposed to do per the formal Agda spec or CIPs. Use for intended behavior, mathematical definitions, STS rule structure, reward formulas, and governance rules — not for Haskell implementation details."
 model: opus
 memory: project
 ---

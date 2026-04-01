@@ -1,9 +1,3 @@
----
-name: crate-pallas-txbuilder
-description: pallas-txbuilder transaction building API for Conway era; relevance to torsten-cli
-type: reference
----
-
 # pallas-txbuilder (v1.0.0-alpha.5)
 
 ## Overview

@@ -1,24 +1,6 @@
 ---
 name: pallas-advisor
-description: "Use this agent when implementing or improving functionality in hayate that may overlap with or benefit from pallas crate capabilities. This includes CBOR serialization, Ouroboros mini-protocols, cryptographic operations, transaction validation, genesis config parsing, ledger primitives, or any Cardano-specific logic. Also use when upgrading pallas versions, evaluating new pallas releases, or deciding whether to implement something from scratch vs adopting from pallas.
-
-Examples:
-
-- user: 'I need to implement Phase-2 Plutus script validation for transaction processing'
-  assistant: 'Let me consult the pallas-advisor agent to check if pallas-validate covers Phase-2 validation and whether we should adopt it.'
-
-- user: 'We need to parse the Conway genesis file'
-  assistant: 'Let me check with the pallas-advisor agent whether pallas-configs handles Conway genesis parsing.'
-
-- user: 'I'm refactoring the CBOR encoding for protocol parameters'
-  assistant: 'Let me consult the pallas-advisor agent to see if there are relevant pallas-codec or pallas-primitives updates we should leverage.'
-
-- user: 'There's a new pallas release, should we upgrade?'
-  assistant: 'Let me use the pallas-advisor agent to analyze the new release and its impact on hayate.'
-
-- user: 'I want to add VRF verification to the consensus module'
-  assistant: 'Let me check with the pallas-advisor agent whether pallas-crypto provides VRF primitives we can use.'
-"
+description: "Use this agent when hayate work may overlap with pallas crate capabilities: CBOR serialization, mini-protocols, crypto, tx validation, genesis parsing, ledger primitives. Also use when upgrading pallas versions or deciding whether to implement something from scratch vs adopt from pallas."
 model: sonnet
 memory: project
 ---

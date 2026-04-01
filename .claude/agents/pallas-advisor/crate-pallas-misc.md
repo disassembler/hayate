@@ -1,9 +1,3 @@
----
-name: crate-pallas-misc
-description: pallas-addresses, pallas-primitives, pallas-codec, pallas-bech32, pallas-utxorpc — capabilities and torsten usage
-type: reference
----
-
 # Miscellaneous Pallas Crates
 
 ## pallas-addresses (v1.0.0-alpha.5)

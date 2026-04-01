@@ -1,20 +1,6 @@
 ---
 name: haskell-ledger
-description: "Use this agent when you need to understand exactly how the Haskell cardano-ledger or ouroboros-consensus implements a specific rule, formula, or behavior. Provides source-verified answers about concrete Haskell implementation details so hayate can match them precisely.
-
-Use this (not ledger-spec) when the question is about implementation specifics: exact file/function locations, Haskell types, ordering of sub-rules, edge cases in the code, or when Haskell behavior may differ from the formal spec.
-
-Examples:
-
-- User: 'How does Haskell apply pool retirements relative to the mark snapshot?'
-  Assistant: 'Let me use haskell-ledger to find the exact POOL/SNAP ordering in the EPOCH STS rule.'
-
-- User: 'What exact function computes drepDistr and what inputs does it use?'
-  Assistant: 'I will use haskell-ledger to trace the DRepPulser.hs implementation.'
-
-- User: 'Does nesBprev include the retiring pool's blocks?'
-  Assistant: 'Let me use haskell-ledger to check how nesBprev is populated in ouroboros-consensus.'
-"
+description: "Use this agent to look up exactly how Haskell cardano-ledger or ouroboros-consensus implements a specific rule, formula, or behavior — for implementation specifics like exact file/function locations, Haskell types, ordering of sub-rules, and edge cases."
 model: opus
 memory: project
 ---

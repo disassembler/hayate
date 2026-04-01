@@ -1,9 +1,3 @@
----
-name: pallas-gaps-and-recommendations
-description: ADOPT/ADAPT/IMPLEMENT decisions for each pallas crate, with rationale and migration paths
-type: reference
----
-
 # Pallas Gaps and Adoption Recommendations
 
 Last reviewed: 2026-03-13, pallas v1.0.0-alpha.5

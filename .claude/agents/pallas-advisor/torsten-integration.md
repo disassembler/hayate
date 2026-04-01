@@ -1,9 +1,3 @@
----
-name: torsten-pallas-integration
-description: Exact pallas versions/features used per torsten crate, known workarounds, API quirks, and integration patterns
-type: reference
----
-
 # Torsten-Pallas Integration Details
 
 Last reviewed: 2026-03-13, pallas v1.0.0-alpha.5

@@ -1,18 +1,6 @@
 ---
 name: ledger-lead
-description: "Use this agent when working on hayate's ledger code: epoch transitions, reward calculation, stake snapshots, pool retirement, certificate processing, deposit tracking, or Conway governance. Use it to investigate a specific divergence, implement a missing feature, or verify a fix against the Haskell reference behavior.
-
-Examples:
-
-- User: 'The drepDistr is wrong. How do we compute it?'
-  Assistant: 'Let me use the ledger-lead to analyze the GovernanceState and epoch.rs drepDistr computation.'
-
-- User: 'Pool retirement is one epoch too early. Can you fix it?'
-  Assistant: 'I will use the ledger-lead to trace the retirement flow and fix the timing in epoch.rs.'
-
-- User: 'We need to implement StakeRegDeleg cert handling.'
-  Assistant: 'Let me use the ledger-lead to implement the combined register+delegate cert in main.rs.'
-"
+description: "Use this agent when working on hayate's ledger code: epoch transitions, reward calculation, stake snapshots, pool retirement, certificate processing, deposit tracking, or Conway governance. Use it to investigate divergences, implement missing features, or verify fixes against Haskell reference behavior."
 model: sonnet
 memory: project
 ---

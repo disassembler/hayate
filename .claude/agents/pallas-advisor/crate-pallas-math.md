@@ -1,9 +1,3 @@
----
-name: crate-pallas-math
-description: pallas-math fixed-point arithmetic, VRF leader check math, and comparison with torsten's ported implementation
-type: reference
----
-
 # pallas-math (v1.0.0-alpha.5)
 
 ## Overview
