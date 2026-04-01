@@ -1165,13 +1165,21 @@ async fn process_block_simple(
 
         // Process consumed UTxOs.
         // For valid txs, consumes() returns inputs(); for invalid txs, it returns collateral().
+        // Track consumed values for invalid txs to compute collateral fee.
+        let mut consumed_value: u64 = 0;
         for input in tx.consumes() {
             let input_hash = input.hash();
             let input_index = input.index();
 
             let t = std::time::Instant::now();
-            storage.remove_utxo(input_hash.as_ref(), input_index as u32)?;
+            let removed = storage.remove_utxo(input_hash.as_ref(), input_index as u32)?;
             remove_us += t.elapsed().as_micros() as u64;
+
+            if !tx_valid {
+                if let Some(entry) = &removed {
+                    consumed_value += entry.amount;
+                }
+            }
         }
 
         // Process produced UTxOs.
@@ -1565,18 +1573,24 @@ async fn process_block_simple(
 
         // Track transaction fees.
         // For valid txs: fee is the declared tx fee.
-        // For invalid txs (phase-2 script failure): fee is total_collateral, which is
-        // the amount actually consumed from the collateral inputs.
+        // For invalid txs (phase-2 script failure): fee is total_collateral, or if absent,
+        // the sum of consumed collateral input values minus collateral return value.
         let tx_fee = if tx_valid {
             tx.fee().unwrap_or(0)
         } else {
-            // In Babbage+, total_collateral is explicit in the tx body.
-            // In Alonzo, it must be computed as sum(collateral inputs) - collateral_return,
-            // but Alonzo has no collateral_return so it is just sum(collateral input values).
-            // However, Alonzo collateral inputs are consumed fully (no return), and the
-            // "fee" for an invalid Alonzo tx is the sum of collateral input values.
-            // We use total_collateral if available (Babbage+), otherwise fall back to tx.fee().
-            tx.total_collateral().unwrap_or_else(|| tx.fee().unwrap_or(0))
+            // Babbage/Conway: use explicit total_collateral if present.
+            // Otherwise (Alonzo-style or Babbage without the optional field):
+            // fee = sum(collateral_input_values) - collateral_return_value.
+            // consumed_value was computed above during UTxO removal; produced_value
+            // comes from the collateral_return output (already inserted into storage).
+            if let Some(tc) = tx.total_collateral() {
+                tc
+            } else {
+                let return_value = tx.collateral_return()
+                    .map(|r| r.value().coin())
+                    .unwrap_or(0);
+                consumed_value.saturating_sub(return_value)
+            }
         };
         ledger_state.epoch_fees.0 += tx_fee;
         if tx_fee > 0 {
