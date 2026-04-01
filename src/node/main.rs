@@ -620,6 +620,16 @@ async fn process_block_bytes(
             *blocks_processed += 1;
             *epoch_tx_count += tx_count as u64;
 
+            if *blocks_processed % 1000 == 0 {
+                info!(
+                    target: "Hayate.Sync",
+                    slot,
+                    epoch = *current_epoch,
+                    blocks_total = *blocks_processed,
+                    "sync.progress"
+                );
+            }
+
             let (slot_off, epoch_len) = ledger_state.slot_within_epoch(slot);
             debug!(slot, elapsed_us = t_block.elapsed().as_micros() as u64, decode_us, remove_us, insert_us, certs_us, "block");
             trace!(
