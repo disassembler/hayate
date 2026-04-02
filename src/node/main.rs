@@ -2006,10 +2006,18 @@ fn process_alonzo_certificate(
 
                 // New registrations go directly to pool_params; re-registrations go to
                 // future_pool_params so updated params appear in the NEXT mark snapshot.
-                // Note: re-registration does NOT cancel a pending retirement — both Haskell and
-                // Hayate leave psRetiring unchanged when a RegPool cert is processed.
+                // Haskell POOL STS: re-registration cancels pending retirement
+                // (psRetiringL %~ Map.delete ppId).
                 let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
                     Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
+                    // Cancel any pending retirement for this pool (Haskell: Map.delete ppId psRetiring)
+                    if ledger_state.pending_retirements.remove(&pool_id).is_some() {
+                        tracing::info!(
+                            "e={} s={} off={} | Pool re-registration cancelled pending retirement: {}",
+                            epoch, slot, slot_off,
+                            hex::encode(&pool_id[..8]),
+                        );
+                    }
                     false
                 } else {
                     Arc::make_mut(&mut ledger_state.pool_params).insert(pool_id, pool_reg);
@@ -2053,11 +2061,11 @@ fn process_alonzo_certificate(
                 let mut pool_id = [0u8; 28];
                 pool_id.copy_from_slice(&pool_bytes[..28]);
 
+                // Haskell: psRetiring is Map PoolId EpochNo — insert replaces any
+                // previous retirement epoch for the same pool.
                 ledger_state
                     .pending_retirements
-                    .entry(EpochNo(*retirement_epoch))
-                    .or_insert_with(Vec::new)
-                    .push(pool_id);
+                    .insert(pool_id, EpochNo(*retirement_epoch));
 
                 tracing::debug!(
                     "e={} s={} off={} | Pool retirement scheduled: {} at epoch {}",
@@ -2334,9 +2342,18 @@ fn process_conway_certificate(
 
                 // New registrations go directly to pool_params; re-registrations go to
                 // future_pool_params so updated params appear in the NEXT mark snapshot.
-                // Note: re-registration does NOT cancel a pending retirement.
+                // Haskell POOL STS: re-registration cancels pending retirement
+                // (psRetiringL %~ Map.delete ppId).
                 let is_new_pool = if ledger_state.pool_params.contains_key(&pool_id) {
                     Arc::make_mut(&mut ledger_state.future_pool_params).insert(pool_id, pool_reg);
+                    // Cancel any pending retirement for this pool (Haskell: Map.delete ppId psRetiring)
+                    if ledger_state.pending_retirements.remove(&pool_id).is_some() {
+                        tracing::info!(
+                            "e={} s={} off={} | Pool re-registration cancelled pending retirement: {}",
+                            epoch, slot, slot_off,
+                            hex::encode(&pool_id[..8]),
+                        );
+                    }
                     false
                 } else {
                     Arc::make_mut(&mut ledger_state.pool_params).insert(pool_id, pool_reg);
@@ -2380,11 +2397,11 @@ fn process_conway_certificate(
                 let mut pool_id = [0u8; 28];
                 pool_id.copy_from_slice(&pool_bytes[..28]);
 
+                // Haskell: psRetiring is Map PoolId EpochNo — insert replaces any
+                // previous retirement epoch for the same pool.
                 ledger_state
                     .pending_retirements
-                    .entry(EpochNo(*retirement_epoch))
-                    .or_insert_with(Vec::new)
-                    .push(pool_id);
+                    .insert(pool_id, EpochNo(*retirement_epoch));
 
                 tracing::debug!(
                     "e={} s={} off={} | Pool retirement scheduled: {} at epoch {}",

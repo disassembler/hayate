@@ -83,8 +83,11 @@ pub struct LedgerState {
     #[serde(default)]
     pub future_pool_params: Arc<HashMap<Hash28, PoolRegistration>>,
 
-    /// Pool retirements pending at a given epoch
-    pub pending_retirements: BTreeMap<EpochNo, Vec<Hash28>>,
+    /// Pool retirements: pool_id → retirement epoch.
+    /// Matches Haskell's `psRetiring :: Map (KeyHash 'StakePool) EpochNo`.
+    /// Re-registration (RegPool for an existing pool) cancels a pending retirement
+    /// by removing the pool from this map.
+    pub pending_retirements: HashMap<Hash28, EpochNo>,
 
     /// Stake snapshots for the Cardano "mark/set/go" snapshot model
     pub snapshots: EpochSnapshots,
@@ -253,7 +256,7 @@ impl LedgerState {
             delegations: Arc::new(HashMap::new()),
             pool_params: Arc::new(HashMap::new()),
             future_pool_params: Arc::new(HashMap::new()),
-            pending_retirements: BTreeMap::new(),
+            pending_retirements: HashMap::new(),
             snapshots: EpochSnapshots::default(),
             reward_accounts: Arc::new(HashMap::new()),
             epoch_fees: Lovelace(0),

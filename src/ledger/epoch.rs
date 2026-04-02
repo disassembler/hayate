@@ -226,7 +226,7 @@ impl LedgerState {
 
         // Step 5a: POOLREAP — retire pools after taking the mark snapshot.
         // Matches Haskell's EPOCH STS: SNAP runs before POOL (POOLREAP).
-        // Haskell's POOLREAP retires pools where retire_epoch <= new_epoch (current epoch number).
+        // Haskell's POOLREAP retires pools where retire_epoch == new_epoch (exact match).
         // The mark snapshot above includes pools that are being retired in this same transition.
         {
             // Haskell POOLREAP step 1: activate future pool params BEFORE retirement.
@@ -243,13 +243,18 @@ impl LedgerState {
             }
 
             let pool_deposit = Lovelace(self.protocol_params.pool_deposit);
+            // Haskell: retired = {k | (k, v) <- psRetiring, v == e}
+            // pending_retirements is HashMap<Hash28, EpochNo> (pool_id → epoch)
             let retiring: Vec<Hash28> = self
                 .pending_retirements
-                .range(..=new_epoch)
-                .flat_map(|(_, pools)| pools.iter().copied())
+                .iter()
+                .filter(|(_, epoch)| **epoch == new_epoch)
+                .map(|(pool_id, _)| *pool_id)
                 .collect();
-            self.pending_retirements
-                .retain(|epoch, _| *epoch > new_epoch);
+            // Remove all retired pools from pending_retirements
+            for pool_id in &retiring {
+                self.pending_retirements.remove(pool_id);
+            }
 
             // Collect the set of retired pool IDs for delegation removal
             let mut retired_set: std::collections::HashSet<Hash28> =
