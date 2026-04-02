@@ -1389,9 +1389,7 @@ async fn process_block_simple(
                                 let members_to_remove = remove
                                     .iter()
                                     .filter_map(|cred| {
-                                        stake_credential_to_hash28(cred).map(|h28| {
-                                            let mut hash = [0u8; 32];
-                                            hash[..28].copy_from_slice(&h28);
+                                        stake_credential_to_hash32(cred).map(|hash| {
                                             if matches!(
                                                 cred,
                                                 pallas_primitives::StakeCredential::ScriptHash(_)
@@ -1406,9 +1404,7 @@ async fn process_block_simple(
                                 let members_to_add = add
                                     .iter()
                                     .filter_map(|(cred, epoch)| {
-                                        stake_credential_to_hash28(cred).map(|h28| {
-                                            let mut hash = [0u8; 32];
-                                            hash[..28].copy_from_slice(&h28);
+                                        stake_credential_to_hash32(cred).map(|hash| {
                                             let credential = if matches!(
                                                 cred,
                                                 pallas_primitives::StakeCredential::ScriptHash(_)
@@ -1569,6 +1565,12 @@ async fn process_block_simple(
                         }
                         let mut cred_hash = [0u8; 32];
                         cred_hash[..28].copy_from_slice(&reward_addr_bytes[1..29]);
+                        // Tag byte 28: reward address header high nibble 0xf = scriptHash
+                        let header = reward_addr_bytes[0];
+                        if (header & 0xf0) == 0xf0 {
+                            cred_hash[28] = 0x01; // scriptHash
+                        }
+                        // keyHash tag is 0x00, already default from zero-init
                         // Zero the balance; do NOT remove the entry. Removing would make the
                         // credential appear "unregistered" to the next RUPD application, causing
                         // its rewards to be redirected to treasury (unregRU'). In Haskell,
@@ -1617,9 +1619,16 @@ async fn process_block_simple(
     Ok((decode_us, remove_us, insert_us, certs_us))
 }
 
+/// Extract a tagged stake credential from an address.
+///
+/// Returns a 29-byte `Vec<u8>`: bytes 0..28 = credential hash,
+/// byte 28 = type tag (0x00 for keyHash, 0x01 for scriptHash).
+///
+/// This matches the Haskell `Credential 'Staking` ADT where
+/// `KeyHashObj` and `ScriptHashObj` are distinct types.
 fn extract_stake_credential(
     address: &[u8],
-    ptr_map: &std::collections::HashMap<(u64, u32, u32), [u8; 28]>,
+    ptr_map: &std::collections::HashMap<(u64, u32, u32), [u8; 29]>,
 ) -> Result<Option<Vec<u8>>> {
     use pallas_addresses::{Address, ShelleyDelegationPart};
 
@@ -1628,10 +1637,20 @@ fn extract_stake_credential(
 
     match addr {
         Address::Shelley(shelley_addr) => match shelley_addr.delegation() {
-            ShelleyDelegationPart::Key(key_hash) => Ok(Some(key_hash.to_vec())),
-            ShelleyDelegationPart::Script(script_hash) => Ok(Some(script_hash.to_vec())),
+            ShelleyDelegationPart::Key(key_hash) => {
+                let mut tagged = Vec::with_capacity(29);
+                tagged.extend_from_slice(key_hash.as_ref());
+                tagged.push(0x00); // keyHash tag
+                Ok(Some(tagged))
+            }
+            ShelleyDelegationPart::Script(script_hash) => {
+                let mut tagged = Vec::with_capacity(29);
+                tagged.extend_from_slice(script_hash.as_ref());
+                tagged.push(0x01); // scriptHash tag
+                Ok(Some(tagged))
+            }
             ShelleyDelegationPart::Pointer(pointer) => {
-                // Resolve CIP-19 pointer address via ptr_map
+                // Resolve CIP-19 pointer address via ptr_map (already tagged)
                 let key = (pointer.slot(), pointer.tx_idx() as u32, pointer.cert_idx() as u32);
                 Ok(ptr_map.get(&key).map(|cred| cred.to_vec()))
             }
@@ -1849,13 +1868,22 @@ fn process_certificate(
     Ok(())
 }
 
-fn stake_credential_to_hash28(cred: &pallas_primitives::StakeCredential) -> Option<[u8; 28]> {
+/// Convert a pallas StakeCredential to a tagged Hash32.
+///
+/// Byte layout: bytes 0..28 = blake2b-224 hash, byte 28 = type tag
+/// (0x00 for KeyHash, 0x01 for ScriptHash), bytes 29..32 = 0.
+///
+/// This preserves the Haskell distinction between `KeyHashObj` and
+/// `ScriptHashObj`: two credentials with the same raw hash but different
+/// types are different map keys.
+fn stake_credential_to_hash32(cred: &pallas_primitives::StakeCredential) -> Option<[u8; 32]> {
     match cred {
         pallas_primitives::StakeCredential::AddrKeyhash(hash) => {
             let bytes = hash.as_ref();
             if bytes.len() >= 28 {
-                let mut result = [0u8; 28];
-                result.copy_from_slice(&bytes[..28]);
+                let mut result = [0u8; 32];
+                result[..28].copy_from_slice(&bytes[..28]);
+                // result[28] = 0x00 — keyHash tag (already zero)
                 Some(result)
             } else {
                 None
@@ -1864,8 +1892,9 @@ fn stake_credential_to_hash28(cred: &pallas_primitives::StakeCredential) -> Opti
         pallas_primitives::StakeCredential::ScriptHash(hash) => {
             let bytes = hash.as_ref();
             if bytes.len() >= 28 {
-                let mut result = [0u8; 28];
-                result.copy_from_slice(&bytes[..28]);
+                let mut result = [0u8; 32];
+                result[..28].copy_from_slice(&bytes[..28]);
+                result[28] = 0x01; // scriptHash tag
                 Some(result)
             } else {
                 None
@@ -1891,10 +1920,7 @@ fn process_alonzo_certificate(
 
     match cert {
         Certificate::StakeRegistration(stake_cred) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 // Track deposit only on new registrations (not re-registrations)
@@ -1910,18 +1936,17 @@ fn process_alonzo_certificate(
                     ledger_state.script_stake_credentials.insert(hash);
                 }
 
-                // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                // Record tagged pointer for CIP-19 pointer address resolution (types 4-5)
+                let mut tagged = [0u8; 29];
+                tagged[..29].copy_from_slice(&hash[..29]);
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged);
 
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
         }
 
         Certificate::StakeDeregistration(stake_cred) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
@@ -1936,22 +1961,19 @@ fn process_alonzo_certificate(
         }
 
         Certificate::StakeDelegation(stake_cred, pool_hash) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let pool_bytes = pool_hash.as_ref();
 
                 if pool_bytes.len() >= 28 {
-                    let mut stake_hash = [0u8; 32];
-                    stake_hash[..28].copy_from_slice(&cred_hash);
-
                     let mut pool_id = [0u8; 28];
                     pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                    Arc::make_mut(&mut ledger_state.delegations).insert(stake_hash, pool_id);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
 
                     tracing::debug!(
                         "e={} s={} off={} | Delegation: {} -> {}",
                         epoch, slot, slot_off,
-                        hex::encode(&stake_hash[..8]),
+                        hex::encode(&hash[..8]),
                         hex::encode(&pool_id[..8])
                     );
                 }
@@ -2227,10 +2249,7 @@ fn process_conway_certificate(
     match cert {
         // Basic stake certificates (same as Alonzo)
         Certificate::StakeRegistration(stake_cred) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 // Track deposit only on new registrations (not re-registrations)
@@ -2246,18 +2265,17 @@ fn process_conway_certificate(
                     ledger_state.script_stake_credentials.insert(hash);
                 }
 
-                // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                // Record tagged pointer for CIP-19 pointer address resolution (types 4-5)
+                let mut tagged = [0u8; 29];
+                tagged[..29].copy_from_slice(&hash[..29]);
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged);
 
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
         }
 
         Certificate::StakeDeregistration(stake_cred) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
@@ -2272,22 +2290,19 @@ fn process_conway_certificate(
         }
 
         Certificate::StakeDelegation(stake_cred, pool_hash) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let pool_bytes = pool_hash.as_ref();
 
                 if pool_bytes.len() >= 28 {
-                    let mut stake_hash = [0u8; 32];
-                    stake_hash[..28].copy_from_slice(&cred_hash);
-
                     let mut pool_id = [0u8; 28];
                     pool_id.copy_from_slice(&pool_bytes[..28]);
 
-                    Arc::make_mut(&mut ledger_state.delegations).insert(stake_hash, pool_id);
+                    Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
 
                     tracing::debug!(
                         "e={} s={} off={} | Delegation: {} -> {}",
                         epoch, slot, slot_off,
-                        hex::encode(&stake_hash[..8]),
+                        hex::encode(&hash[..8]),
                         hex::encode(&pool_id[..8])
                     );
                 }
@@ -2414,10 +2429,7 @@ fn process_conway_certificate(
 
         // Conway-specific governance certificates
         Certificate::Reg(stake_cred, deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
 
                 if is_new {
@@ -2435,16 +2447,16 @@ fn process_conway_certificate(
                 }
 
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                let mut tagged29 = [0u8; 29];
+                tagged29[..28].copy_from_slice(&hash[..28]);
+                tagged29[28] = hash[28]; // key/script tag
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged29);
 
-                tracing::debug!("Conway stake registered: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Conway stake registered: {}", hex::encode(&hash[..8]));
             }
         }
         Certificate::UnReg(stake_cred, _deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
-
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
 
@@ -2456,27 +2468,23 @@ fn process_conway_certificate(
 
                 tracing::debug!(
                     "Conway stake deregistered: {}",
-                    hex::encode(&cred_hash[..8])
+                    hex::encode(&hash[..8])
                 );
             }
         }
 
         Certificate::VoteDeleg(stake_cred, drep) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let hayate_drep = pallas_drep_to_hayate(drep);
                 Arc::make_mut(&mut ledger_state.governance)
                     .vote_delegations
                     .insert(hash, hayate_drep);
-                tracing::debug!("Vote delegation: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Vote delegation: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::StakeVoteDeleg(stake_cred, pool_keyhash, drep) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let pool_bytes = pool_keyhash.as_ref();
                 if pool_bytes.len() >= 28 {
                     let mut pool_id = [0u8; 28];
@@ -2487,14 +2495,12 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.governance)
                     .vote_delegations
                     .insert(hash, hayate_drep);
-                tracing::debug!("Stake+vote delegation: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Stake+vote delegation: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::StakeRegDeleg(stake_cred, pool_keyhash, deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
@@ -2513,16 +2519,17 @@ fn process_conway_certificate(
                     Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
                 }
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                let mut tagged29 = [0u8; 29];
+                tagged29[..28].copy_from_slice(&hash[..28]);
+                tagged29[28] = hash[28]; // key/script tag
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged29);
 
-                tracing::debug!("Stake reg+delegate: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Stake reg+delegate: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::VoteRegDeleg(stake_cred, drep, deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
@@ -2539,16 +2546,17 @@ fn process_conway_certificate(
                     .vote_delegations
                     .insert(hash, hayate_drep);
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                let mut tagged29 = [0u8; 29];
+                tagged29[..28].copy_from_slice(&hash[..28]);
+                tagged29[28] = hash[28]; // key/script tag
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged29);
 
-                tracing::debug!("Vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Vote reg+delegate: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::StakeVoteRegDeleg(stake_cred, pool_keyhash, drep, deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(stake_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let is_new = Arc::make_mut(&mut ledger_state.reward_accounts).insert(hash, Lovelace(0)).is_none();
                 if is_new {
                     ledger_state.deposit_tracker.add_deposit(
@@ -2571,21 +2579,20 @@ fn process_conway_certificate(
                     .vote_delegations
                     .insert(hash, hayate_drep);
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
-                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+                let mut tagged29 = [0u8; 29];
+                tagged29[..28].copy_from_slice(&hash[..28]);
+                tagged29[28] = hash[28]; // key/script tag
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), tagged29);
 
-                tracing::debug!("Stake+vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("Stake+vote reg+delegate: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::AuthCommitteeHot(cold_cred, hot_cred) => {
-            if let (Some(cold_28), Some(hot_28)) = (
-                stake_credential_to_hash28(cold_cred),
-                stake_credential_to_hash28(hot_cred),
+            if let (Some(cold_hash), Some(hot_hash)) = (
+                stake_credential_to_hash32(cold_cred),
+                stake_credential_to_hash32(hot_cred),
             ) {
-                let mut cold_hash = [0u8; 32];
-                cold_hash[..28].copy_from_slice(&cold_28);
-                let mut hot_hash = [0u8; 32];
-                hot_hash[..28].copy_from_slice(&hot_28);
                 let gov = Arc::make_mut(&mut ledger_state.governance);
                 gov.committee_hot_keys.insert(cold_hash, hot_hash);
                 gov.committee_resigned.remove(&cold_hash);
@@ -2597,30 +2604,26 @@ fn process_conway_certificate(
                 }
                 tracing::debug!(
                     "Committee hot key authorized: {} -> {}",
-                    hex::encode(&cold_28[..8]),
-                    hex::encode(&hot_28[..8])
+                    hex::encode(&cold_hash[..8]),
+                    hex::encode(&hot_hash[..8])
                 );
             }
         }
 
         Certificate::ResignCommitteeCold(cold_cred, _anchor) => {
-            if let Some(cold_28) = stake_credential_to_hash28(cold_cred) {
-                let mut cold_hash = [0u8; 32];
-                cold_hash[..28].copy_from_slice(&cold_28);
+            if let Some(cold_hash) = stake_credential_to_hash32(cold_cred) {
                 let gov = Arc::make_mut(&mut ledger_state.governance);
                 gov.committee_resigned.insert(cold_hash, None);
                 gov.committee_hot_keys.remove(&cold_hash);
                 if matches!(cold_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
                     gov.script_committee_credentials.insert(cold_hash);
                 }
-                tracing::debug!("Committee member resigned: {}", hex::encode(&cold_28[..8]));
+                tracing::debug!("Committee member resigned: {}", hex::encode(&cold_hash[..8]));
             }
         }
 
         Certificate::RegDRepCert(drep_cred, deposit, anchor) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(drep_cred) {
                 ledger_state.deposit_tracker.add_deposit(
                     hash,
                     DepositType::DRep,
@@ -2660,16 +2663,14 @@ fn process_conway_certificate(
                 gov.drep_registration_count += 1;
                 tracing::debug!(
                     "DRep registered: {} deposit={}",
-                    hex::encode(&cred_hash[..8]),
+                    hex::encode(&hash[..8]),
                     deposit
                 );
             }
         }
 
         Certificate::UnRegDRepCert(drep_cred, _deposit) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(drep_cred) {
                 if let Some(refund) = ledger_state
                     .deposit_tracker
                     .refund_deposit(&hash, DepositType::DRep)
@@ -2681,14 +2682,12 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.governance)
                     .dreps
                     .remove(&hash);
-                tracing::debug!("DRep deregistered: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("DRep deregistered: {}", hex::encode(&hash[..8]));
             }
         }
 
         Certificate::UpdateDRepCert(drep_cred, anchor) => {
-            if let Some(cred_hash) = stake_credential_to_hash28(drep_cred) {
-                let mut hash = [0u8; 32];
-                hash[..28].copy_from_slice(&cred_hash);
+            if let Some(hash) = stake_credential_to_hash32(drep_cred) {
                 let current_epoch = ledger_state.epoch;
                 // Issue 6: store updated anchor
                 let hayate_anchor = anchor.as_ref().map(|a| {
@@ -2705,7 +2704,7 @@ fn process_conway_certificate(
                     reg.last_active_epoch = current_epoch;
                     reg.anchor = hayate_anchor;
                 }
-                tracing::debug!("DRep updated: {}", hex::encode(&cred_hash[..8]));
+                tracing::debug!("DRep updated: {}", hex::encode(&hash[..8]));
             }
         }
     }

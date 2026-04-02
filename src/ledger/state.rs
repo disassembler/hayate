@@ -215,7 +215,8 @@ pub struct LedgerState {
     ///
     /// Matches Haskell's `UMap.umPtrs :: Map Ptr (Credential 'Staking)`.
     #[serde(default)]
-    pub ptr_map: HashMap<(u64, u32, u32), [u8; 28]>,
+    /// Tagged credential: bytes 0..28 = hash, byte 28 = type tag (0=key, 1=script).
+    pub ptr_map: HashMap<(u64, u32, u32), [u8; 29]>,
 
     /// The decentralization parameter (d) from the PREVIOUS epoch.
     ///

@@ -376,12 +376,20 @@ impl LedgerState {
     }
 
     /// Extract stake credential hash from reward account bytes.
-    /// Reward accounts are 29 bytes: [network_id][credential_type][28-byte hash]
+    /// Reward accounts are 29 bytes: [header(1)][28-byte hash].
+    /// Header high nibble: 0xe = keyHash, 0xf = scriptHash.
+    /// Returns Hash32 with byte 28 tagged: 0x00 = keyHash, 0x01 = scriptHash.
     pub(crate) fn reward_account_to_hash(reward_account: &[u8]) -> Hash32 {
         if reward_account.len() >= 29 {
-            let mut hash28 = [0u8; 28];
-            hash28.copy_from_slice(&reward_account[1..29]);
-            hash28.to_hash32_padded()
+            let mut hash = [0u8; 32];
+            hash[..28].copy_from_slice(&reward_account[1..29]);
+            // Tag byte 28 based on reward address header
+            let header = reward_account[0];
+            if (header & 0xf0) == 0xf0 {
+                hash[28] = 0x01; // scriptHash
+            }
+            // keyHash (0xe_) leaves byte 28 as 0x00
+            hash
         } else {
             [0u8; 32]
         }

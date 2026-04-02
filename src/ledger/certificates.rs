@@ -133,11 +133,9 @@ impl LedgerState {
                     // In the EPOCH STS, SNAP runs before POOL, so the mark snapshot is taken using
                     // the current params; the future params are merged in AFTER the snapshot.
                     // This means re-registration params appear in the snapshot one epoch later.
-                    for pools in self.pending_retirements.values_mut() {
-                        pools.retain(|id| id != &params.operator);
-                    }
-                    self.pending_retirements
-                        .retain(|_, pools| !pools.is_empty());
+                    // Haskell POOL STS: re-registration cancels pending retirement
+                    // (psRetiringL %~ Map.delete ppId)
+                    self.pending_retirements.remove(&params.operator);
                     Arc::make_mut(&mut self.future_pool_params).insert(params.operator, pool_reg);
                     tracing::debug!(
                         "Pool re-registered (queued for next epoch): {}",
@@ -168,10 +166,10 @@ impl LedgerState {
                         epoch,
                         hex::encode(pool_hash)
                     );
+                    // Haskell: psRetiring is Map PoolId EpochNo — insert replaces any
+                    // previous retirement epoch for the same pool.
                     self.pending_retirements
-                        .entry(EpochNo(*epoch))
-                        .or_default()
-                        .push(*pool_hash);
+                        .insert(*pool_hash, EpochNo(*epoch));
                 }
             }
             Certificate::RegStakeDeleg {

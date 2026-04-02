@@ -82,7 +82,14 @@ impl LedgerState {
             HashMap::with_capacity(utxo_stake.len().max(self.stake_distribution.stake_map.len()));
 
         for (cred_bytes, &amount) in utxo_stake {
-            if cred_bytes.len() >= 28 {
+            // Keys are 29 bytes: [hash(28)] [tag(1)] where tag=0x00 keyHash, 0x01 scriptHash
+            if cred_bytes.len() >= 29 {
+                let mut hash = [0u8; 32];
+                hash[..28].copy_from_slice(&cred_bytes[..28]);
+                hash[28] = cred_bytes[28]; // propagate key/script type tag
+                *new_map.entry(hash).or_insert(Lovelace(0)) += Lovelace(amount);
+            } else if cred_bytes.len() >= 28 {
+                // Legacy 28-byte keys (no tag) — treat as keyHash (tag 0x00)
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(&cred_bytes[..28]);
                 *new_map.entry(hash).or_insert(Lovelace(0)) += Lovelace(amount);
@@ -269,7 +276,7 @@ fn decode_varuint(bytes: &[u8]) -> Option<(u64, usize)> {
 /// - Address format is invalid
 fn extract_stake_credential(
     address: &[u8],
-    ptr_map: &HashMap<(u64, u32, u32), [u8; 28]>,
+    ptr_map: &HashMap<(u64, u32, u32), [u8; 29]>,
 ) -> Option<Hash32> {
     if address.is_empty() {
         return None;
@@ -283,12 +290,21 @@ fn extract_stake_credential(
         // ALL base addresses are: [header(1)] [payment(28)] [stake(28)] = 57 bytes.
         // The type nibble encodes whether each credential is key or script, but
         // the on-chain representation is always 28 bytes regardless.
+        //
+        // Stake credential type tag (byte 28 of Hash32):
+        //   types 0, 1 => keyHash   (tag 0x00)
+        //   types 2, 3 => scriptHash (tag 0x01)
         0x0 | 0x1 | 0x2 | 0x3 => {
             // Base address: header(1) + payment(28) + stake(28) = 57 bytes
             if address.len() >= 57 {
                 let stake_bytes = &address[29..57]; // Skip header(1) + payment(28)
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(stake_bytes);
+                // Types 2, 3 have scriptHash stake credential
+                if addr_type >= 2 {
+                    hash[28] = 0x01; // scriptHash tag
+                }
+                // Types 0, 1: keyHash tag is 0x00 (already zero)
                 Some(hash)
             } else {
                 None
@@ -296,7 +312,7 @@ fn extract_stake_credential(
         }
         // Pointer address types 4-5 (CIP-19):
         // [header(1)] [payment(28)] [slot(varint)] [tx_idx(varint)] [cert_idx(varint)]
-        // Resolve the pointer via ptr_map to get the 28-byte credential hash.
+        // Resolve the pointer via ptr_map to get the tagged credential.
         0x4 | 0x5 => {
             if address.len() < 30 {
                 return None; // too short for header + payment + at least 1 byte of pointer
@@ -310,17 +326,22 @@ fn extract_stake_credential(
                 .get(&(slot, tx_idx as u32, cert_idx as u32))
                 .map(|cred| {
                     let mut hash = [0u8; 32];
-                    hash[..28].copy_from_slice(cred);
+                    hash[..28].copy_from_slice(&cred[..28]);
+                    hash[28] = cred[28]; // propagate key/script tag
                     hash
                 })
         }
         // Reward address types 14-15 (CIP-19):
         // [header(1)] [stake(28)] = 29 bytes. Both key and script hashes are 28 bytes.
+        // Type 0xe = keyHash, type 0xf = scriptHash
         0xe | 0xf => {
             if address.len() >= 29 {
                 let stake_bytes = &address[1..29];
                 let mut hash = [0u8; 32];
                 hash[..28].copy_from_slice(stake_bytes);
+                if addr_type == 0xf {
+                    hash[28] = 0x01; // scriptHash tag
+                }
                 Some(hash)
             } else {
                 None
@@ -345,33 +366,32 @@ mod tests {
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xbb; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]); // Zero-padded
+        assert_eq!(cred[28], 0x00); // keyHash tag
+        assert_eq!(&cred[29..], &[0, 0, 0]); // remaining zero-padded
     }
 
     #[test]
     fn test_extract_stake_credential_base_address_type1() {
         // Base address type 1: payment script (28) + stake key (28)
-        // Per CIP-19, script hashes are blake2b-224 = 28 bytes
         let mut addr = vec![0x11]; // type 1, testnet
         addr.extend_from_slice(&[0xaa; 28]); // payment script hash (28 bytes)
         addr.extend_from_slice(&[0xbb; 28]); // stake key hash (28 bytes)
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xbb; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+        assert_eq!(cred[28], 0x00); // keyHash tag (types 0,1 have key stake)
     }
 
     #[test]
     fn test_extract_stake_credential_base_address_type2() {
         // Base address type 2: payment key (28) + stake script (28)
-        // This is the address type for script-based stake credentials
         let mut addr = vec![0x21]; // type 2, testnet
         addr.extend_from_slice(&[0xaa; 28]); // payment key hash (28 bytes)
         addr.extend_from_slice(&[0xcc; 28]); // stake script hash (28 bytes)
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xcc; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+        assert_eq!(cred[28], 0x01); // scriptHash tag (types 2,3 have script stake)
     }
 
     #[test]
@@ -383,19 +403,18 @@ mod tests {
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xdd; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+        assert_eq!(cred[28], 0x01); // scriptHash tag
     }
 
     #[test]
     fn test_extract_stake_credential_reward_address() {
         // Reward address type 14: stake key only
-        // Header 0xe1 (testnet, type 14), stake (28 bytes)
         let mut addr = vec![0xe1];
         addr.extend_from_slice(&[0xcc; 28]);
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xcc; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+        assert_eq!(cred[28], 0x00); // keyHash tag (type 0xe)
     }
 
     #[test]
@@ -406,7 +425,7 @@ mod tests {
 
         let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xee; 28]);
-        assert_eq!(&cred[28..], &[0, 0, 0, 0]);
+        assert_eq!(cred[28], 0x01); // scriptHash tag (type 0xf)
     }
 
     #[test]
@@ -427,12 +446,47 @@ mod tests {
             addr.extend_from_slice(&[0xaa; 28]); // payment
             addr.extend_from_slice(&[0xbb; 28]); // stake
             assert_eq!(addr.len(), 57, "type {:#04x} address should be 57 bytes", addr_type);
+            let cred = extract_stake_credential(&addr, &HashMap::new());
             assert!(
-                extract_stake_credential(&addr, &HashMap::new()).is_some(),
+                cred.is_some(),
                 "type {:#04x} should extract stake credential",
                 addr_type
             );
+            // Types 0x20, 0x30 have script stake → tag 0x01; types 0x00, 0x10 have key stake → tag 0x00
+            let expected_tag = if addr_type >= 0x20 { 0x01 } else { 0x00 };
+            assert_eq!(
+                cred.unwrap()[28], expected_tag,
+                "type {:#04x} should have tag {:#04x}", addr_type, expected_tag
+            );
         }
+    }
+
+    #[test]
+    fn test_same_hash_different_type_produces_different_hash32() {
+        // The core bug #14 test: same 28-byte hash at keyHash vs scriptHash address
+        // must produce different Hash32 keys
+        let hash_bytes = [0xab; 28];
+
+        // Type 0: keyHash stake
+        let mut addr_key = vec![0x01]; // type 0, testnet
+        addr_key.extend_from_slice(&[0xaa; 28]); // payment
+        addr_key.extend_from_slice(&hash_bytes); // stake
+
+        // Type 3: scriptHash stake (same raw hash)
+        let mut addr_script = vec![0x31]; // type 3, testnet
+        addr_script.extend_from_slice(&[0xaa; 28]); // payment
+        addr_script.extend_from_slice(&hash_bytes); // stake
+
+        let cred_key = extract_stake_credential(&addr_key, &HashMap::new()).unwrap();
+        let cred_script = extract_stake_credential(&addr_script, &HashMap::new()).unwrap();
+
+        // Same raw hash bytes
+        assert_eq!(&cred_key[..28], &cred_script[..28]);
+        // Different type tag
+        assert_eq!(cred_key[28], 0x00);   // keyHash
+        assert_eq!(cred_script[28], 0x01); // scriptHash
+        // Therefore different Hash32 values (the whole point of bug #14 fix)
+        assert_ne!(cred_key, cred_script);
     }
 
     #[test]
