@@ -497,8 +497,8 @@ async fn process_block_bytes(
                     let epoch_fees_ada = ledger_state.epoch_fees.0 / 1_000_000;
                     let old_era = era_name(ledger_state.protocol_params.protocol_version_major);
 
-                    // Capture enactments before process_epoch_transition consumes them
-                    let pending_enactments: Vec<_> = ledger_state
+                    // Capture stale enactment descriptions before they're discarded.
+                    let stale_enactment_descs: Vec<_> = ledger_state
                         .pending_enactments
                         .iter()
                         .map(|e| describe_gov_action(&e.gov_action, &ledger_state.protocol_params))
@@ -585,7 +585,13 @@ async fn process_block_bytes(
                             current_epoch, epoch_tx_count
                         );
                     }
-                    for desc in &pending_enactments {
+                    // Log stale enactments that were discarded (from old snapshots)
+                    for desc in &stale_enactment_descs {
+                        info!(target: "ChainDB.LedgerEvent", "  enacted (stale): {desc}");
+                    }
+                    // Log newly ratified proposals (enacted in this epoch transition)
+                    for (_, state) in &ledger_state.governance.last_ratified {
+                        let desc = describe_gov_action(&state.procedure.gov_action, &ledger_state.protocol_params);
                         info!(target: "ChainDB.LedgerEvent", "  enacted: {desc}");
                     }
                     info!(

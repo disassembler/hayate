@@ -387,12 +387,11 @@ pub enum GovernanceAction {
     InfoAction,
 }
 
-/// A governance proposal ratified at epoch N that must be enacted (and its deposit returned)
-/// at epoch N+1, after the mark snapshot is taken.
+/// A governance proposal ratified during RATIFY, to be enacted immediately in ENACT.
 ///
-/// Matches Haskell's 2-phase RATIFY → ENACT ordering:
-/// - RATIFY at epoch N: proposal passes, stored here
-/// - ENACT at epoch N+1: action applied, deposit returned to reward_accounts (after SNAP)
+/// Haskell's Conway EPOCH STS applies RATIFY then ENACT in the same epoch transition.
+/// The deposit is returned to reward_accounts after the mark snapshot is taken,
+/// so it appears in the NEXT epoch's mark snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingEnactment {
     pub action_id: GovActionId,

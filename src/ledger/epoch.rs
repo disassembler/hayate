@@ -319,43 +319,21 @@ impl LedgerState {
             }
         }
 
-        // ENACT: Apply proposals ratified at the PREVIOUS epoch boundary.
+        // NOTE: Governance ENACT (deposit refunds and action effects) is now applied
+        // immediately after RATIFY below, matching Haskell's Conway EPOCH STS which
+        // does SNAP → POOLREAP → RATIFY → ENACT in the same epoch transition.
         //
-        // Matches Haskell's NEWEPOCH STS order: EPOCH (→ SNAP) then ENACT then RATIFY.
-        // ENACT runs AFTER the mark snapshot, so the deposit does NOT appear in this epoch's
-        // mark. It will appear in the mark at the NEXT epoch boundary (one epoch later).
-        //
-        // Example: proposal passes RATIFY at epoch N → pending_enactments.
-        //   Epoch N+1: mark taken (deposit NOT in reward_accounts) → ENACT (deposit added)
-        //   Epoch N+2: mark taken (deposit IS in reward_accounts) ← matches Haskell
-        let pending = std::mem::take(&mut self.pending_enactments);
-        if !pending.is_empty() {
-            tracing::info!(
+        // Discard any stale pending_enactments from snapshots saved with the old
+        // deferred 2-phase approach.  These proposals were already enacted in Haskell
+        // at the epoch they were ratified; replaying them one epoch late would
+        // double-credit deposits.
+        if !self.pending_enactments.is_empty() {
+            tracing::warn!(
                 target: "ChainDB.LedgerEvent",
-                epoch = new_epoch.0,
-                n = pending.len(),
-                "ENACT: applying {} proposal(s) ratified at previous epoch boundary",
-                pending.len()
+                "Discarding {} stale pending_enactments from previous snapshot (already enacted in Haskell)",
+                self.pending_enactments.len()
             );
-            for enactment in pending {
-                self.enact_gov_action(&enactment.gov_action);
-                if enactment.deposit.0 > 0 {
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .entry(enactment.return_cred_hash)
-                        .or_insert(Lovelace(0)) += enactment.deposit;
-                    self.deposit_tracker.refund_deposit(
-                        &enactment.return_cred_hash,
-                        super::state::DepositType::Governance(enactment.action_id),
-                    );
-                    tracing::debug!(
-                        target: "ChainDB.LedgerEvent",
-                        action_id = %hex::encode(&enactment.action_id.tx_hash),
-                        deposit = enactment.deposit.0,
-                        return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
-                        "ENACT: deposit returned to reward_accounts"
-                    );
-                }
-            }
+            self.pending_enactments.clear();
         }
 
         // NOTE: Future pool re-registrations are now activated inside POOLREAP above,
@@ -449,7 +427,40 @@ impl LedgerState {
         // Step 8: Ratify governance proposals per CIP-1694.
         // Only active in Conway era (protocol_version_major >= 9).
         // In pre-Conway eras the governance state is empty so this is a no-op.
-        let _ratified = self.ratify_proposals();
+        let enactments = self.ratify_proposals();
+
+        // ENACT: Apply ratified proposals immediately (same epoch transition).
+        // Haskell's Conway EPOCH STS does SNAP → POOLREAP → RATIFY → ENACT in one pass.
+        // Deposit refunds go to reward_accounts AFTER the mark snapshot was taken,
+        // so they appear in the NEXT epoch's mark (one epoch later), matching Haskell.
+        if !enactments.is_empty() {
+            tracing::info!(
+                target: "ChainDB.LedgerEvent",
+                epoch = new_epoch.0,
+                n = enactments.len(),
+                "ENACT: applying {} ratified proposal(s)",
+                enactments.len()
+            );
+            for enactment in enactments {
+                self.enact_gov_action(&enactment.gov_action);
+                if enactment.deposit.0 > 0 {
+                    *Arc::make_mut(&mut self.reward_accounts)
+                        .entry(enactment.return_cred_hash)
+                        .or_insert(Lovelace(0)) += enactment.deposit;
+                    self.deposit_tracker.refund_deposit(
+                        &enactment.return_cred_hash,
+                        super::state::DepositType::Governance(enactment.action_id),
+                    );
+                    tracing::debug!(
+                        target: "ChainDB.LedgerEvent",
+                        action_id = %hex::encode(&enactment.action_id.tx_hash),
+                        deposit = enactment.deposit.0,
+                        return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
+                        "ENACT: deposit returned to reward_accounts"
+                    );
+                }
+            }
+        }
 
         // Step 9: Expire governance proposals that have passed their lifetime
         let expired: Vec<GovActionId> = self
@@ -468,13 +479,12 @@ impl LedgerState {
                 {
                     // Refund deposit to return address
                     let deposit = proposal_state.procedure.deposit;
+                    // Extract credential from return address
+                    let return_cred_hash = match &proposal_state.procedure.return_addr {
+                        Credential::Key(hash) => *hash,
+                        Credential::Script(hash) => *hash,
+                    };
                     if deposit.0 > 0 {
-                        // Extract credential from return address
-                        let return_cred_hash = match &proposal_state.procedure.return_addr {
-                            Credential::Key(hash) => *hash,
-                            Credential::Script(hash) => *hash,
-                        };
-
                         *Arc::make_mut(&mut self.reward_accounts)
                             .entry(return_cred_hash)
                             .or_insert(Lovelace(0)) += deposit;
@@ -487,10 +497,11 @@ impl LedgerState {
                     }
                     tracing::debug!(
                         target: "ChainDB.LedgerEvent",
-                        "Governance proposal expired at epoch {}: {:?} (deposit {} returned)",
+                        "Governance proposal expired at epoch {}: {} (deposit {} returned to {})",
                         new_epoch.0,
-                        action_id,
-                        deposit.0
+                        hex::encode(&action_id.tx_hash[..8]),
+                        deposit.0,
+                        hex::encode(&return_cred_hash[..28]),
                     );
                 }
             }

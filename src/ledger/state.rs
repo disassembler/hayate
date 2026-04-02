@@ -199,11 +199,11 @@ pub struct LedgerState {
     #[serde(default)]
     pub conway_genesis_epoch: Option<u64>,
 
-    /// Proposals ratified at the most recent epoch boundary, waiting to be enacted.
+    /// Legacy field: previously used to defer governance enactments by one epoch.
     ///
-    /// Matches Haskell's 2-phase RATIFY → ENACT ordering:
-    /// - RATIFY at epoch N populates this list
-    /// - ENACT at epoch N+1 (after the mark snapshot) applies actions and returns deposits
+    /// Now RATIFY and ENACT happen in the same epoch transition (matching Haskell).
+    /// This field is retained only for backward compatibility with existing snapshots;
+    /// any stale entries are discarded at the first epoch transition after restore.
     #[serde(default)]
     pub pending_enactments: Vec<PendingEnactment>,
 

@@ -118,8 +118,8 @@ impl LedgerState {
     /// 5. Enact ratified proposals
     /// 6. Stop at first "delaying action" (NoConfidence, HardFork, UpdateCommittee, NewConstitution)
     ///
-    /// Returns the list of ratified action IDs.
-    pub fn ratify_proposals(&mut self) -> Vec<GovActionId> {
+    /// Returns the list of ratified enactments to be applied immediately.
+    pub fn ratify_proposals(&mut self) -> Vec<PendingEnactment> {
         // Build DRep power cache once (O(n) instead of per-proposal O(n))
         let (drep_power_cache, no_confidence_stake, _abstain_stake) =
             self.build_drep_power_cache();
@@ -138,6 +138,7 @@ impl LedgerState {
 
         let mut ratified = Vec::new();
         let mut ratified_ids = Vec::new();
+        let mut enactments = Vec::new();
         let mut delayed = false;
 
         for (action_id, state) in &proposals {
@@ -167,15 +168,13 @@ impl LedgerState {
                 // sequential proposals in the same RATIFY round can depend on each other's roots).
                 self.update_enacted_roots(&action_id, &state.procedure.gov_action);
 
-                // Stage for ENACT at the NEXT epoch boundary (after the mark snapshot).
-                // Matches Haskell's 2-phase RATIFY → ENACT ordering:
-                //   RATIFY at epoch N: proposal passes → stored in pending_enactments
-                //   ENACT  at epoch N+1: action applied, deposit returned (after SNAP/mark)
+                // Build enactment for immediate application (same epoch transition).
+                // Haskell's Conway EPOCH STS does RATIFY → ENACT in the same boundary.
                 let return_cred_hash = match &state.procedure.return_addr {
                     Credential::Key(hash) => *hash,
                     Credential::Script(hash) => *hash,
                 };
-                self.pending_enactments.push(PendingEnactment {
+                enactments.push(PendingEnactment {
                     action_id: *action_id,
                     gov_action: state.procedure.gov_action.clone(),
                     return_cred_hash,
@@ -187,7 +186,7 @@ impl LedgerState {
 
                 tracing::info!(
                     action_id = %hex::encode(&action_id.tx_hash),
-                    "Governance proposal ratified (staged for enactment at next epoch boundary)"
+                    "Governance proposal ratified"
                 );
 
                 // Check if this is a delaying action
@@ -209,7 +208,7 @@ impl LedgerState {
         Arc::make_mut(&mut self.governance).last_ratified = ratified;
         Arc::make_mut(&mut self.governance).last_ratify_delayed = delayed;
 
-        ratified_ids
+        enactments
     }
 
     /// Update enacted action roots after ratifying a proposal.
