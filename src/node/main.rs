@@ -2021,6 +2021,11 @@ fn process_alonzo_certificate(
             if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
+                // Haskell removes the entire AccountState on de-registration,
+                // which includes the DRep delegation. We must mirror that here.
+                Arc::make_mut(&mut ledger_state.governance)
+                    .vote_delegations
+                    .remove(&hash);
 
                 ledger_state
                     .deposit_tracker
@@ -2350,6 +2355,11 @@ fn process_conway_certificate(
             if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
+                // Haskell removes the entire AccountState on de-registration,
+                // which includes the DRep delegation. We must mirror that here.
+                Arc::make_mut(&mut ledger_state.governance)
+                    .vote_delegations
+                    .remove(&hash);
 
                 ledger_state
                     .deposit_tracker
@@ -2531,6 +2541,11 @@ fn process_conway_certificate(
             if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 Arc::make_mut(&mut ledger_state.delegations).remove(&hash);
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
+                // Haskell removes the entire AccountState on de-registration,
+                // which includes the DRep delegation. We must mirror that here.
+                Arc::make_mut(&mut ledger_state.governance)
+                    .vote_delegations
+                    .remove(&hash);
 
                 ledger_state
                     .deposit_tracker
