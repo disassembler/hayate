@@ -29,7 +29,7 @@ impl LedgerState {
     /// 13. createRUpd: compute new reward update -> store in pending_reward_update
     /// 14. Reset per-epoch accumulators, advance epoch number
     pub fn process_epoch_transition(&mut self, new_epoch: EpochNo) {
-        tracing::debug!("Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
+        tracing::debug!(target: "ChainDB.LedgerEvent", "Epoch transition: {} -> {}", self.epoch.0, new_epoch.0);
 
         // Capture prevPp BEFORE propagating new epoch's params.
         // This is the protocol parameters in effect during the epoch that just ended (epoch N
@@ -46,6 +46,7 @@ impl LedgerState {
                 if let Some(cur_params) = self.governance.conway_cur_params.as_deref().cloned() {
                     self.protocol_params = cur_params;
                     tracing::debug!(
+                        target: "ChainDB.LedgerEvent",
                         "Propagated conway_cur_params → protocol_params at epoch {} (genesis epoch: {})",
                         new_epoch.0, genesis_epoch
                     );
@@ -78,6 +79,7 @@ impl LedgerState {
                 if reward.0 > 0 {
                     let registered = self.reward_accounts.contains_key(cred_hash);
                     tracing::debug!(
+                        target: "ChainDB.LedgerEvent",
                         epoch = self.epoch.0,
                         cred = hex::encode(&cred_hash[..28]),
                         reward = reward.0,
@@ -101,8 +103,9 @@ impl LedgerState {
                 .saturating_add(rupd.delta_treasury)
                 .saturating_add(unreg_treasury);
 
-            tracing::debug!("RUPD: unregRU′ = {}", unreg_treasury);
+            tracing::debug!(target: "ChainDB.LedgerEvent", "RUPD: unregRU′ = {}", unreg_treasury);
             tracing::debug!(
+                target: "ChainDB.LedgerEvent",
                 "RUPD: ending balances: reserves={}, treasury={}",
                 self.reserves.0, self.treasury.0,
             );
@@ -195,6 +198,7 @@ impl LedgerState {
             .fold(0u64, |acc, l| acc.saturating_add(l.0));
 
         tracing::debug!(
+            target: "ChainDB.LedgerEvent",
             epoch = new_epoch.0,
             credentials = self.stake_distribution.stake_map.len(),
             delegations = self.delegations.len(),
@@ -285,6 +289,7 @@ impl LedgerState {
                     self.deposit_tracker
                         .refund_deposit(&pool_dep_key, super::state::DepositType::Pool);
                     tracing::info!(
+                        target: "ChainDB.LedgerEvent",
                         "Pool retired at epoch→{}: {} (deposit {} refunded, registered={})",
                         new_epoch.0,
                         hex::encode(&pool_id[..8]),
@@ -304,6 +309,7 @@ impl LedgerState {
                 let removed = before - delegations.len();
                 if removed > 0 {
                     tracing::info!(
+                        target: "ChainDB.LedgerEvent",
                         "POOLREAP: removed {} delegations to {} retired pool(s) at epoch→{}",
                         removed,
                         retired_set.len(),
@@ -325,6 +331,7 @@ impl LedgerState {
         let pending = std::mem::take(&mut self.pending_enactments);
         if !pending.is_empty() {
             tracing::info!(
+                target: "ChainDB.LedgerEvent",
                 epoch = new_epoch.0,
                 n = pending.len(),
                 "ENACT: applying {} proposal(s) ratified at previous epoch boundary",
@@ -341,6 +348,7 @@ impl LedgerState {
                         super::state::DepositType::Governance(enactment.action_id),
                     );
                     tracing::debug!(
+                        target: "ChainDB.LedgerEvent",
                         action_id = %hex::encode(&enactment.action_id.tx_hash),
                         deposit = enactment.deposit.0,
                         return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
@@ -376,6 +384,7 @@ impl LedgerState {
             let quorum = self.update_quorum;
             let n_proposals = proposals.len() as u64;
             tracing::debug!(
+                target: "ChainDB.LedgerEvent",
                 epoch = new_epoch.0,
                 n_proposals,
                 quorum,
@@ -408,7 +417,7 @@ impl LedgerState {
             if let Some(winner) = voted {
                 let changes = winner.format_changes(&self.protocol_params);
                 if let Err(e) = self.apply_protocol_param_update(winner) {
-                    tracing::warn!(epoch = new_epoch.0, error = %e, "PPUP: failed to apply protocol parameter update");
+                    tracing::warn!(target: "ChainDB.LedgerEvent", epoch = new_epoch.0, error = %e, "PPUP: failed to apply protocol parameter update");
                 } else {
                     self.ppup_enacted_log = Some(format!(
                         "PPUP: enacted protocol parameter update epoch={} changes=\"{}\"",
@@ -417,6 +426,7 @@ impl LedgerState {
                 }
             } else {
                 tracing::info!(
+                    target: "ChainDB.LedgerEvent",
                     epoch = new_epoch.0,
                     n_proposals,
                     quorum,
@@ -476,6 +486,7 @@ impl LedgerState {
                         );
                     }
                     tracing::debug!(
+                        target: "ChainDB.LedgerEvent",
                         "Governance proposal expired at epoch {}: {:?} (deposit {} returned)",
                         new_epoch.0,
                         action_id,
@@ -492,6 +503,7 @@ impl LedgerState {
             }
 
             tracing::debug!(
+                target: "ChainDB.LedgerEvent",
                 "Expired {} governance proposals at epoch {}",
                 expired.len(),
                 new_epoch.0
@@ -517,6 +529,7 @@ impl LedgerState {
             }
             if newly_inactive > 0 || reactivated > 0 {
                 tracing::debug!(
+                    target: "ChainDB.LedgerEvent",
                     "DRep activity update at epoch {}: {} newly inactive, {} reactivated (threshold: {} epochs)",
                     new_epoch.0,
                     newly_inactive,
@@ -545,6 +558,7 @@ impl LedgerState {
                     .remove(hash);
             }
             tracing::debug!(
+                target: "ChainDB.LedgerEvent",
                 "Expired {} committee members at epoch {}",
                 expired_members.len(),
                 new_epoch.0
@@ -598,6 +612,7 @@ impl LedgerState {
         });
 
         tracing::debug!(
+            target: "ChainDB.LedgerEvent",
             "createRUpd: epoch={}, pay_stake_epoch={}, pay_blocks={}, fees={},",
             self.epoch.0,
             self.snapshots.pay.as_ref().map(|p| p.epoch.0).unwrap_or(0),
@@ -605,6 +620,7 @@ impl LedgerState {
             fees_for_rewards.0,
         );
         tracing::debug!(
+            target: "ChainDB.LedgerEvent",
             "RUPD: starting balances: reserves={}, treasury={}",
             self.reserves.0, self.treasury.0,
         );
@@ -807,7 +823,7 @@ impl LedgerState {
 
         self.conway_genesis_epoch = Some(new_epoch.0);
 
-        tracing::info!(epoch = new_epoch.0, "Applied Conway genesis");
+        tracing::info!(target: "ChainDB.LedgerEvent", epoch = new_epoch.0, "Applied Conway genesis");
     }
 
     /// Convert a floating-point threshold (e.g., 0.67) to a Rational with denominator 100.
@@ -968,7 +984,7 @@ impl LedgerState {
         // `rupdNext` = the RUPD computed at this epoch boundary, to be applied at the next.
         //              Comparison: haskell[N].rupdNext == hayate[N].rupdNext
         let rupd_values = if let Some(rupd) = &self.last_applied_rupd {
-            tracing::debug!("Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
+            tracing::debug!(target: "ChainDB.LedgerEvent", "Dumping RUPD: eta={}, deltaR1={}", rupd.eta, rupd.delta_r1);
             json!({
                 "eta": rupd.eta,
                 "deltaR1": rupd.delta_r1,
@@ -980,6 +996,7 @@ impl LedgerState {
             })
         } else {
             tracing::debug!(
+                target: "ChainDB.LedgerEvent",
                 "last_applied_rupd is None when dumping epoch {}",
                 self.epoch.0
             );
@@ -1301,6 +1318,7 @@ impl LedgerState {
 
         std::fs::write(&filepath, serde_json::to_string_pretty(&json_output)?)?;
         tracing::debug!(
+            target: "ChainDB.LedgerEvent",
             "📝 Dumped epoch {} state to {}",
             self.epoch.0,
             filepath.display()

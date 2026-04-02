@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use hermod::forwarder::{ForwarderConfig, TraceForwarder};
+use hermod::forwarder::{ForwarderAddress, ForwarderConfig, TraceForwarder};
 use hermod::tracer::TracerBuilder;
 use std::path::PathBuf;
 use tracing::{debug, error, info, trace, warn};
@@ -112,7 +112,7 @@ async fn main() -> Result<()> {
     // None = no-op layer (only stdout logging active).
     let tracer_layer = args.tracer_socket.as_ref().map(|socket| {
         let fwd_config = ForwarderConfig {
-            socket_path: socket.clone(),
+            address: ForwarderAddress::Unix(socket.clone()),
             ..Default::default()
         };
         let (layer, _fwd_task) = TracerBuilder::new(TraceForwarder::new(fwd_config))
@@ -128,14 +128,14 @@ async fn main() -> Result<()> {
         .with(tracer_layer)
         .init();
 
-    info!("疾風ノード Hayate-Node starting...");
+    info!(target: "Startup", "疾風ノード Hayate-Node starting...");
 
     // Parse network
     let network = Network::parse(&args.network)
         .ok_or_else(|| anyhow::anyhow!("Invalid network: {}", args.network))?;
 
-    info!("Network: {}", network.as_str());
-    info!("Database: {}", args.db_path);
+    info!(target: "Startup", "Network: {}", network.as_str());
+    info!(target: "Startup", "Database: {}", args.db_path);
 
     // Wipe state if --reset-genesis was requested
     if args.reset_genesis {
@@ -144,14 +144,16 @@ async fn main() -> Result<()> {
             .join(network.as_str());
         if network_db.exists() {
             info!(
+                target: "Startup",
                 "⚠️  --reset-genesis: wiping ledger state at {}",
                 network_db.display()
             );
             std::fs::remove_dir_all(&network_db)
                 .with_context(|| format!("Failed to remove {}", network_db.display()))?;
-            info!("✅ Ledger state wiped. Re-syncing from genesis.");
+            info!(target: "Startup", "✅ Ledger state wiped. Re-syncing from genesis.");
         } else {
             info!(
+                target: "Startup",
                 "--reset-genesis: no existing state at {}, nothing to wipe",
                 network_db.display()
             );
@@ -164,7 +166,7 @@ async fn main() -> Result<()> {
     // Determine magic
     let magic = args.magic.unwrap_or_else(|| network.magic());
 
-    info!("Network magic: {}", magic);
+    info!(target: "Startup", "Network magic: {}", magic);
 
     // Initialize or restore ledger state and determine chain-sync start point.
     //
@@ -179,12 +181,14 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Failed to restore from epoch {}", target_epoch))?;
             let epoch = state.epoch.0;
             info!(
+                target: "Startup",
                 "⏪ Rolled back to epoch {} snapshot (slot {}). \
                  Re-syncing from that point forward.",
                 epoch, slot
             );
             if let Some(ref dump_dir) = args.dump_epoch_dir {
                 info!(
+                    target: "Startup",
                     "  Tip: delete dump files for epochs >= {} in {} so they regenerate.",
                     epoch,
                     dump_dir.display()
@@ -201,6 +205,7 @@ async fn main() -> Result<()> {
                 Some((state, slot, hash)) => {
                     let epoch = state.epoch.0;
                     info!(
+                        target: "Startup",
                         "Restored ledger state from epoch {} (resuming from slot {})",
                         epoch, slot
                     );
@@ -212,7 +217,7 @@ async fn main() -> Result<()> {
                     )
                 }
                 None => {
-                    info!("🆕 No epoch snapshot found, initializing from genesis");
+                    info!(target: "Startup", "🆕 No epoch snapshot found, initializing from genesis");
                     let result = load_genesis_and_init_ledger(args.config.as_ref(), &network)?;
                     // Seed genesis UTxOs into the LSM tree (fresh run only).
                     // This must happen after storage is open but before any blocks are processed.
@@ -238,19 +243,20 @@ async fn main() -> Result<()> {
     let mut rolling_nonce: Option<Hash<32>> = None;
 
     info!(
+        target: "Startup",
         "🔄 Starting block processing from epoch {}...",
         current_epoch
     );
 
     // ── Immutable DB sync ────────────────────────────────────────────────────
     if let Some(ref imm_dir) = args.immutable_db {
-        info!("📂 Syncing from immutable DB at {}", imm_dir.display());
+        info!(target: "ChainDB", "📂 Syncing from immutable DB at {}", imm_dir.display());
 
         match imm_db::get_tip(imm_dir) {
             Ok(Some(Point::Specific(tip_slot, _))) => {
-                info!("📂 Immutable DB tip: slot {}", tip_slot)
+                info!(target: "ChainDB", "📂 Immutable DB tip: slot {}", tip_slot)
             }
-            Ok(_) => info!("📂 Immutable DB appears empty"),
+            Ok(_) => info!(target: "ChainDB", "📂 Immutable DB appears empty"),
             Err(e) => return Err(anyhow::anyhow!("Cannot read immutable DB tip: {e}")),
         }
 
@@ -286,6 +292,7 @@ async fn main() -> Result<()> {
         }
 
         info!(
+            target: "ChainDB",
             "✅ Immutable DB sync complete — epoch {}, {} blocks processed",
             current_epoch, blocks_processed
         );
@@ -328,10 +335,10 @@ async fn main() -> Result<()> {
         start_point
     };
 
-    info!("Connecting to node socket: {}", socket_path);
-    info!("Connecting to chain sync...");
+    info!(target: "Startup.DiffusionInit", "Connecting to node socket: {}", socket_path);
+    info!(target: "Startup.DiffusionInit", "Connecting to chain sync...");
     let mut sync = HayateSync::connect(&socket_path, magic, network_start_point).await?;
-    info!("✅ Connected to Cardano node via chain sync");
+    info!(target: "Startup.DiffusionInit", "✅ Connected to Cardano node via chain sync");
 
     let mut awaiting = false;
     loop {
@@ -362,11 +369,11 @@ async fn main() -> Result<()> {
             }
             NextResponse::RollBackward(point, _tip) => {
                 awaiting = false;
-                info!("⚠️  Rollback to {:?}", point);
+                info!(target: "ChainSync.Client", "⚠️  Rollback to {:?}", point);
                 // TODO: Implement rollback logic
             }
             NextResponse::Await => {
-                info!("Caught up, waiting for new blocks...");
+                info!(target: "ChainSync.Client", "Caught up, waiting for new blocks...");
                 awaiting = true;
             }
         }
@@ -419,6 +426,7 @@ async fn process_block_bytes(
                             *rolling_nonce =
                                 Some(generate_rolling_nonce(init_nonce, &vrf_output[..32]));
                             info!(
+                                target: "Startup",
                                 "🔐 Initializing rolling nonce from first VRF at slot {}",
                                 slot
                             );
@@ -435,6 +443,7 @@ async fn process_block_bytes(
                 if bv == (2, 0, 0) {
                     ledger_state.record_shelley_hf_proposal(*current_epoch);
                     info!(
+                        target: "ChainDB.LedgerEvent",
                         "🔀 Shelley HF update proposal seen in epoch {} — \
                            transition at epoch {}",
                         *current_epoch,
@@ -454,9 +463,9 @@ async fn process_block_bytes(
             if parsed.is_conway && ledger_state.conway_genesis_epoch.is_none() {
                 if let Some(ref cg) = conway_genesis {
                     ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
-                    info!("🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
+                    info!(target: "ChainDB.LedgerEvent", "🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
                 } else {
-                    warn!("⚠️  First Conway block detected but no Conway genesis loaded!");
+                    warn!(target: "ChainDB.LedgerEvent", "⚠️  First Conway block detected but no Conway genesis loaded!");
                 }
             }
 
@@ -489,7 +498,7 @@ async fn process_block_bytes(
                         if let Err(e) =
                             ledger_state.recalibrate_reserves_from_utxo_tree(&storage.utxo_tree)
                         {
-                            error!("Failed to recalibrate reserves at Shelley HF: {}", e);
+                            error!(target: "ChainDB.LedgerEvent", "Failed to recalibrate reserves at Shelley HF: {}", e);
                         }
                     }
 
@@ -516,14 +525,14 @@ async fn process_block_bytes(
                                     epoch_num,
                                 ) {
                                     Ok(true) => {
-                                        debug!("Epoch {} matches Haskell reference", epoch_num)
+                                        debug!(target: "ChainDB.LedgerEvent", "Epoch {} matches Haskell reference", epoch_num)
                                     }
                                     Ok(false) => {
-                                        error!("EPOCH {} DIVERGED", epoch_num);
+                                        error!(target: "ChainDB.LedgerEvent", "EPOCH {} DIVERGED", epoch_num);
                                         std::process::exit(1);
                                     }
                                     Err(e) => {
-                                        warn!("Could not compare epoch {} dumps: {}", epoch_num, e)
+                                        warn!(target: "ChainDB.LedgerEvent", "Could not compare epoch {} dumps: {}", epoch_num, e)
                                     }
                                 }
                             }
@@ -543,26 +552,30 @@ async fn process_block_bytes(
                         .unwrap_or(0);
                     if ledger_state.is_shelley_plus_epoch(*current_epoch) {
                         info!(
+                            target: "ChainDB.LedgerEvent",
                             "Epoch {} ({}) ended  txs: {}  fees: {} ADA",
                             current_epoch, old_era, epoch_tx_count, epoch_fees_ada
                         );
                     } else {
                         info!(
+                            target: "ChainDB.LedgerEvent",
                             "Epoch {} (Byron) ended  txs: {}",
                             current_epoch, epoch_tx_count
                         );
                     }
                     for desc in &pending_enactments {
-                        info!("  enacted: {desc}");
+                        info!(target: "ChainDB.LedgerEvent", "  enacted: {desc}");
                     }
                     info!(
+                        target: "ChainDB.LedgerEvent",
                         "Epoch {} ({}) treasury={} ADA  reserves={} ADA  rewards={} ADA",
                         epoch, new_era, treasury_ada, reserves_ada, rewards_ada
                     );
                     if let Some(msg) = ledger_state.ppup_enacted_log.take() {
-                        info!("{}", msg);
+                        info!(target: "ChainDB.LedgerEvent", "{}", msg);
                     }
                     info!(
+                        target: "ChainDB.LedgerEvent",
                         epoch = *current_epoch,
                         stake_ms,
                         ledger_ms,
@@ -574,6 +587,7 @@ async fn process_block_bytes(
                     // which is correct regardless of what current_epoch holds on
                     // resume from an old Byron snapshot.
                     info!(
+                        target: "ChainDB.LedgerEvent",
                         "Epoch {} (Byron) slot={}  txs: {}",
                         epoch.saturating_sub(1),
                         slot,
@@ -581,9 +595,9 @@ async fn process_block_bytes(
                     );
                     for &(mj, mn, pat) in epoch_update_proposals.iter() {
                         if (mj, mn, pat) == (2, 0, 0) {
-                            info!("  Update proposal: Shelley HF ({}.{}.{})", mj, mn, pat);
+                            info!(target: "ChainDB.LedgerEvent", "  Update proposal: Shelley HF ({}.{}.{})", mj, mn, pat);
                         } else {
-                            info!("  Update proposal: noop ({}.{}.{})", mj, mn, pat);
+                            info!(target: "ChainDB.LedgerEvent", "  Update proposal: noop ({}.{}.{})", mj, mn, pat);
                         }
                     }
                     // Keep ledger_state.epoch in sync so that restore gives the
@@ -597,7 +611,7 @@ async fn process_block_bytes(
                 if let Err(e) =
                     storage.save_epoch_snapshot(epoch, *last_slot, *last_hash, ledger_state)
                 {
-                    error!("Failed to save epoch {} snapshot: {}", epoch, e);
+                    error!(target: "ChainDB.CopyToImmutableDBEvent", "Failed to save epoch {} snapshot: {}", epoch, e);
                 }
 
                 *epoch_tx_count = 0;
@@ -612,7 +626,7 @@ async fn process_block_bytes(
                 match process_block_simple(storage, ledger_state, slot, &block_hash, block_bytes).await {
                     Ok(t) => t,
                     Err(e) => {
-                        error!("Error processing block at slot {}: {}", slot, e);
+                        error!(target: "ChainDB.AddBlockEvent.AddBlockValidation", "Error processing block at slot {}: {}", slot, e);
                         return;
                     }
                 };
@@ -622,7 +636,7 @@ async fn process_block_bytes(
 
             if *blocks_processed % 1000 == 0 {
                 info!(
-                    target: "Hayate.Sync",
+                    target: "ChainDB.AddBlockEvent.AddedBlockToVolatileDB",
                     slot,
                     epoch = *current_epoch,
                     blocks_total = *blocks_processed,
@@ -631,7 +645,7 @@ async fn process_block_bytes(
             }
 
             let (slot_off, epoch_len) = ledger_state.slot_within_epoch(slot);
-            debug!(slot, elapsed_us = t_block.elapsed().as_micros() as u64, decode_us, remove_us, insert_us, certs_us, "block");
+            debug!(target: "ChainDB.AddBlockEvent.AddedBlockToVolatileDB", slot, elapsed_us = t_block.elapsed().as_micros() as u64, decode_us, remove_us, insert_us, certs_us, "block");
             trace!(
                 "block slot={} ({}/{}) epoch={} txs={}",
                 slot,
@@ -1167,6 +1181,7 @@ async fn process_block_simple(
 
         if !tx_valid {
             tracing::info!(
+                target: "ChainDB.AddBlockEvent.AddBlockValidation",
                 "Phase-2 script failure: tx {} at slot {} (is_valid=false), using collateral",
                 hex::encode(tx_hash.as_ref()),
                 slot
