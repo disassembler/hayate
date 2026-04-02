@@ -102,17 +102,25 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
-    // RUST_LOG overrides the defaults; if unset, fall back to info for both crates.
+    // Read tracer settings from the cardano-node config file before initialising logging.
+    // This must happen before tracing::init so the filter and node_name are available.
+    let tracer_cfg = read_tracer_config(args.config.as_ref());
+
+    // Initialize logging.
+    // RUST_LOG takes precedence; otherwise use the per-namespace severity map from
+    // TraceOptions in the config file (mapped to tracing level directives).
     let env_filter = std::env::var("RUST_LOG")
         .map(|_| tracing_subscriber::EnvFilter::from_default_env())
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("hayate_node=info,hayate=info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&tracer_cfg.filter_string));
 
     // Optionally forward traces to cardano-tracer via a Unix socket.
     // None = no-op layer (only stdout logging active).
     let tracer_layer = args.tracer_socket.as_ref().map(|socket| {
         let fwd_config = ForwarderConfig {
             address: ForwarderAddress::Unix(socket.clone()),
+            queue_size: tracer_cfg.queue_size,
+            max_reconnect_delay: tracer_cfg.max_reconnect_delay,
+            node_name: Some(tracer_cfg.node_name.clone()),
             ..Default::default()
         };
         let (layer, _fwd_task) = TracerBuilder::new(TraceForwarder::new(fwd_config))
@@ -129,6 +137,7 @@ async fn main() -> Result<()> {
         .init();
 
     info!(target: "Startup", "疾風ノード Hayate-Node starting...");
+    info!(target: "Startup", "Node name: {}  filter: {}", tracer_cfg.node_name, tracer_cfg.filter_string);
 
     // Parse network
     let network = Network::parse(&args.network)
@@ -2725,6 +2734,131 @@ fn process_conway_certificate(
     }
 
     Ok(())
+}
+
+// ── Tracer configuration ─────────────────────────────────────────────────────
+
+/// Settings extracted from the cardano-node config file that affect tracing.
+struct TracerConfig {
+    /// Node display name advertised to cardano-tracer.
+    /// Source: `TraceOptionNodeName` in config, or `hayate-<hostname>` if absent.
+    node_name: String,
+    /// Maximum reconnection back-off (seconds).  Source: `TraceOptionForwarder.maxReconnectDelay`.
+    max_reconnect_delay: u64,
+    /// Trace object queue size.  Source: `TraceOptionForwarder.connQueueSize`.
+    queue_size: usize,
+    /// `EnvFilter`-compatible directive string derived from `TraceOptions` severity map.
+    filter_string: String,
+}
+
+fn get_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
+}
+
+/// Map a cardano-node severity string to a `tracing` level name.
+fn cardano_severity_to_level(s: &str) -> &'static str {
+    match s {
+        "Debug" => "debug",
+        "Info" | "Notice" => "info",
+        "Warning" => "warn",
+        "Error" | "Critical" | "Alert" | "Emergency" => "error",
+        "Silence" => "off",
+        _ => "info",
+    }
+}
+
+/// Build a tracing-subscriber `EnvFilter` directive string from `TraceOptions`.
+///
+/// The root entry `""` sets the default level for `hayate_node` and `hayate`.
+/// Each non-empty key becomes a per-target override (e.g. `ChainDB.LedgerEvent=debug`).
+fn build_trace_filter(opts: &serde_json::Map<String, serde_json::Value>) -> String {
+    let default_level = opts
+        .get("")
+        .and_then(|v| v.get("severity"))
+        .and_then(|s| s.as_str())
+        .map(cardano_severity_to_level)
+        .unwrap_or("info");
+
+    let mut parts = vec![
+        format!("hayate_node={default_level}"),
+        format!("hayate={default_level}"),
+    ];
+
+    for (ns, cfg) in opts {
+        if ns.is_empty() {
+            continue;
+        }
+        // Only emit a directive if an explicit severity is present; entries with
+        // only `maxFrequency` (rate limiting) don't affect log filtering.
+        if let Some(level) = cfg
+            .get("severity")
+            .and_then(|s| s.as_str())
+            .map(cardano_severity_to_level)
+        {
+            parts.push(format!("{ns}={level}"));
+        }
+    }
+
+    parts.join(",")
+}
+
+/// Read tracer-relevant settings from the cardano-node config file.
+///
+/// Falls back to sensible defaults if the file is absent or a field is missing.
+fn read_tracer_config(config_path: Option<&PathBuf>) -> TracerConfig {
+    let default_name = format!("hayate-{}", get_hostname());
+
+    let defaults = TracerConfig {
+        node_name: default_name.clone(),
+        max_reconnect_delay: 45,
+        queue_size: 1000,
+        filter_string: "hayate_node=info,hayate=info".to_string(),
+    };
+
+    let config_file = match config_path {
+        Some(p) => p,
+        None => return defaults,
+    };
+
+    let config: serde_json::Value = match std::fs::read_to_string(config_file)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+    {
+        Some(c) => c,
+        None => return defaults,
+    };
+
+    let node_name = config
+        .get("TraceOptionNodeName")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or(default_name);
+
+    let fwd = config.get("TraceOptionForwarder");
+    let max_reconnect_delay = fwd
+        .and_then(|v| v.get("maxReconnectDelay"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(defaults.max_reconnect_delay);
+    let queue_size = fwd
+        .and_then(|v| v.get("connQueueSize"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(defaults.queue_size);
+
+    let filter_string = config
+        .get("TraceOptions")
+        .and_then(|v| v.as_object())
+        .map(build_trace_filter)
+        .unwrap_or(defaults.filter_string);
+
+    TracerConfig {
+        node_name,
+        max_reconnect_delay,
+        queue_size,
+        filter_string,
+    }
 }
 
 /// Load only the Conway genesis (does not require full ledger init)
