@@ -27,10 +27,10 @@ path = "src/bin/compare_epoch_dumps.rs"
 
 [dependencies]
 # LSM storage engine
-cardano-lsm = "1.0.2"
+cardano-lsm = "1.0.4"
 
 # Cardano tracer (logging + metrics forwarding to cardano-tracer)
-hermod = { path = "../hermod-rust" }
+hermod-tracer = "1.0.1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -121,5 +121,3 @@ harness = false
 name = "disk_benchmarks"
 harness = false
 
-[patch.crates-io]
-cardano-lsm = { path = "../cardano-lsm-rust" }
