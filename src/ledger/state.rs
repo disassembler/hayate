@@ -204,6 +204,16 @@ pub struct LedgerState {
     #[serde(default)]
     pub pending_enactments: Vec<PendingEnactment>,
 
+    /// Pointer address resolution map: (slot, tx_idx, cert_idx) → 28-byte credential hash.
+    ///
+    /// Populated by stake registration certificates. Used to resolve CIP-19 pointer
+    /// addresses (types 4-5) which encode a stake reference as a chain pointer to the
+    /// registration certificate rather than embedding the credential hash directly.
+    ///
+    /// Matches Haskell's `UMap.umPtrs :: Map Ptr (Credential 'Staking)`.
+    #[serde(default)]
+    pub ptr_map: HashMap<(u64, u32, u32), [u8; 28]>,
+
     /// The decentralization parameter (d) from the PREVIOUS epoch.
     ///
     /// Haskell's RUPD computes eta using `d` from the epoch whose blocks are being measured
@@ -268,6 +278,7 @@ impl LedgerState {
             prev_protocol_params: None,
             conway_genesis_epoch: None,
             pending_enactments: Vec::new(),
+            ptr_map: HashMap::new(),
             ppup_enacted_log: None,
             prev_epoch_decentralization: default_prev_epoch_decentralization(),
         }

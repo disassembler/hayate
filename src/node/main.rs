@@ -1161,7 +1161,7 @@ async fn process_block_simple(
     let mut remove_us: u64 = 0;
     let mut insert_us: u64 = 0;
     let mut certs_us: u64 = 0;
-    for tx in txs {
+    for (tx_idx, tx) in txs.into_iter().enumerate() {
         let tx_hash = tx.hash();
         let tx_valid = tx.is_valid();
 
@@ -1199,8 +1199,8 @@ async fn process_block_simple(
             let address_bytes = output.address()?.to_vec();
             let amount = output.value().coin();
 
-            // Extract stake credential from address
-            let stake_credential = extract_stake_credential(&address_bytes)?;
+            // Extract stake credential from address (resolves pointer addresses via ptr_map)
+            let stake_credential = extract_stake_credential(&address_bytes, &ledger_state.ptr_map)?;
 
             // Parse multi-assets
             let mut assets = std::collections::HashMap::new();
@@ -1270,8 +1270,8 @@ async fn process_block_simple(
         if tx_valid {
             // Process certificates (delegations, pool registrations, etc.)
             let t = std::time::Instant::now();
-            for cert in tx.certs() {
-                process_certificate(cert, ledger_state, slot)?;
+            for (cert_idx, cert) in tx.certs().into_iter().enumerate() {
+                process_certificate(cert, ledger_state, slot, tx_idx as u32, cert_idx as u32)?;
             }
             certs_us += t.elapsed().as_micros() as u64;
 
@@ -1617,7 +1617,10 @@ async fn process_block_simple(
     Ok((decode_us, remove_us, insert_us, certs_us))
 }
 
-fn extract_stake_credential(address: &[u8]) -> Result<Option<Vec<u8>>> {
+fn extract_stake_credential(
+    address: &[u8],
+    ptr_map: &std::collections::HashMap<(u64, u32, u32), [u8; 28]>,
+) -> Result<Option<Vec<u8>>> {
     use pallas_addresses::{Address, ShelleyDelegationPart};
 
     let addr = Address::from_bytes(address)
@@ -1627,8 +1630,12 @@ fn extract_stake_credential(address: &[u8]) -> Result<Option<Vec<u8>>> {
         Address::Shelley(shelley_addr) => match shelley_addr.delegation() {
             ShelleyDelegationPart::Key(key_hash) => Ok(Some(key_hash.to_vec())),
             ShelleyDelegationPart::Script(script_hash) => Ok(Some(script_hash.to_vec())),
+            ShelleyDelegationPart::Pointer(pointer) => {
+                // Resolve CIP-19 pointer address via ptr_map
+                let key = (pointer.slot(), pointer.tx_idx() as u32, pointer.cert_idx() as u32);
+                Ok(ptr_map.get(&key).map(|cred| cred.to_vec()))
+            }
             ShelleyDelegationPart::Null => Ok(None),
-            _ => Ok(None),
         },
         _ => Ok(None), // Byron addresses don't have stake credentials
     }
@@ -1819,15 +1826,17 @@ fn process_certificate(
     cert: pallas_traverse::MultiEraCert,
     ledger_state: &mut LedgerState,
     slot: u64,
+    tx_idx: u32,
+    cert_idx: u32,
 ) -> Result<()> {
     // MultiEraCert is an enum with AlonzoCompatible and Conway variants
     // Each contains the era-specific Certificate enum
     match cert {
         pallas_traverse::MultiEraCert::AlonzoCompatible(cert_box) => {
-            process_alonzo_certificate(&cert_box, ledger_state, slot)?;
+            process_alonzo_certificate(&cert_box, ledger_state, slot, tx_idx, cert_idx)?;
         }
         pallas_traverse::MultiEraCert::Conway(cert_box) => {
-            process_conway_certificate(&cert_box, ledger_state, slot)?;
+            process_conway_certificate(&cert_box, ledger_state, slot, tx_idx, cert_idx)?;
         }
         pallas_traverse::MultiEraCert::NotApplicable => {
             // Byron era - no certificates
@@ -1869,6 +1878,8 @@ fn process_alonzo_certificate(
     cert: &pallas_primitives::alonzo::Certificate,
     ledger_state: &mut LedgerState,
     slot: u64,
+    tx_idx: u32,
+    cert_idx: u32,
 ) -> Result<()> {
     use hayate::ledger::primitives::{EpochNo, Lovelace};
     use hayate::ledger::state::{DepositType, PoolRegistration};
@@ -1898,6 +1909,9 @@ fn process_alonzo_certificate(
                 if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
                     ledger_state.script_stake_credentials.insert(hash);
                 }
+
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
 
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
@@ -2191,6 +2205,8 @@ fn process_conway_certificate(
     cert: &pallas_primitives::conway::Certificate,
     ledger_state: &mut LedgerState,
     slot: u64,
+    tx_idx: u32,
+    cert_idx: u32,
 ) -> Result<()> {
     use hayate::ledger::primitives::{EpochNo, Lovelace};
     use hayate::ledger::state::{DepositType, PoolRegistration};
@@ -2221,6 +2237,9 @@ fn process_conway_certificate(
                 if matches!(stake_cred, pallas_primitives::StakeCredential::ScriptHash(_)) {
                     ledger_state.script_stake_credentials.insert(hash);
                 }
+
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
 
                 tracing::debug!("e={} s={} off={} | Stake registered: {}", epoch, slot, slot_off, hex::encode(&hash[..8]));
             }
@@ -2398,6 +2417,9 @@ fn process_conway_certificate(
                     ledger_state.script_stake_credentials.insert(hash);
                 }
 
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+
                 tracing::debug!("Conway stake registered: {}", hex::encode(&cred_hash[..8]));
             }
         }
@@ -2473,6 +2495,9 @@ fn process_conway_certificate(
                     pool_id.copy_from_slice(&pool_bytes[..28]);
                     Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
                 }
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+
                 tracing::debug!("Stake reg+delegate: {}", hex::encode(&cred_hash[..8]));
             }
         }
@@ -2496,6 +2521,9 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.governance)
                     .vote_delegations
                     .insert(hash, hayate_drep);
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+
                 tracing::debug!("Vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
             }
         }
@@ -2525,6 +2553,9 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.governance)
                     .vote_delegations
                     .insert(hash, hayate_drep);
+                // Record pointer for CIP-19 pointer address resolution (types 4-5)
+                ledger_state.ptr_map.insert((slot, tx_idx, cert_idx), cred_hash);
+
                 tracing::debug!("Stake+vote reg+delegate: {}", hex::encode(&cred_hash[..8]));
             }
         }

@@ -46,7 +46,7 @@ impl LedgerState {
 
         // Scan UTxO set and accumulate stake per credential
         for output in utxos {
-            if let Some(cred_hash) = extract_stake_credential(&output.address) {
+            if let Some(cred_hash) = extract_stake_credential(&output.address, &self.ptr_map) {
                 *new_map.entry(cred_hash).or_insert(Lovelace(0)) += Lovelace(output.coin);
             }
         }
@@ -226,6 +226,27 @@ impl LedgerState {
     }
 }
 
+/// Decode a variable-length unsigned integer from a byte slice, returning
+/// `(value, bytes_consumed)`.  Returns `None` on truncated / overflowing input.
+///
+/// Encoding: each byte contributes 7 payload bits; the MSB is 1 when more
+/// bytes follow, 0 for the final byte.  Same as pallas-addresses' varuint.
+fn decode_varuint(bytes: &[u8]) -> Option<(u64, usize)> {
+    let mut output: u128 = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        output = (output << 7) | (b & 0x7f) as u128;
+        if output > u64::MAX as u128 {
+            // Overflow – treat as u64::MAX (matches pallas behaviour for invalid
+            // testnet addresses).
+            return Some((u64::MAX, i + 1));
+        }
+        if (b & 0x80) == 0 {
+            return Some((output as u64, i + 1));
+        }
+    }
+    None // truncated
+}
+
 /// Extract stake credential hash from a Cardano address.
 ///
 /// Cardano addresses encode the stake credential in different positions depending
@@ -233,18 +254,23 @@ impl LedgerState {
 ///
 /// Address types (per CIP-19):
 /// - Type 0x00-0x03: Base address (payment + stake)
-/// - Type 0x04-0x05: Pointer address (payment + pointer)
+/// - Type 0x04-0x05: Pointer address (payment + pointer) — resolved via `ptr_map`
 /// - Type 0x06-0x07: Enterprise address (payment only, no stake)
 /// - Type 0x0e-0x0f: Reward address (stake only)
 ///
 /// For base addresses (type 0-3), the stake credential is the second credential.
+/// For pointer addresses (type 4-5), the pointer is decoded and resolved via `ptr_map`.
 /// For reward addresses (type 14-15), the stake credential is the only credential.
 ///
 /// Returns `None` if:
 /// - Address is too short
-/// - Address type has no stake credential (enterprise, pointer)
+/// - Address type has no stake credential (enterprise)
+/// - Pointer address cannot be resolved (pointer not in map)
 /// - Address format is invalid
-fn extract_stake_credential(address: &[u8]) -> Option<Hash32> {
+fn extract_stake_credential(
+    address: &[u8],
+    ptr_map: &HashMap<(u64, u32, u32), [u8; 28]>,
+) -> Option<Hash32> {
     if address.is_empty() {
         return None;
     }
@@ -268,6 +294,26 @@ fn extract_stake_credential(address: &[u8]) -> Option<Hash32> {
                 None
             }
         }
+        // Pointer address types 4-5 (CIP-19):
+        // [header(1)] [payment(28)] [slot(varint)] [tx_idx(varint)] [cert_idx(varint)]
+        // Resolve the pointer via ptr_map to get the 28-byte credential hash.
+        0x4 | 0x5 => {
+            if address.len() < 30 {
+                return None; // too short for header + payment + at least 1 byte of pointer
+            }
+            let pointer_bytes = &address[29..]; // after header(1) + payment(28)
+            let (slot, n1) = decode_varuint(pointer_bytes)?;
+            let (tx_idx, n2) = decode_varuint(&pointer_bytes[n1..])?;
+            let (cert_idx, _n3) = decode_varuint(&pointer_bytes[n1 + n2..])?;
+
+            ptr_map
+                .get(&(slot, tx_idx as u32, cert_idx as u32))
+                .map(|cred| {
+                    let mut hash = [0u8; 32];
+                    hash[..28].copy_from_slice(cred);
+                    hash
+                })
+        }
         // Reward address types 14-15 (CIP-19):
         // [header(1)] [stake(28)] = 29 bytes. Both key and script hashes are 28 bytes.
         0xe | 0xf => {
@@ -280,7 +326,7 @@ fn extract_stake_credential(address: &[u8]) -> Option<Hash32> {
                 None
             }
         }
-        // Enterprise (6-7), Pointer (4-5), Byron (8), etc. - no stake credential
+        // Enterprise (6-7), Byron (8), etc. - no stake credential
         _ => None,
     }
 }
@@ -297,7 +343,7 @@ mod tests {
         addr.extend_from_slice(&[0xaa; 28]); // payment
         addr.extend_from_slice(&[0xbb; 28]); // stake
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xbb; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]); // Zero-padded
     }
@@ -310,7 +356,7 @@ mod tests {
         addr.extend_from_slice(&[0xaa; 28]); // payment script hash (28 bytes)
         addr.extend_from_slice(&[0xbb; 28]); // stake key hash (28 bytes)
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xbb; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]);
     }
@@ -323,7 +369,7 @@ mod tests {
         addr.extend_from_slice(&[0xaa; 28]); // payment key hash (28 bytes)
         addr.extend_from_slice(&[0xcc; 28]); // stake script hash (28 bytes)
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xcc; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]);
     }
@@ -335,7 +381,7 @@ mod tests {
         addr.extend_from_slice(&[0xaa; 28]); // payment script hash (28 bytes)
         addr.extend_from_slice(&[0xdd; 28]); // stake script hash (28 bytes)
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xdd; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]);
     }
@@ -347,7 +393,7 @@ mod tests {
         let mut addr = vec![0xe1];
         addr.extend_from_slice(&[0xcc; 28]);
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xcc; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]);
     }
@@ -358,7 +404,7 @@ mod tests {
         let mut addr = vec![0xf1]; // type 15, testnet
         addr.extend_from_slice(&[0xee; 28]);
 
-        let cred = extract_stake_credential(&addr).unwrap();
+        let cred = extract_stake_credential(&addr, &HashMap::new()).unwrap();
         assert_eq!(&cred[..28], &[0xee; 28]);
         assert_eq!(&cred[28..], &[0, 0, 0, 0]);
     }
@@ -369,7 +415,7 @@ mod tests {
         let mut addr = vec![0x61];
         addr.extend_from_slice(&[0xaa; 28]);
 
-        let cred = extract_stake_credential(&addr);
+        let cred = extract_stake_credential(&addr, &HashMap::new());
         assert!(cred.is_none());
     }
 
@@ -382,7 +428,7 @@ mod tests {
             addr.extend_from_slice(&[0xbb; 28]); // stake
             assert_eq!(addr.len(), 57, "type {:#04x} address should be 57 bytes", addr_type);
             assert!(
-                extract_stake_credential(&addr).is_some(),
+                extract_stake_credential(&addr, &HashMap::new()).is_some(),
                 "type {:#04x} should extract stake credential",
                 addr_type
             );
