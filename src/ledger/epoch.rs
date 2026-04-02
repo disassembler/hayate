@@ -1215,9 +1215,22 @@ impl LedgerState {
                     if stake == 0 {
                         continue;
                     }
+                    // Haskell's computeDRepDistr only includes DRepCredential entries
+                    // when the DRep is registered (Map.member cred regDReps).
+                    // AlwaysAbstain and AlwaysNoConfidence are always included.
                     let key = match drep {
-                        DRep::KeyHash(h) => format!("drep-keyHash-{}", hex::encode(&h[..28])),
-                        DRep::ScriptHash(h) => format!("drep-scriptHash-{}", hex::encode(&h[..28])),
+                        DRep::KeyHash(h) => {
+                            if !gov.dreps.contains_key(h) {
+                                continue;
+                            }
+                            format!("drep-keyHash-{}", hex::encode(&h[..28]))
+                        }
+                        DRep::ScriptHash(h) => {
+                            if !gov.dreps.contains_key(h) {
+                                continue;
+                            }
+                            format!("drep-scriptHash-{}", hex::encode(&h[..28]))
+                        }
                         DRep::AlwaysAbstain => "drep-alwaysAbstain".to_string(),
                         DRep::AlwaysNoConfidence => "drep-alwaysNoConfidence".to_string(),
                     };
