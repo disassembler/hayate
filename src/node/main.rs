@@ -236,6 +236,13 @@ async fn main() -> Result<()> {
             }
         };
 
+    // If restoring from a post-Conway epoch, the UTxO tree rebuild has already
+    // re-included pointer-address stake in current_stake.  Purge it so the first
+    // epoch transition after restore sees the correct (Haskell-matching) stake.
+    if ledger_state.conway_genesis_epoch.is_some() {
+        storage.purge_pointer_stake_for_conway();
+    }
+
     // Shared processing state — used by both immutable-DB and network sync loops.
     let mut blocks_processed = 0u64;
     let mut current_epoch = ledger_state.epoch.0;
@@ -473,6 +480,12 @@ async fn process_block_bytes(
                 if let Some(ref cg) = conway_genesis {
                     ledger_state.apply_conway_genesis(cg, EpochNo(epoch));
                     info!(target: "ChainDB.LedgerEvent", "🌅 Conway genesis applied at epoch {} slot {}", epoch, slot);
+
+                    // Purge pointer-address stake from current_stake.
+                    // Haskell's ConwayInstantStake drops sisPtrStake at the Babbage→Conway
+                    // hard fork. This must happen BEFORE rebuild_stake_from_current_stake
+                    // so the first Conway mark snapshot excludes pointer-address stake.
+                    storage.purge_pointer_stake_for_conway();
                 } else {
                     warn!(target: "ChainDB.LedgerEvent", "⚠️  First Conway block detected but no Conway genesis loaded!");
                 }
@@ -617,6 +630,21 @@ async fn process_block_bytes(
                 // Save epoch snapshot (UTxO hard-links + bincode file).
                 // last_slot/last_hash = final block of the ending epoch
                 // (the current block hasn't been processed yet at this point).
+                {
+                    let cs = storage.current_stake();
+                    let stake_total: u64 = cs.values().sum();
+                    debug!(
+                        target: "ChainDB.CopyToImmutableDBEvent",
+                        epoch,
+                        stake_creds = cs.len(),
+                        stake_total,
+                        treasury = ledger_state.treasury.0,
+                        reserves = ledger_state.reserves.0,
+                        delegations = ledger_state.delegations.len(),
+                        reward_accounts = ledger_state.reward_accounts.len(),
+                        "SNAP fingerprint"
+                    );
+                }
                 if let Err(e) =
                     storage.save_epoch_snapshot(epoch, *last_slot, *last_hash, ledger_state)
                 {
@@ -1223,8 +1251,11 @@ async fn process_block_simple(
             let address_bytes = output.address()?.to_vec();
             let amount = output.value().coin();
 
-            // Extract stake credential from address (resolves pointer addresses via ptr_map)
-            let stake_credential = extract_stake_credential(&address_bytes, &ledger_state.ptr_map)?;
+            // Extract stake credential from address.
+            // In Conway era, pointer addresses are skipped — Haskell's ConwayInstantStake
+            // drops sisPtrStake entirely, so pointer-addressed UTxOs contribute zero stake.
+            let is_conway_era = ledger_state.conway_genesis_epoch.is_some();
+            let stake_credential = extract_stake_credential(&address_bytes, &ledger_state.ptr_map, is_conway_era)?;
 
             // Parse multi-assets
             let mut assets = std::collections::HashMap::new();
@@ -1650,9 +1681,15 @@ async fn process_block_simple(
 ///
 /// This matches the Haskell `Credential 'Staking` ADT where
 /// `KeyHashObj` and `ScriptHashObj` are distinct types.
+///
+/// When `skip_pointers` is true (Conway era), pointer addresses return `None`.
+/// Haskell's `ConwayInstantStake` drops pointer-address stake entirely —
+/// `applyUTxOConwayInstantStake` only handles `StakeRefBase`; pointer
+/// addresses (`_other`) are no-ops.
 fn extract_stake_credential(
     address: &[u8],
     ptr_map: &std::collections::HashMap<(u64, u32, u32), [u8; 29]>,
+    skip_pointers: bool,
 ) -> Result<Option<Vec<u8>>> {
     use pallas_addresses::{Address, ShelleyDelegationPart};
 
@@ -1674,9 +1711,14 @@ fn extract_stake_credential(
                 Ok(Some(tagged))
             }
             ShelleyDelegationPart::Pointer(pointer) => {
-                // Resolve CIP-19 pointer address via ptr_map (already tagged)
-                let key = (pointer.slot(), pointer.tx_idx() as u32, pointer.cert_idx() as u32);
-                Ok(ptr_map.get(&key).map(|cred| cred.to_vec()))
+                if skip_pointers {
+                    // Conway era: pointer addresses contribute nothing to instant stake
+                    Ok(None)
+                } else {
+                    // Pre-Conway: resolve CIP-19 pointer address via ptr_map (already tagged)
+                    let key = (pointer.slot(), pointer.tx_idx() as u32, pointer.cert_idx() as u32);
+                    Ok(ptr_map.get(&key).map(|cred| cred.to_vec()))
+                }
             }
             ShelleyDelegationPart::Null => Ok(None),
         },

@@ -65,6 +65,14 @@ pub struct NodeStorage {
     /// Which epoch the utxo_tree was last restored to, or None if never restored.
     utxo_epoch: Option<u64>,
 
+    /// When true, `insert_utxo` and `remove_utxo` skip `current_stake` updates for
+    /// pointer-address UTxOs (CIP-19 address types 4 and 5).  Set at the Babbage→Conway
+    /// boundary by `purge_pointer_stake_for_conway`.
+    ///
+    /// Haskell's `ConwayInstantStake` drops pointer-address stake entirely, so from
+    /// Conway onwards pointer addresses contribute zero to the incremental stake tracker.
+    skip_pointer_stake: bool,
+
     /// `.../node/<network>/` — parent of utxos/ and epochs/.
     base_path: PathBuf,
 
@@ -109,6 +117,7 @@ impl NodeStorage {
             utxo_tree,
             current_stake: HashMap::new(),
             utxo_epoch: None,
+            skip_pointer_stake: false,
             base_path: net_path,
             epochs_dir,
         })
@@ -127,13 +136,29 @@ impl NodeStorage {
         key
     }
 
+    /// Check if a raw address is a CIP-19 pointer address (types 4 or 5).
+    /// The high nibble of byte 0 encodes the address type:
+    ///   4 = key payment + pointer delegation
+    ///   5 = script payment + pointer delegation
+    fn is_pointer_address(address: &[u8]) -> bool {
+        if address.is_empty() {
+            return false;
+        }
+        let addr_type = address[0] >> 4;
+        addr_type == 4 || addr_type == 5
+    }
+
     pub fn insert_utxo(&mut self, tx_hash: &[u8], output_index: u32, utxo: &UtxoEntry) -> Result<()> {
         let key = Self::utxo_key(tx_hash, output_index);
         let value = bincode::serialize(utxo)?;
         self.utxo_tree.insert(&Key::from(key.as_ref()), &Value::from(&value))?;
 
         if let Some(stake_cred) = &utxo.stake_credential {
-            *self.current_stake.entry(stake_cred.clone()).or_insert(0) += utxo.amount;
+            // In Conway era, skip current_stake updates for pointer-address UTxOs.
+            // Haskell's ConwayInstantStake ignores pointer addresses entirely.
+            if !(self.skip_pointer_stake && Self::is_pointer_address(&utxo.address)) {
+                *self.current_stake.entry(stake_cred.clone()).or_insert(0) += utxo.amount;
+            }
         }
         Ok(())
     }
@@ -155,10 +180,14 @@ impl NodeStorage {
 
         if let Some(ref entry) = utxo {
             if let Some(stake_cred) = &entry.stake_credential {
-                if let Some(current) = self.current_stake.get_mut(stake_cred) {
-                    *current = current.saturating_sub(entry.amount);
-                    if *current == 0 {
-                        self.current_stake.remove(stake_cred);
+                // In Conway era, skip current_stake updates for pointer-address UTxOs.
+                // Their stake was already purged at the boundary and should stay at zero.
+                if !(self.skip_pointer_stake && Self::is_pointer_address(&entry.address)) {
+                    if let Some(current) = self.current_stake.get_mut(stake_cred) {
+                        *current = current.saturating_sub(entry.amount);
+                        if *current == 0 {
+                            self.current_stake.remove(stake_cred);
+                        }
                     }
                 }
             }
@@ -183,6 +212,81 @@ impl NodeStorage {
     /// at epoch boundaries.
     pub fn current_stake(&self) -> &HashMap<Vec<u8>, u64> {
         &self.current_stake
+    }
+
+    /// Purge pointer-address UTxO stake from `current_stake` at the Babbage→Conway boundary.
+    ///
+    /// Haskell's `ConwayInstantStake` drops `sisPtrStake` entirely — pointer addresses
+    /// contribute ZERO to the incremental stake tracker from Conway onwards.  Hayate
+    /// eagerly resolves pointer addresses at UTxO insert time, so the resolved credential
+    /// is indistinguishable from a base-address credential in `current_stake`.
+    ///
+    /// This method scans the full UTxO set, identifies pointer-address entries (CIP-19
+    /// address types 4 and 5), and subtracts their lovelace from `current_stake`.
+    /// It also sets `skip_pointer_stake = true` so that subsequent insert/remove operations
+    /// skip `current_stake` updates for pointer-address UTxOs.
+    ///
+    /// Must be called exactly once, right after `apply_conway_genesis`, BEFORE the
+    /// epoch transition captures the mark snapshot.
+    pub fn purge_pointer_stake_for_conway(&mut self) {
+        let mut purged_lovelace: u64 = 0;
+        let mut purged_utxos: u64 = 0;
+        let mut affected_creds: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+
+        for (_key, value) in self.utxo_tree.iter() {
+            let value_bytes: &[u8] = value.as_ref();
+            if value_bytes.is_empty() {
+                continue; // tombstone
+            }
+            let entry: UtxoEntry = match bincode::deserialize(value_bytes) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+
+            // Check if this UTxO has a stake credential and a pointer address.
+            if entry.stake_credential.is_none() {
+                continue;
+            }
+            if !Self::is_pointer_address(&entry.address) {
+                continue;
+            }
+            let stake_cred = entry.stake_credential.as_ref().unwrap();
+
+            // Subtract this UTxO's lovelace from the resolved credential in current_stake
+            if let Some(current) = self.current_stake.get_mut(stake_cred) {
+                *current = current.saturating_sub(entry.amount);
+                purged_lovelace += entry.amount;
+                purged_utxos += 1;
+                affected_creds.insert(stake_cred.clone());
+                if *current == 0 {
+                    self.current_stake.remove(stake_cred);
+                }
+            }
+        }
+
+        // From now on, insert_utxo / remove_utxo skip current_stake updates for
+        // pointer-address UTxOs, matching Haskell's Conway instant stake semantics.
+        self.skip_pointer_stake = true;
+
+        tracing::info!(
+            target: "ChainDB.LedgerEvent",
+            purged_utxos,
+            purged_lovelace,
+            affected_credentials = affected_creds.len(),
+            "Conway transition: purged pointer-address stake from current_stake"
+        );
+    }
+
+    /// Enable Conway-era pointer-address stake skipping without running a full purge.
+    ///
+    /// Used when restoring from a post-Conway epoch snapshot where pointer-address
+    /// stake was already purged.  The `current_stake` rebuilt from the UTxO tree
+    /// will already include pointer-address contributions (they still have
+    /// `stake_credential` set in the LSM), but since we mark `skip_pointer_stake`
+    /// here, the *next* purge or manual rebuild can correct it.  For snapshots taken
+    /// after the Conway transition, the stake was already correct at save time.
+    pub fn set_skip_pointer_stake(&mut self) {
+        self.skip_pointer_stake = true;
     }
 
     pub fn get_utxo(&self, tx_hash: &[u8], output_index: u32) -> Result<Option<UtxoEntry>> {
@@ -291,9 +395,16 @@ impl NodeStorage {
             }
         }
         self.utxo_epoch = Some(epoch);
+        let stake_total: u64 = self.current_stake.values().sum();
         tracing::info!(
             "🔄 UTxO tree restored to epoch {} ({} staked UTxOs, {} credentials)",
             epoch, staked_credentials, self.current_stake.len()
+        );
+        tracing::debug!(
+            epoch,
+            stake_creds = self.current_stake.len(),
+            stake_total,
+            "RESTORE fingerprint (current_stake)"
         );
         Ok(())
     }
@@ -307,6 +418,15 @@ impl NodeStorage {
         let path = self.epochs_dir.join(format!("epoch-{:010}.bin", epoch));
         anyhow::ensure!(path.exists(), "No epoch snapshot for epoch {}", epoch);
         let record: EpochSnapshot = bincode::deserialize(&std::fs::read(&path)?)?;
+        let state = &record.ledger_state;
+        tracing::debug!(
+            epoch,
+            treasury = state.treasury.0,
+            reserves = state.reserves.0,
+            delegations = state.delegations.len(),
+            reward_accounts = state.reward_accounts.len(),
+            "RESTORE fingerprint (LedgerState)"
+        );
         self.restore_utxo_to_epoch(epoch)?;
         Ok((record.ledger_state, record.slot, record.block_hash))
     }
