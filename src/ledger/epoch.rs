@@ -37,12 +37,17 @@ impl LedgerState {
         // under which the blocks in `self.epoch_blocks_by_pool` were produced.
         let prev_pp = self.protocol_params.clone();
 
-        // Propagate Conway curPParams → protocol_params starting from the SECOND Conway epoch.
-        // At the Conway genesis epoch (e.g. 492), protocol_params stays as Babbage params so
-        // the epoch dump shows the correct "prevPParams = Babbage params" relationship.
-        // From the next epoch onwards, protocol_params reflects the current Conway params.
+        // Propagate Conway curPParams → protocol_params from the Conway genesis epoch onwards.
+        //
+        // Haskell's TranslateEra sets curPParams to Conway params at the hard fork epoch.
+        // The prev_pp capture above preserves the Babbage params for RUPD (epoch N-1 blocks),
+        // so propagating here is safe: prev_pp = Babbage, protocol_params = Conway.
+        //
+        // Previously this used `new_epoch > genesis_epoch` which deferred propagation by one
+        // epoch. This caused blocks in the first Conway epoch to use stale Babbage defaults
+        // for Conway-specific fields (e.g. gov_action_lifetime=6 instead of 30 from genesis).
         if let Some(genesis_epoch) = self.conway_genesis_epoch {
-            if new_epoch.0 > genesis_epoch {
+            if new_epoch.0 >= genesis_epoch {
                 if let Some(cur_params) = self.governance.conway_cur_params.as_deref().cloned() {
                     self.protocol_params = cur_params;
                     tracing::debug!(
@@ -462,12 +467,18 @@ impl LedgerState {
             }
         }
 
-        // Step 9: Expire governance proposals that have passed their lifetime
+        // Step 9: Expire governance proposals that have passed their lifetime.
+        //
+        // Haskell timing: the expiry check runs inside `ratifyTransition` with
+        // `reCurrentEpoch` = the epoch when the DRep pulser was initialized,
+        // which is `self.epoch` (the epoch just ended), NOT `new_epoch`.
+        // At the N→(N+1) boundary, Haskell checks `gasExpiresAfter < N`.
+        // Using `new_epoch` (N+1) would expire proposals one epoch too early.
         let expired: Vec<GovActionId> = self
             .governance
             .proposals
             .iter()
-            .filter(|(_, state)| state.expires_epoch < new_epoch)
+            .filter(|(_, state)| state.expires_epoch < self.epoch)
             .map(|(id, _)| *id)
             .collect();
 

@@ -1344,7 +1344,8 @@ async fn process_block_simple(
             // Process Conway governance proposals (proposal_procedures in tx body)
             // Each submitted proposal pays a deposit; the deposit is refunded when the proposal
             // expires (epoch.rs) to the return_addr's reward account.
-            for (proposal_index, proposal) in tx.gov_proposals().into_iter().enumerate() {
+            let gov_proposals = tx.gov_proposals();
+            for (proposal_index, proposal) in gov_proposals.into_iter().enumerate() {
                 if let Some(conway_proposal) = proposal.as_conway() {
                     let tx_hash_bytes = tx_hash.as_ref();
                     let mut tx_hash_arr = [0u8; 32];

@@ -184,8 +184,22 @@ impl LedgerState {
                 ratified.push((*action_id, state.clone()));
                 ratified_ids.push(*action_id);
 
+                let action_type = match &state.procedure.gov_action {
+                    GovernanceAction::ParameterChange { .. } => "ParameterChange",
+                    GovernanceAction::HardForkInitiation { .. } => "HardForkInitiation",
+                    GovernanceAction::TreasuryWithdrawals { .. } => "TreasuryWithdrawals",
+                    GovernanceAction::NoConfidence { .. } => "NoConfidence",
+                    GovernanceAction::UpdateCommittee { .. } => "UpdateCommittee",
+                    GovernanceAction::NewConstitution { .. } => "NewConstitution",
+                    GovernanceAction::InfoAction => "InfoAction",
+                };
                 tracing::info!(
                     action_id = %hex::encode(&action_id.tx_hash),
+                    action_type,
+                    deposit = state.procedure.deposit.0,
+                    return_cred = %hex::encode(&return_cred_hash[..28]),
+                    proposed_epoch = state.proposed_epoch.0,
+                    expires_epoch = state.expires_epoch.0,
                     "Governance proposal ratified"
                 );
 
@@ -260,8 +274,11 @@ impl LedgerState {
 
         match &state.procedure.gov_action {
             GovernanceAction::InfoAction => {
-                // InfoAction is always ratified (it's informational only)
-                true
+                // InfoAction can NEVER be ratified per Haskell.
+                // Haskell's `votingDRepThresholdInternal` returns `NoVotingThreshold`
+                // for InfoAction, which maps to `SNothing`, causing `dRepAccepted`
+                // to return False unconditionally. InfoAction proposals can only expire.
+                false
             }
             GovernanceAction::ParameterChange {
                 update: protocol_param_update,
