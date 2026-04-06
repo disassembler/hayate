@@ -685,6 +685,19 @@ pub struct DRepRegistration {
     /// Whether this DRep is currently active (per CIP-1694 activity tracking)
     #[serde(default = "default_drep_active")]
     pub active: bool,
+    /// Set of staking credentials delegated to this DRep (Haskell: drepDelegs).
+    ///
+    /// This is the reverse mapping of vote_delegations. It is maintained alongside
+    /// vote_delegations and is critical for clearDRepDelegations on UnRegDRepCert.
+    ///
+    /// NOTE: Due to PV9 bug (Haskell #4772), when a credential re-delegates from
+    /// DRep A to DRep B (where B is registered), the credential is NOT removed from
+    /// A's delegs set. This means a credential can appear in MULTIPLE DReps' delegs
+    /// sets. On UnRegDRepCert for A, clearDRepDelegations iterates A.delegs and sets
+    /// each credential's casDRepDelegation to Nothing -- even if the credential has
+    /// since re-delegated to B. This is the correct (bug-compatible) behavior for PV9.
+    #[serde(skip)]
+    pub delegs: HashSet<Hash32>,
 }
 
 fn default_drep_active() -> bool {

@@ -205,6 +205,7 @@ impl LedgerState {
                         registered_epoch: self.epoch,
                         last_active_epoch: self.epoch,
                         active: true,
+                        delegs: std::collections::HashSet::new(),
                     },
                 );
                 Arc::make_mut(&mut self.governance).drep_registration_count += 1;

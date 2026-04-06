@@ -712,12 +712,16 @@ impl LedgerState {
             let stake = utxo + reward + gov_deps;
             match drep {
                 DRep::KeyHash(h) => {
-                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                    // Haskell's computeDRepDistr only checks Map.member cred regDReps
+                    // (is DRep registered?), NOT whether the DRep is active/expired.
+                    // Expired DReps still accumulate stake in drepDistr; expiry only
+                    // matters for ratification quorum (isDRepExpired).
+                    if self.governance.dreps.contains_key(h) {
                         *cache.entry(*h).or_default() += stake;
                     }
                 }
                 DRep::ScriptHash(h) => {
-                    if self.governance.dreps.get(h).is_some_and(|d| d.active) {
+                    if self.governance.dreps.contains_key(h) {
                         *cache.entry(*h).or_default() += stake;
                     }
                 }

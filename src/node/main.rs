@@ -243,6 +243,38 @@ async fn main() -> Result<()> {
         storage.purge_pointer_stake_for_conway();
     }
 
+    // Rebuild DRep delegs (reverse index) from vote_delegations.
+    // Old snapshots pre-date the delegs field, so #[serde(default)] gives empty sets.
+    // Reconstruct by iterating vote_delegations and inserting into the target DRep's delegs.
+    // NOTE: This cannot reconstruct stale PV9-bug entries from before the snapshot, but
+    // it ensures all current delegations are tracked for clearDRepDelegations correctness.
+    {
+        let gov = std::sync::Arc::make_mut(&mut ledger_state.governance);
+        let mut rebuilt = 0usize;
+        for (cred, drep) in &gov.vote_delegations {
+            let drep_hash = match drep {
+                hayate::ledger::primitives::DRep::KeyHash(h)
+                | hayate::ledger::primitives::DRep::ScriptHash(h) => Some(h),
+                _ => None,
+            };
+            if let Some(h) = drep_hash {
+                if let Some(drep_state) = gov.dreps.get_mut(h) {
+                    if drep_state.delegs.insert(*cred) {
+                        rebuilt += 1;
+                    }
+                }
+            }
+        }
+        if rebuilt > 0 {
+            info!(
+                target: "Startup",
+                "Rebuilt DRep delegs reverse index: {} entries added across {} DReps",
+                rebuilt,
+                gov.dreps.values().filter(|d| !d.delegs.is_empty()).count()
+            );
+        }
+    }
+
     // Shared processing state — used by both immutable-DB and network sync loops.
     let mut blocks_processed = 0u64;
     let mut current_epoch = ledger_state.epoch.0;
@@ -2024,9 +2056,22 @@ fn process_alonzo_certificate(
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
                 // Haskell removes the entire AccountState on de-registration,
                 // which includes the DRep delegation. We must mirror that here.
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .remove(&hash);
+                // Also calls processDRepUnDelegation to remove from old DRep's drepDelegs.
+                {
+                    let gov = Arc::make_mut(&mut ledger_state.governance);
+                    if let Some(old_drep) = gov.vote_delegations.remove(&hash) {
+                        let old_hash = match &old_drep {
+                            hayate::ledger::primitives::DRep::KeyHash(h)
+                            | hayate::ledger::primitives::DRep::ScriptHash(h) => Some(*h),
+                            _ => None,
+                        };
+                        if let Some(oh) = old_hash {
+                            if let Some(drep_state) = gov.dreps.get_mut(&oh) {
+                                drep_state.delegs.remove(&hash);
+                            }
+                        }
+                    }
+                }
 
                 ledger_state
                     .deposit_tracker
@@ -2209,6 +2254,64 @@ fn pallas_drep_to_hayate(
     }
 }
 
+/// Apply a DRep vote delegation, maintaining the `drepDelegs` reverse index.
+///
+/// Implements Haskell's `processDelegationInternal` for the vote delegation part,
+/// including the PV9 bug (#4772) where `preserveIncorrectDelegation = True`.
+///
+/// PV9 bug behavior:
+/// - When the new DRep IS registered: add `stake_cred` to `newDRep.delegs`,
+///   but do NOT remove from `oldDRep.delegs` (the removal is overwritten).
+/// - When the new DRep is NOT registered or is AlwaysAbstain/NoConfidence:
+///   remove `stake_cred` from `oldDRep.delegs` (the removal is preserved).
+///
+/// In both cases, `vote_delegations[stake_cred]` is updated to the new DRep.
+fn apply_vote_delegation(
+    gov: &mut hayate::ledger::state::GovernanceState,
+    stake_cred: hayate::ledger::primitives::Hash32,
+    new_drep: hayate::ledger::primitives::DRep,
+) {
+    use hayate::ledger::primitives::DRep;
+
+    // Determine if new DRep is a registered DRepCredential
+    let new_drep_hash = match &new_drep {
+        DRep::KeyHash(h) | DRep::ScriptHash(h) => Some(*h),
+        _ => None,
+    };
+    let new_drep_is_registered = new_drep_hash
+        .as_ref()
+        .map(|h| gov.dreps.contains_key(h))
+        .unwrap_or(false);
+
+    if new_drep_is_registered {
+        // PV9 bug: add to new DRep's delegs, do NOT remove from old DRep's delegs.
+        // (In Haskell, the vsDReps replacement overwrites the removal.)
+        if let Some(h) = &new_drep_hash {
+            if let Some(drep_state) = gov.dreps.get_mut(h) {
+                drep_state.delegs.insert(stake_cred);
+            }
+        }
+    } else {
+        // New DRep is NOT registered (or is AlwaysAbstain/NoConfidence).
+        // PV9 behavior: remove from old DRep's delegs (the removal is preserved
+        // because we fall through to `_ -> cState'` which keeps processDRepUnDelegation).
+        if let Some(old_drep) = gov.vote_delegations.get(&stake_cred) {
+            let old_drep_hash = match old_drep {
+                DRep::KeyHash(h) | DRep::ScriptHash(h) => Some(*h),
+                _ => None,
+            };
+            if let Some(oh) = old_drep_hash {
+                if let Some(old_drep_state) = gov.dreps.get_mut(&oh) {
+                    old_drep_state.delegs.remove(&stake_cred);
+                }
+            }
+        }
+    }
+
+    // Always update vote_delegations
+    gov.vote_delegations.insert(stake_cred, new_drep);
+}
+
 /// Convert a pallas Conway ProtocolParamUpdate to a hayate ProtocolParamUpdate.
 ///
 /// Only Conway-era fields that have hayate equivalents are mapped.
@@ -2358,9 +2461,22 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
                 // Haskell removes the entire AccountState on de-registration,
                 // which includes the DRep delegation. We must mirror that here.
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .remove(&hash);
+                // Also calls processDRepUnDelegation to remove from old DRep's drepDelegs.
+                {
+                    let gov = Arc::make_mut(&mut ledger_state.governance);
+                    if let Some(old_drep) = gov.vote_delegations.remove(&hash) {
+                        let old_hash = match &old_drep {
+                            hayate::ledger::primitives::DRep::KeyHash(h)
+                            | hayate::ledger::primitives::DRep::ScriptHash(h) => Some(*h),
+                            _ => None,
+                        };
+                        if let Some(oh) = old_hash {
+                            if let Some(drep_state) = gov.dreps.get_mut(&oh) {
+                                drep_state.delegs.remove(&hash);
+                            }
+                        }
+                    }
+                }
 
                 ledger_state
                     .deposit_tracker
@@ -2544,9 +2660,22 @@ fn process_conway_certificate(
                 Arc::make_mut(&mut ledger_state.reward_accounts).remove(&hash);
                 // Haskell removes the entire AccountState on de-registration,
                 // which includes the DRep delegation. We must mirror that here.
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .remove(&hash);
+                // Also calls processDRepUnDelegation to remove from old DRep's drepDelegs.
+                {
+                    let gov = Arc::make_mut(&mut ledger_state.governance);
+                    if let Some(old_drep) = gov.vote_delegations.remove(&hash) {
+                        let old_hash = match &old_drep {
+                            hayate::ledger::primitives::DRep::KeyHash(h)
+                            | hayate::ledger::primitives::DRep::ScriptHash(h) => Some(*h),
+                            _ => None,
+                        };
+                        if let Some(oh) = old_hash {
+                            if let Some(drep_state) = gov.dreps.get_mut(&oh) {
+                                drep_state.delegs.remove(&hash);
+                            }
+                        }
+                    }
+                }
 
                 ledger_state
                     .deposit_tracker
@@ -2564,9 +2693,11 @@ fn process_conway_certificate(
         Certificate::VoteDeleg(stake_cred, drep) => {
             if let Some(hash) = stake_credential_to_hash32(stake_cred) {
                 let hayate_drep = pallas_drep_to_hayate(drep);
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .insert(hash, hayate_drep);
+                apply_vote_delegation(
+                    Arc::make_mut(&mut ledger_state.governance),
+                    hash,
+                    hayate_drep,
+                );
                 tracing::debug!("Vote delegation: {}", hex::encode(&hash[..8]));
             }
         }
@@ -2580,9 +2711,11 @@ fn process_conway_certificate(
                     Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
                 }
                 let hayate_drep = pallas_drep_to_hayate(drep);
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .insert(hash, hayate_drep);
+                apply_vote_delegation(
+                    Arc::make_mut(&mut ledger_state.governance),
+                    hash,
+                    hayate_drep,
+                );
                 tracing::debug!("Stake+vote delegation: {}", hex::encode(&hash[..8]));
             }
         }
@@ -2630,9 +2763,14 @@ fn process_conway_certificate(
                     ledger_state.script_stake_credentials.insert(hash);
                 }
                 let hayate_drep = pallas_drep_to_hayate(drep);
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .insert(hash, hayate_drep);
+                // ConwayRegDelegCert: mCurDelegatee = Nothing, so processDRepUnDelegation
+                // is a no-op. We use apply_vote_delegation which handles this correctly
+                // (since there's no old delegation to clean up for a fresh registration).
+                apply_vote_delegation(
+                    Arc::make_mut(&mut ledger_state.governance),
+                    hash,
+                    hayate_drep,
+                );
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
                 let mut tagged29 = [0u8; 29];
                 tagged29[..28].copy_from_slice(&hash[..28]);
@@ -2663,9 +2801,12 @@ fn process_conway_certificate(
                     Arc::make_mut(&mut ledger_state.delegations).insert(hash, pool_id);
                 }
                 let hayate_drep = pallas_drep_to_hayate(drep);
-                Arc::make_mut(&mut ledger_state.governance)
-                    .vote_delegations
-                    .insert(hash, hayate_drep);
+                // ConwayRegDelegCert: mCurDelegatee = Nothing (fresh registration)
+                apply_vote_delegation(
+                    Arc::make_mut(&mut ledger_state.governance),
+                    hash,
+                    hayate_drep,
+                );
                 // Record pointer for CIP-19 pointer address resolution (types 4-5)
                 let mut tagged29 = [0u8; 29];
                 tagged29[..28].copy_from_slice(&hash[..28]);
@@ -2746,31 +2887,54 @@ fn process_conway_certificate(
                         registered_epoch: current_epoch,
                         last_active_epoch: current_epoch,
                         active: true,
+                        delegs: std::collections::HashSet::new(),
                     },
                 );
                 gov.drep_registration_count += 1;
                 tracing::debug!(
-                    "DRep registered: {} deposit={}",
-                    hex::encode(&hash[..8]),
-                    deposit
+                    "DRep registered: {} deposit={} slot={} epoch={}",
+                    hex::encode(&hash[..28]),
+                    deposit,
+                    slot,
+                    epoch
                 );
             }
         }
 
         Certificate::UnRegDRepCert(drep_cred, _deposit) => {
             if let Some(hash) = stake_credential_to_hash32(drep_cred) {
-                if let Some(refund) = ledger_state
+                // Remove the DRep deposit from tracking.
+                // NOTE: Do NOT add the refund to reward_accounts. In Haskell,
+                // DRep deposit refunds go through `conwayTotalRefundsTxCerts`
+                // (the UTxO balance mechanism), not reward accounts. Adding to
+                // reward_accounts would inflate the credential's drepDistr stake.
+                let _ = ledger_state
                     .deposit_tracker
-                    .refund_deposit(&hash, DepositType::DRep)
-                {
-                    *Arc::make_mut(&mut ledger_state.reward_accounts)
-                        .entry(hash)
-                        .or_insert(Lovelace(0)) += refund;
+                    .refund_deposit(&hash, DepositType::DRep);
+
+                // Haskell's ConwayUnRegDRep (GovCert.hs):
+                // 1. Delete the DRep from vsDReps
+                // 2. clearDRepDelegations: for each credential in DRep's drepDelegs set,
+                //    set dRepDelegationAccountStateL to Nothing (remove vote delegation).
+                //
+                // IMPORTANT: drepDelegs may contain stale entries due to PV9 bug (#4772).
+                // A credential that has re-delegated to another registered DRep will still
+                // be in the OLD DRep's drepDelegs. clearDRepDelegations clears its
+                // delegation anyway, which is the bug-compatible behavior.
+                let gov = Arc::make_mut(&mut ledger_state.governance);
+                let mut cleared = 0usize;
+                if let Some(drep_state) = gov.dreps.remove(&hash) {
+                    // clearDRepDelegations: iterate drepDelegs and remove vote_delegations
+                    for delegator_cred in &drep_state.delegs {
+                        if gov.vote_delegations.remove(delegator_cred).is_some() {
+                            cleared += 1;
+                        }
+                    }
                 }
-                Arc::make_mut(&mut ledger_state.governance)
-                    .dreps
-                    .remove(&hash);
-                tracing::debug!("DRep deregistered: {}", hex::encode(&hash[..8]));
+                tracing::debug!(
+                    "DRep deregistered: {} cleared_delegations={} slot={} epoch={}",
+                    hex::encode(&hash[..28]), cleared, slot, epoch
+                );
             }
         }
 
