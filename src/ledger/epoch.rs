@@ -449,19 +449,32 @@ impl LedgerState {
             for enactment in enactments {
                 self.enact_gov_action(&enactment.gov_action);
                 if enactment.deposit.0 > 0 {
-                    *Arc::make_mut(&mut self.reward_accounts)
-                        .entry(enactment.return_cred_hash)
-                        .or_insert(Lovelace(0)) += enactment.deposit;
+                    // Haskell's returnProposalDeposits: refund to reward account only if
+                    // the credential is registered. Unregistered → deposit goes to treasury.
+                    if self.reward_accounts.contains_key(&enactment.return_cred_hash) {
+                        *Arc::make_mut(&mut self.reward_accounts)
+                            .entry(enactment.return_cred_hash)
+                            .or_insert(Lovelace(0)) += enactment.deposit;
+                        tracing::debug!(
+                            target: "ChainDB.LedgerEvent",
+                            action_id = %hex::encode(&enactment.action_id.tx_hash),
+                            deposit = enactment.deposit.0,
+                            return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
+                            "ENACT: deposit returned to reward_accounts"
+                        );
+                    } else {
+                        self.treasury += enactment.deposit;
+                        tracing::info!(
+                            target: "ChainDB.LedgerEvent",
+                            action_id = %hex::encode(&enactment.action_id.tx_hash),
+                            deposit = enactment.deposit.0,
+                            return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
+                            "ENACT: deposit unclaimed (return addr unregistered) → treasury"
+                        );
+                    }
                     self.deposit_tracker.refund_deposit(
                         &enactment.return_cred_hash,
                         super::state::DepositType::Governance(enactment.action_id),
-                    );
-                    tracing::debug!(
-                        target: "ChainDB.LedgerEvent",
-                        action_id = %hex::encode(&enactment.action_id.tx_hash),
-                        deposit = enactment.deposit.0,
-                        return_cred = %hex::encode(&enactment.return_cred_hash[..28]),
-                        "ENACT: deposit returned to reward_accounts"
                     );
                 }
             }
@@ -496,9 +509,31 @@ impl LedgerState {
                         Credential::Script(hash) => *hash,
                     };
                     if deposit.0 > 0 {
-                        *Arc::make_mut(&mut self.reward_accounts)
-                            .entry(return_cred_hash)
-                            .or_insert(Lovelace(0)) += deposit;
+                        // Haskell's returnProposalDeposits: refund to reward account only if
+                        // the credential is registered. Unregistered → deposit goes to treasury.
+                        if self.reward_accounts.contains_key(&return_cred_hash) {
+                            *Arc::make_mut(&mut self.reward_accounts)
+                                .entry(return_cred_hash)
+                                .or_insert(Lovelace(0)) += deposit;
+                            tracing::debug!(
+                                target: "ChainDB.LedgerEvent",
+                                "Governance proposal expired at epoch {}: {} (deposit {} returned to {})",
+                                new_epoch.0,
+                                hex::encode(&action_id.tx_hash[..8]),
+                                deposit.0,
+                                hex::encode(&return_cred_hash[..28]),
+                            );
+                        } else {
+                            self.treasury += deposit;
+                            tracing::info!(
+                                target: "ChainDB.LedgerEvent",
+                                "Governance proposal expired at epoch {}: {} (deposit {} unclaimed, return addr {} unregistered → treasury)",
+                                new_epoch.0,
+                                hex::encode(&action_id.tx_hash[..8]),
+                                deposit.0,
+                                hex::encode(&return_cred_hash[..28]),
+                            );
+                        }
 
                         // Refund from deposit tracker
                         self.deposit_tracker.refund_deposit(
@@ -506,14 +541,6 @@ impl LedgerState {
                             super::state::DepositType::Governance(*action_id),
                         );
                     }
-                    tracing::debug!(
-                        target: "ChainDB.LedgerEvent",
-                        "Governance proposal expired at epoch {}: {} (deposit {} returned to {})",
-                        new_epoch.0,
-                        hex::encode(&action_id.tx_hash[..8]),
-                        deposit.0,
-                        hex::encode(&return_cred_hash[..28]),
-                    );
                 }
             }
 
