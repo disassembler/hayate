@@ -696,7 +696,12 @@ pub struct DRepRegistration {
     /// sets. On UnRegDRepCert for A, clearDRepDelegations iterates A.delegs and sets
     /// each credential's casDRepDelegation to Nothing -- even if the credential has
     /// since re-delegated to B. This is the correct (bug-compatible) behavior for PV9.
-    #[serde(skip)]
+    ///
+    /// NOTE: This field MUST be serialized (not skipped) because the PV9 stale entries
+    /// cannot be reconstructed from vote_delegations alone. On snapshot restore, the
+    /// startup code only rebuilds from current vote_delegations (1:1 mapping), losing
+    /// the stale multi-DRep entries that Haskell preserves in its UMap.
+    #[serde(default)]
     pub delegs: HashSet<Hash32>,
 }
 
