@@ -17,6 +17,10 @@ pub mod wallet;
 #[allow(dead_code)]
 pub mod unified_tx;
 pub mod simulator;
+pub mod multisig;
+pub mod multisig_cli;
+pub mod portal;
+pub mod portal_cli;
 #[cfg(test)]
 pub mod test_validators;
 

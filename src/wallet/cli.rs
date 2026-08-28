@@ -88,6 +88,10 @@ pub async fn handle_wallet_command(
         WalletCommand::SignMsg { wallet, account, msg_file, out_file, stake, hashed } => {
             handle_sign_msg(&storage, wallet, *account, msg_file, out_file, *stake, *hashed)?;
         }
+
+        WalletCommand::Multisig { multisig_cmd } => {
+            crate::wallet::multisig_cli::handle_multisig_command(multisig_cmd, &storage).await?;
+        }
     }
 
     Ok(())
