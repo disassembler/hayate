@@ -443,7 +443,7 @@ pub enum MultisigCommand {
     /// Derive a CIP-1854 M-of-N multisig enterprise address
     CreateAddress {
         /// Local wallet name contributing a CIP-1854 payment key; may be specified multiple times
-        #[arg(long = "wallet", action = clap::ArgAction::Append, required = true)]
+        #[arg(long = "wallet", action = clap::ArgAction::Append)]
         wallets: Vec<String>,
 
         /// Account index for each local wallet (positional, defaults to 0)

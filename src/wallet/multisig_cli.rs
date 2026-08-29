@@ -112,6 +112,9 @@ fn handle_create_address(
     }
 
     let n = all_hashes.len();
+    if n == 0 {
+        anyhow::bail!("At least one --wallet or --address is required");
+    }
     if threshold == 0 || threshold as usize > n {
         anyhow::bail!(
             "Invalid threshold: M={} must be >= 1 and <= N={}",
