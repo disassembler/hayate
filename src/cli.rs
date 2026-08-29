@@ -469,6 +469,10 @@ pub enum MultisigCommand {
         /// Output file for native script policy (cardano-cli JSON format)
         #[arg(long)]
         policy_file: String,
+
+        /// Sort key hashes lexicographically before building the script (matches MeshJS portal ordering)
+        #[arg(long)]
+        sort_keys: bool,
     },
 
     /// Sign a Conway era transaction with a CIP-1854 payment key, producing a VKey witness

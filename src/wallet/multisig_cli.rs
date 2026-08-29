@@ -38,6 +38,7 @@ pub async fn handle_multisig_command(
             threshold,
             network,
             policy_file,
+            sort_keys,
         } => handle_create_address(
             storage,
             wallets,
@@ -47,6 +48,7 @@ pub async fn handle_multisig_command(
             *threshold,
             network,
             policy_file,
+            *sort_keys,
         ),
 
         MultisigCommand::Sign {
@@ -87,6 +89,7 @@ fn handle_create_address(
     threshold: u32,
     network_str: &str,
     policy_file: &str,
+    sort_keys: bool,
 ) -> Result<()> {
     let network = parse_network(network_str)?;
 
@@ -109,6 +112,10 @@ fn handle_create_address(
         let hash = payment_keyhash_from_address(addr)
             .with_context(|| format!("Invalid --address at position {}: {}", i, addr))?;
         all_hashes.push(hash);
+    }
+
+    if sort_keys {
+        all_hashes.sort_unstable();
     }
 
     let n = all_hashes.len();
